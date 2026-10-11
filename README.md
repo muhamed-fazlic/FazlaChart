@@ -55,11 +55,92 @@ Full release notes are in [CHANGELOG.md](CHANGELOG.md).
 </details>
 <!-- news:end -->
 
+---
+
+## FazlaChart — Crypto Futures Market Scanner (this fork)
+
+This repository is a private fork of [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents),
+adapted for **crypto futures** instead of equities. The long-term goal is not
+another "RSI says BUY" bot, but a system that:
+
+1. **Measures the market objectively** — a 24/7 Market Scanner over Binance
+   USDT-M futures (price/volume/indicators, funding rate, open interest,
+   anomaly detection, BTC trend filter), with zero LLM involvement.
+2. **Lets agents interpret, not invent** — the existing multi-agent analyst
+   team (adapted with a Derivatives Analyst for funding/OI) reasons over the
+   scanner's structured facts instead of guessing probabilities from thin air.
+3. **Grades itself against reality** — every scan is persisted, so a later
+   calibration pass can check "the model said 65% confidence, what fraction
+   of those calls were actually right?" instead of trusting a self-reported
+   number.
+
+### Market Scanner (phase 1 — implemented)
+
+Lives in [`scanner/`](scanner) + [`tradingagents/dataflows/vendors/binance/`](tradingagents/dataflows/vendors/binance),
+on top of Binance's public Futures REST API (no API key needed for market data):
+
+- `tradingagents/dataflows/vendors/binance/client.py` — klines, funding rate,
+  open interest (current + history), 24h ticker, top symbols by volume.
+- `tradingagents/dataflows/vendors/binance/indicators.py` — trend
+  classification, relative volume, support/resistance, momentum-fade check
+  (via `stockstats`, the same library the stock Technical Analyst uses).
+- `tradingagents/dataflows/vendors/binance/anomaly.py` — single-symbol
+  anomalies: price up without volume confirmation, open interest rising with
+  flat price and spiking funding, failed breakouts, volatility
+  squeeze-then-expansion.
+- `scanner/btc_context.py` — BTC's own trend across timeframes, used to flag
+  altcoins whose move disagrees with BTC (`scanner/anomaly.py`).
+- `scanner/market_scanner.py` + `scanner/storage.py` — runs scan cycles over
+  a symbol universe (explicit list or top-N by 24h volume) and persists every
+  structured snapshot + anomaly flags to SQLite for later review/calibration.
+
+Run it:
+
+```bash
+# one cycle, fixed symbols, for a quick check
+python -m scanner --symbols BTCUSDT,ETHUSDT,INJUSDT --once
+
+# continuous 24/7 scan of the top 40 USDT perpetuals by volume, every 5 minutes
+python -m scanner --top-n 40 --interval 300
+```
+
+Each scan writes rows like this (one per symbol, per cycle) to
+`scanner_data/scanner.db`:
+
+```json
+{
+  "symbol": "INJUSDT",
+  "timeframe": "1h",
+  "trend": "bullish",
+  "rsi": 55.86,
+  "ema20": 7.72,
+  "ema50": 7.54,
+  "volume_change_pct": -73.79,
+  "funding_rate": 0.000054,
+  "open_interest_change_pct_60m": -0.77,
+  "support": 6.896,
+  "resistance": 7.996,
+  "anomalies": []
+}
+```
+
+### Roadmap
+
+- [x] Market Scanner: Binance futures data layer + indicators + anomalies + BTC filter
+- [ ] Derivatives Analyst agent wired into the existing LangGraph analyst team
+- [ ] FastAPI read layer over `scanner_data/scanner.db` + a web dashboard
+- [ ] Calibration pipeline: join each scan against its realized forward
+      return, so any agent's or model's stated confidence can be checked
+      against actual outcomes instead of trusted at face value
+
+---
+
 <div align="center">
 
 🚀 [TradingAgents](#tradingagents-framework) | ⚡ [Installation & CLI](#installation-and-cli) | 🎬 [Demo](https://www.youtube.com/watch?v=90gr5lwjIho) | 📦 [Package Usage](#tradingagents-package) | 🤝 [Contributing](#contributing) | 📄 [Citation](#citation)
 
 </div>
+
 
 > 🎉 **TradingAgents** officially released! We have received numerous inquiries about the work, and we would like to express our thanks for the enthusiasm in our community.
 >
