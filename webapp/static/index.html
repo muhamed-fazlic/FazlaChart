@@ -55,8 +55,10 @@
       <div class="analysis-bar">
         <button id="analyze-btn">🤖 Analyze with AI</button>
         <select id="analyze-model">
-          <option value="llama3.1:8b">llama3.1:8b (recommended — reliable structured output)</option>
-          <option value="llama3.2:3b">llama3.2:3b (faster, but may fail to return valid JSON)</option>
+          <option value="groq:openai/gpt-oss-120b">Groq · gpt-oss-120b (cloud, fast, recommended)</option>
+          <option value="groq:openai/gpt-oss-20b">Groq · gpt-oss-20b (cloud, fastest)</option>
+          <option value="ollama:llama3.1:8b">Ollama · llama3.1:8b (local, reliable, slow on CPU)</option>
+          <option value="ollama:llama3.2:3b">Ollama · llama3.2:3b (local, fast, may fail to return valid JSON)</option>
         </select>
         <span id="analyze-status" class="muted"></span>
       </div>

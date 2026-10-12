@@ -150,19 +150,25 @@ def test_analyze_endpoint_returns_structured_payload(client, monkeypatch):
         diverges_from_btc=True,
     )
 
-    def _fake_assess_symbol(symbol, timeframe="1h", horizon_candles=12, model=None, **_kwargs):
+    captured = {}
+
+    def _fake_assess_symbol(symbol, timeframe="1h", horizon_candles=12, provider=None, model=None, **_kwargs):
         assert symbol == "INJUSDT"
+        captured["provider"] = provider
+        captured["model"] = model
         return fake_result
 
     monkeypatch.setattr("agents_crypto.derivatives_risk_agent.assess_symbol", _fake_assess_symbol)
 
-    resp = client.post("/api/analyze/injusdt?timeframe=1h")
+    resp = client.post("/api/analyze/injusdt?timeframe=1h&provider=groq&model=openai%2Fgpt-oss-120b")
     assert resp.status_code == 200
     body = resp.json()
     assert body["symbol"] == "INJUSDT"
     assert body["assessment"]["bias"] == "short"
     assert body["diverges_from_btc"] is True
     assert body["risk_levels"]["take_profit"] == 9.5
+    assert captured["provider"] == "groq"
+    assert captured["model"] == "openai/gpt-oss-120b"
 
 
 def test_analyze_endpoint_returns_502_on_failure(client, monkeypatch):

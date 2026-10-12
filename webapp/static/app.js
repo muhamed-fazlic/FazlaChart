@@ -142,13 +142,22 @@ function renderAssessment(data) {
 
 async function analyzeSymbol() {
   if (!currentDetailSymbol) return;
-  const model = document.getElementById("analyze-model").value;
+  const selected = document.getElementById("analyze-model").value;
+  // Dropdown values are "provider:model" (e.g. "groq:llama-3.3-70b-versatile"
+  // or "ollama:llama3.1:8b") — split on the first colon only, since Ollama
+  // model names themselves contain a colon (tag separator).
+  const sep = selected.indexOf(":");
+  const provider = selected.slice(0, sep);
+  const model = selected.slice(sep + 1);
   const btn = document.getElementById("analyze-btn");
   const status = document.getElementById("analyze-status");
   btn.disabled = true;
-  status.textContent = "Thinking… (first run on CPU can take a few minutes)";
+  status.textContent =
+    provider === "ollama"
+      ? "Thinking… (local CPU inference can take a few minutes)"
+      : "Thinking… (cloud inference, usually a few seconds)";
   try {
-    const url = `/api/analyze/${currentDetailSymbol}?timeframe=${encodeURIComponent(currentDetailTimeframe)}&model=${encodeURIComponent(model)}`;
+    const url = `/api/analyze/${currentDetailSymbol}?timeframe=${encodeURIComponent(currentDetailTimeframe)}&provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}`;
     const res = await fetch(url, { method: "POST" });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));

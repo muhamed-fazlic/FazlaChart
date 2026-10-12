@@ -145,26 +145,35 @@ def symbol_history(symbol: str, limit: int = 200) -> dict[str, Any]:
 
 
 @app.post("/api/analyze/{symbol}")
-def analyze_symbol(symbol: str, timeframe: str = "1h", horizon_candles: int = 12, model: str | None = None) -> dict[str, Any]:
+def analyze_symbol(
+    symbol: str,
+    timeframe: str = "1h",
+    horizon_candles: int = 12,
+    model: str | None = None,
+    provider: str | None = None,
+) -> dict[str, Any]:
     """On-demand only: calls the Derivatives/Risk LLM agent (live Binance
-    snapshot + cached calibration stats + local LLM) for one symbol. This is
-    the one endpoint in this dashboard that leaves the "read-only, no LLM"
-    world — it's a deliberate, explicit user action (clicking "Analyze"),
-    never triggered automatically by the auto-refresh loop.
+    snapshot + cached calibration stats + an LLM — local Ollama or a cloud
+    provider such as Groq) for one symbol. This is the one endpoint in this
+    dashboard that leaves the "read-only, no LLM" world — it's a deliberate,
+    explicit user action (clicking "Analyze"), never triggered automatically
+    by the auto-refresh loop.
 
     Runs synchronously in FastAPI's threadpool, which can take anywhere from
-    a few seconds to a few minutes depending on the local machine's
-    CPU/GPU and the chosen model — there is no streaming/progress here.
+    a couple of seconds (cloud provider) to several minutes (local CPU-only
+    Ollama) depending on the chosen provider/model — there is no
+    streaming/progress here.
     """
     # Imported lazily so merely running the dashboard never pulls in the LLM
     # client stack (langchain, etc.) unless this endpoint is actually hit.
-    from agents_crypto.derivatives_risk_agent import DEFAULT_MODEL, assess_symbol
+    from agents_crypto.derivatives_risk_agent import DEFAULT_MODEL, DEFAULT_PROVIDER, assess_symbol
 
     try:
         result = assess_symbol(
             symbol.upper(),
             timeframe=timeframe,
             horizon_candles=horizon_candles,
+            provider=provider or os.environ.get("DASHBOARD_LLM_PROVIDER", DEFAULT_PROVIDER),
             model=model or os.environ.get("DASHBOARD_LLM_MODEL", DEFAULT_MODEL),
         )
     except Exception as exc:  # noqa: BLE001 - surface any failure (Ollama down, bad symbol, etc.) to the UI
@@ -178,6 +187,7 @@ def analyze_symbol(symbol: str, timeframe: str = "1h", horizon_candles: int = 12
         "calibration_matches": result.calibration_matches,
         "diverges_from_btc": result.diverges_from_btc,
     }
+
 
 
 # Static dashboard (HTML/CSS/JS) — mounted last so it doesn't shadow /api/*.
