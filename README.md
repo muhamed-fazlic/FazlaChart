@@ -220,13 +220,55 @@ scanner has already measured and stored ([`webapp/`](webapp)).
 Install it with the `dashboard` extra: `pip install -e ".[dashboard]"`
 (already included if you ran `tool/setup.{ps1,sh}` after this was added).
 
+### Derivatives/Risk agent (phase 4 — implemented)
+
+A single, grounded LLM call that *interprets* what the scanner and
+calibration backtest already measured for one symbol — it never invents its
+own probabilities or stop-loss/take-profit levels. Lives in
+[`agents_crypto/`](agents_crypto), deliberately separate from the original
+stock-oriented LangGraph pipeline in `tradingagents/agents/`, since this is a
+single structured-output call over pre-measured facts rather than a
+multi-step debate.
+
+It is given, as plain facts (not asked to guess):
+
+- the scanner's live snapshot for the symbol/timeframe (trend, RSI, EMA,
+  volume, funding rate, OI change, anomalies, …);
+- the BTC reference context and whether the symbol diverges from it;
+- the calibration backtest's historical win-rate/avg-return for whichever
+  trend/anomaly labels are *currently active* (cached, recomputed every 6h);
+- deterministic ATR-based stop-loss/take-profit levels, computed in Python
+  (see [`agents_crypto/risk_calc.py`](agents_crypto/risk_calc.py)) — not by
+  the LLM.
+
+If no calibration history exists for the active label(s), the response
+schema forces the model to say so explicitly rather than making up a
+confidence number.
+
+Runs against a local, free model by default via [Ollama](https://ollama.com)
+— no API key, no per-call cost:
+
+```powershell
+ollama pull llama3.1:8b   # once
+.\tool\run_derivatives_agent.ps1 -Symbol INJUSDT -Timeframe 1h
+```
+
+```bash
+ollama pull llama3.1:8b
+./tool/run_derivatives_agent.sh --symbol INJUSDT --timeframe 1h
+```
+
+Any other provider already supported by `tradingagents/llm_clients/` also
+works via `-Provider`/`-Model` (or `--provider`/`--model`).
+
 ### Roadmap
 
 - [x] Market Scanner: Binance futures data layer + indicators + anomalies + BTC filter
 - [x] Calibration backtest: measure real historical win-rate/avg-return of
       every trend/anomaly label, before any LLM is involved
 - [x] Local web dashboard over `scanner_data/scanner.db` (read-only, no LLM)
-- [ ] Derivatives Analyst agent wired into the existing LangGraph analyst team
+- [x] Derivatives/Risk agent: grounded, structured LLM interpretation of
+      scanner + calibration facts (local Ollama by default)
 - [ ] Extend the calibration backtest to replay historical funding/OI data
       so OI-based anomalies can be measured too (currently a documented gap)
 - [ ] Deploy the scanner + dashboard to a rented server (same `tool/*.sh`

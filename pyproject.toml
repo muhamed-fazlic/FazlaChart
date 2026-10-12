@@ -52,7 +52,7 @@ tradingagents = "cli.main:app"
 version = {attr = "tradingagents.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*", "scanner*", "webapp*"]
+include = ["tradingagents*", "cli*", "scanner*", "webapp*", "agents_crypto*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
