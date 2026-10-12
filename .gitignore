@@ -224,3 +224,6 @@ reports/
 
 # Market Scanner persisted snapshots (local SQLite data, not source)
 scanner_data/
+
+# Runtime PID/log files written by tool/start_all.ps1 and tool/stop_all.ps1
+tool/.run/

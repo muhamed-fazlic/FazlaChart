@@ -220,6 +220,29 @@ scanner has already measured and stored ([`webapp/`](webapp)).
 Install it with the `dashboard` extra: `pip install -e ".[dashboard]"`
 (already included if you ran `tool/setup.{ps1,sh}` after this was added).
 
+### One-click local launcher (Windows)
+
+For everyday local use you don't need three terminals. One setup step
+creates a desktop shortcut that starts Ollama, the scanner, and the
+dashboard, and opens it in Chrome — all with a single double-click:
+
+```powershell
+.\tool\create_desktop_shortcut.ps1   # one-time: creates "FazlaChart" on your Desktop
+```
+
+From then on, double-click **FazlaChart** on the Desktop. It:
+
+- starts the local Ollama server if it isn't already running;
+- starts the Market Scanner and the dashboard in the background (minimized
+  windows; logs go to `tool\.run\*.log`), reusing them if already running
+  instead of starting duplicates;
+- waits until the dashboard actually responds, then opens it in Chrome.
+
+Run `.\tool\stop_all.ps1` when you're done to stop the scanner and
+dashboard (Ollama is left running — it's a lightweight background service).
+`.\tool\start_all.ps1` and `.\tool\stop_all.ps1` also work standalone from a
+terminal if you'd rather not use the shortcut.
+
 ### Derivatives/Risk agent (phase 4 — implemented)
 
 A single, grounded LLM call that *interprets* what the scanner and
