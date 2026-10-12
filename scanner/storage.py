@@ -75,3 +75,38 @@ def fetch_recent_scans(conn: sqlite3.Connection, symbol: str, limit: int = 50) -
     )
     columns = [description[0] for description in cursor.description]
     return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+
+def fetch_latest_scan_per_symbol(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """One row per symbol — its most recent scan — for a dashboard/overview.
+    Includes the full parsed snapshot (indicators, derivatives, anomalies
+    per timeframe), not just the flattened reference-timeframe columns."""
+    cursor = conn.execute(
+        """
+        SELECT s.symbol, s.scanned_at, s.reference_timeframe, s.close_price, s.trend,
+               s.anomalies_json, s.snapshot_json
+        FROM scans s
+        INNER JOIN (
+            SELECT symbol, MAX(scanned_at) AS max_time FROM scans GROUP BY symbol
+        ) latest ON s.symbol = latest.symbol AND s.scanned_at = latest.max_time
+        ORDER BY s.symbol
+        """
+    )
+    columns = [description[0] for description in cursor.description]
+    rows = [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+    for row in rows:
+        row["anomalies"] = json.loads(row.pop("anomalies_json"))
+        row["snapshot"] = json.loads(row.pop("snapshot_json"))
+    return rows
+
+
+def fetch_symbol_history(conn: sqlite3.Connection, symbol: str, limit: int = 200) -> list[dict[str, Any]]:
+    """Chronological (oldest-first) close price + trend history for one
+    symbol, for a sparkline/chart on the dashboard."""
+    cursor = conn.execute(
+        "SELECT scanned_at, close_price, trend FROM scans"
+        " WHERE symbol = ? ORDER BY scanned_at ASC LIMIT ?",
+        (symbol, limit),
+    )
+    columns = [description[0] for description in cursor.description]
+    return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]

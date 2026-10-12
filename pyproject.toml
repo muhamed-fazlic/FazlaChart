@@ -39,6 +39,11 @@ dev = [
 bedrock = [
     "langchain-aws>=1.7.9",
 ]
+# Local web dashboard over the scanner's SQLite output.
+dashboard = [
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"
@@ -47,11 +52,12 @@ tradingagents = "cli.main:app"
 version = {attr = "tradingagents.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*", "scanner*"]
+include = ["tradingagents*", "cli*", "scanner*", "webapp*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
 tradingagents = ["assets/*.svg"]
+webapp = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -190,15 +190,47 @@ Binance's public (unauthenticated) Futures REST endpoints. The `.env` file
 (copied from `.env.example` by setup) is only needed once the LLM-agent
 phase starts.
 
+### Web dashboard (phase 3 — implemented)
+
+A local, read-only web view over `scanner_data/scanner.db` — run the scanner
+continuously in one terminal, then open the dashboard in another:
+
+```powershell
+# terminal 1: keep the scanner running 24/7
+.\tool\run_scanner.ps1
+
+# terminal 2: open http://127.0.0.1:8000
+.\tool\run_dashboard.ps1
+```
+
+```bash
+# Linux/macOS
+./tool/run_scanner.sh &
+./tool/run_dashboard.sh
+```
+
+It shows every scanned symbol's latest trend, RSI, EMA20/50, volume change,
+funding rate, OI change, support/resistance, and any anomalies that fired —
+with a BTC reference banner at the top and an "anomalies only" filter.
+Clicking a row expands the full raw snapshot (all timeframes + derivatives)
+for that symbol. The dashboard auto-refreshes every 15 seconds and never
+calls Binance or an LLM itself — it is strictly a window onto what the
+scanner has already measured and stored ([`webapp/`](webapp)).
+
+Install it with the `dashboard` extra: `pip install -e ".[dashboard]"`
+(already included if you ran `tool/setup.{ps1,sh}` after this was added).
+
 ### Roadmap
 
 - [x] Market Scanner: Binance futures data layer + indicators + anomalies + BTC filter
 - [x] Calibration backtest: measure real historical win-rate/avg-return of
       every trend/anomaly label, before any LLM is involved
+- [x] Local web dashboard over `scanner_data/scanner.db` (read-only, no LLM)
 - [ ] Derivatives Analyst agent wired into the existing LangGraph analyst team
-- [ ] FastAPI read layer over `scanner_data/scanner.db` + a web dashboard
 - [ ] Extend the calibration backtest to replay historical funding/OI data
       so OI-based anomalies can be measured too (currently a documented gap)
+- [ ] Deploy the scanner + dashboard to a rented server (same `tool/*.sh`
+      scripts; add a reverse proxy / systemd service once that happens)
 
 ---
 
