@@ -1,6 +1,8 @@
 const REFRESH_MS = 15000;
 let refreshTimer = null;
 let lastOverview = null;
+let currentDetailSymbol = null;
+let currentDetailTimeframe = null;
 
 function trendClass(trend) {
   if (trend === "bullish") return "trend-bullish";
@@ -82,13 +84,85 @@ function renderTable(symbols, anomaliesOnly) {
 }
 
 function showDetail(symbolRow) {
+  currentDetailSymbol = symbolRow.symbol;
+  currentDetailTimeframe = symbolRow.reference_timeframe;
   document.getElementById("detail-title").textContent = symbolRow.symbol;
   document.getElementById("detail-json").textContent = JSON.stringify(symbolRow.snapshot, null, 2);
+  document.getElementById("analysis-result").classList.add("hidden");
+  document.getElementById("analysis-result").innerHTML = "";
+  document.getElementById("analyze-status").textContent = "";
   document.getElementById("detail-modal").classList.remove("hidden");
 }
 
 function hideDetail() {
   document.getElementById("detail-modal").classList.add("hidden");
+}
+
+function renderAssessment(data) {
+  const a = data.assessment;
+  const biasClass = a.bias === "long" ? "trend-bullish" : a.bias === "short" ? "trend-bearish" : "trend-neutral";
+
+  const riskLevelsHtml = data.risk_levels
+    ? `<div class="risk-levels">
+        <span>Entry: <b>${fmt(data.risk_levels.entry, 4)}</b></span>
+        <span>SL: <b class="neg">${fmt(data.risk_levels.stop_loss, 4)}</b> (${fmt(data.risk_levels.risk_pct, 2)}%)</span>
+        <span>TP: <b class="pos">${fmt(data.risk_levels.take_profit, 4)}</b> (${fmt(data.risk_levels.reward_pct, 2)}%)</span>
+        <span>R:R <b>${fmt(data.risk_levels.risk_reward_ratio, 2)}</b></span>
+      </div>`
+    : `<p class="muted">No directional risk levels — trend is neutral.</p>`;
+
+  const calibHtml = data.calibration_matches.length
+    ? data.calibration_matches
+        .map(
+          (c) =>
+            `<li>${c.label} → ${c.direction}: win rate <b>${fmt(c.win_rate_pct, 1)}%</b> (n=${c.n}, avg net ${fmt(c.avg_net_return_pct, 2)}%)</li>`
+        )
+        .join("")
+    : `<li class="muted">No historical calibration data for the active label(s).</li>`;
+
+  document.getElementById("analysis-result").innerHTML = `
+    <div class="assessment-bias ${biasClass}">Bias: ${a.bias.toUpperCase()}</div>
+    ${riskLevelsHtml}
+    <h4>Historical basis</h4>
+    <p>${a.historical_basis}</p>
+    <h4>Calibration matches (ground truth, not a guess)</h4>
+    <ul>${calibHtml}</ul>
+    <h4>Key observations</h4>
+    <ul>${a.key_observations.map((o) => `<li>${o}</li>`).join("")}</ul>
+    <h4>Risk factors</h4>
+    <ul>${a.risk_factors.map((o) => `<li>${o}</li>`).join("")}</ul>
+    <h4>Risk/reward commentary</h4>
+    <p>${a.risk_reward_commentary}</p>
+    <h4>Caveats</h4>
+    <p class="muted">${a.caveats}</p>
+    <p class="muted" style="font-size: 11px; margin-top: 10px;">Diverges from BTC's reference trend: ${data.diverges_from_btc}</p>
+  `;
+  document.getElementById("analysis-result").classList.remove("hidden");
+}
+
+async function analyzeSymbol() {
+  if (!currentDetailSymbol) return;
+  const model = document.getElementById("analyze-model").value;
+  const btn = document.getElementById("analyze-btn");
+  const status = document.getElementById("analyze-status");
+  btn.disabled = true;
+  status.textContent = "Thinking… (first run on CPU can take a few minutes)";
+  try {
+    const url = `/api/analyze/${currentDetailSymbol}?timeframe=${encodeURIComponent(currentDetailTimeframe)}&model=${encodeURIComponent(model)}`;
+    const res = await fetch(url, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    renderAssessment(data);
+    status.textContent = "Done.";
+  } catch (err) {
+    status.textContent = `Error: ${err.message}`;
+    console.error(err);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function refresh() {
@@ -123,6 +197,7 @@ document.getElementById("detail-close").addEventListener("click", hideDetail);
 document.getElementById("detail-modal").addEventListener("click", (e) => {
   if (e.target.id === "detail-modal") hideDetail();
 });
+document.getElementById("analyze-btn").addEventListener("click", analyzeSymbol);
 
 refresh();
 scheduleAutoRefresh();

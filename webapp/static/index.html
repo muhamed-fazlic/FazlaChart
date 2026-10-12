@@ -51,13 +51,25 @@
     <div class="modal-content">
       <button id="detail-close" class="close-btn">&times;</button>
       <h2 id="detail-title">Symbol</h2>
+
+      <div class="analysis-bar">
+        <button id="analyze-btn">🤖 Analyze with AI</button>
+        <select id="analyze-model">
+          <option value="llama3.1:8b">llama3.1:8b (recommended — reliable structured output)</option>
+          <option value="llama3.2:3b">llama3.2:3b (faster, but may fail to return valid JSON)</option>
+        </select>
+        <span id="analyze-status" class="muted"></span>
+      </div>
+      <div id="analysis-result" class="analysis-result hidden"></div>
+
+      <h3 class="muted">Raw snapshot</h3>
       <pre id="detail-json"></pre>
     </div>
   </div>
 
   <footer class="muted">
-    Read-only view of <code>scanner_data/scanner.db</code>. No LLM calls, no predictions — just what
-    the scanner objectively measured.
+    Read-only view of <code>scanner_data/scanner.db</code> — no LLM calls happen automatically.
+    Click a row, then "Analyze with AI" to get a grounded (not invented) interpretation on demand.
   </footer>
 
   <script src="/static/app.js"></script>

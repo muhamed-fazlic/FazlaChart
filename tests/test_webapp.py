@@ -130,3 +130,47 @@ def test_index_serves_dashboard_html(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "FazlaChart" in resp.text
+
+
+def test_analyze_endpoint_returns_structured_payload(client, monkeypatch):
+    from agents_crypto.derivatives_risk_agent import AssessmentResult, DerivativesRiskAssessment
+
+    fake_result = AssessmentResult(
+        assessment=DerivativesRiskAssessment(
+            symbol="INJUSDT",
+            bias="short",
+            historical_basis="trend:bearish, n=387, win_rate=37.0%",
+            key_observations=["RSI below 40"],
+            risk_factors=["Low sample size"],
+            risk_reward_commentary="R:R is 1.67.",
+            caveats="Doesn't account for news.",
+        ),
+        risk_levels={"entry": 10.0, "stop_loss": 10.3, "take_profit": 9.5, "risk_pct": 3.0, "reward_pct": 5.0, "risk_reward_ratio": 1.67},
+        calibration_matches=[{"label": "trend:bearish", "direction": "short", "n": 387, "win_rate_pct": 37.0, "avg_net_return_pct": -0.17}],
+        diverges_from_btc=True,
+    )
+
+    def _fake_assess_symbol(symbol, timeframe="1h", horizon_candles=12, model=None, **_kwargs):
+        assert symbol == "INJUSDT"
+        return fake_result
+
+    monkeypatch.setattr("agents_crypto.derivatives_risk_agent.assess_symbol", _fake_assess_symbol)
+
+    resp = client.post("/api/analyze/injusdt?timeframe=1h")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["symbol"] == "INJUSDT"
+    assert body["assessment"]["bias"] == "short"
+    assert body["diverges_from_btc"] is True
+    assert body["risk_levels"]["take_profit"] == 9.5
+
+
+def test_analyze_endpoint_returns_502_on_failure(client, monkeypatch):
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("Ollama is not reachable")
+
+    monkeypatch.setattr("agents_crypto.derivatives_risk_agent.assess_symbol", _raise)
+
+    resp = client.post("/api/analyze/INJUSDT")
+    assert resp.status_code == 502
+    assert "Ollama is not reachable" in resp.json()["detail"]

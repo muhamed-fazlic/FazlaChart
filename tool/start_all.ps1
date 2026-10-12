@@ -75,17 +75,32 @@ function Wait-ForHttp($url, $timeoutSeconds) {
 }
 
 # --- 1. Ollama -----------------------------------------------------------
+# IMPORTANT: on modest hardware (e.g. laptops without a dedicated GPU, <=16GB
+# RAM), loading more than one local model at once can exhaust RAM and make
+# every request crawl (observed: free RAM dropping below 1GB, calls stalling
+# for 10+ minutes). OLLAMA_MAX_LOADED_MODELS=1 forces Ollama to unload the
+# previous model before loading a new one, so only one model ever sits in
+# memory at a time.
+$env:OLLAMA_MAX_LOADED_MODELS = "1"
 Write-Host "[1/4] Checking Ollama..." -ForegroundColor Cyan
 $ollamaUrl = "http://127.0.0.1:11434/api/tags"
 if (Wait-ForHttp $ollamaUrl 2) {
     Write-Host "      Ollama already running." -ForegroundColor Green
 } else {
-    $ollamaExe = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama app.exe"
-    if (Test-Path $ollamaExe) {
-        Write-Host "      Starting Ollama..." -ForegroundColor Yellow
-        Start-Process -FilePath $ollamaExe -WindowStyle Hidden
+    # Prefer running the server binary directly ("ollama serve") rather than the
+    # tray app ("ollama app.exe"): the tray app's own server subprocess has been
+    # observed to silently fail to bind its port while "ollama serve" starts
+    # reliably in ~5-10s. No tray icon this way, but the API works the same.
+    $ollamaServerExe = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe"
+    $ollamaLog = Join-Path $runDir "ollama.log"
+    if (Test-Path $ollamaServerExe) {
+        Write-Host "      Starting Ollama server..." -ForegroundColor Yellow
+        $op = Start-Process -FilePath $ollamaServerExe -ArgumentList "serve" `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $ollamaLog -RedirectStandardError (Join-Path $runDir "ollama.err.log")
+        Set-Content -Path (Join-Path $runDir "ollama.pid") -Value $op.Id
     } else {
-        Write-Host "      Ollama app not found at expected path; assuming it's on PATH as a service." -ForegroundColor Yellow
+        Write-Host "      Ollama not found at expected path; assuming it's on PATH as a service." -ForegroundColor Yellow
         Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden
     }
     if (-not (Wait-ForHttp $ollamaUrl 20)) {

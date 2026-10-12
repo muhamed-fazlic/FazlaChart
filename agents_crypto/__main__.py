@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> None:
     console.print(
         f"[bold]Assessing {args.symbol} ({args.timeframe}) with {args.provider}/{args.model}...[/bold]"
     )
-    assessment = assess_symbol(
+    result = assess_symbol(
         args.symbol.upper(),
         timeframe=args.timeframe,
         horizon_candles=args.horizon_candles,
@@ -40,7 +40,14 @@ def main(argv: list[str] | None = None) -> None:
         model=args.model,
         base_url=args.base_url,
     )
-    console.print_json(assessment.model_dump_json())
+    console.print_json(
+        data={
+            "assessment": result.assessment.model_dump(),
+            "risk_levels": result.risk_levels,
+            "calibration_matches": result.calibration_matches,
+            "diverges_from_btc": result.diverges_from_btc,
+        }
+    )
 
 
 if __name__ == "__main__":
