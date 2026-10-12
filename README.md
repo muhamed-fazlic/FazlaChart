@@ -104,6 +104,9 @@ python -m scanner --symbols BTCUSDT,ETHUSDT,INJUSDT --once
 python -m scanner --top-n 40 --interval 300
 ```
 
+Or use the convenience scripts in [`tool/`](tool) (see **Local setup** below), e.g.
+`.\tool\run_scanner.ps1 -Once` on Windows or `./tool/run_scanner.sh --once` on Linux.
+
 Each scan writes rows like this (one per symbol, per cycle) to
 `scanner_data/scanner.db`:
 
@@ -124,14 +127,78 @@ Each scan writes rows like this (one per symbol, per cycle) to
 }
 ```
 
+### Calibration backtest (phase 2 — implemented)
+
+Before letting any agent or model state a probability, this answers a more
+basic question first: **if the scanner flags "trend: bearish" or
+"anomaly: failed_breakout", how often has that actually been profitable,
+historically, after trading costs?**
+
+Lives in [`scanner/calibration.py`](scanner/calibration.py) +
+[`scanner/calibrate.py`](scanner/calibrate.py). It replays historical Binance
+klines candle-by-candle, re-derives each label using the *exact same*
+`classify_trend` / `detect_anomalies` functions the live scanner calls (so the
+backtest can never silently diverge from what's actually flagged live), then
+measures the forward return at several horizons. Each label is pre-assigned a
+direction (`long`, `short`, or undirected/ambiguous) *before* looking at
+results — so "success" is a fixed, declared definition, never redefined after
+seeing the numbers. A round-trip cost (default 0.10%, ~2x Binance taker fee +
+slippage) is deducted before a move counts as a "win".
+
+Run it:
+
+```bash
+python -m scanner.calibrate --symbols BTCUSDT,ETHUSDT,INJUSDT --timeframe 1h --horizons 4,12,24
+```
+
+Or `.\tool\run_calibration.ps1` / `./tool/run_calibration.sh`. Example output
+(real Binance 1h data, illustrates why this step matters — the "bearish
+trend" label alone was *not* a profitable short signal on BTCUSDT over the
+sampled window):
+
+```
+┌────────────────┬───────┬─────────┬─────┬───────────┬──────────────────┬───────────┬────────────┐
+│ Label          │ Dir.  │ Horizon │   N │ Win rate % │ Avg net return % │ Avg win % │ Avg loss % │
+├────────────────┼───────┼─────────┼─────┼───────────┼──────────────────┼───────────┼────────────┤
+│ trend:bullish  │ long  │      12 │ 501 │      51.3 │            0.422 │     1.755 │     -0.983 │
+│ trend:bearish  │ short │      12 │ 387 │      37.0 │           -0.173 │     0.637 │     -0.647 │
+└────────────────┴───────┴─────────┴─────┴───────────┴──────────────────┴───────────┴────────────┘
+```
+
+Known gap: `oi_rising_price_flat_funding_spiking` can't be evaluated yet
+because Binance only retains ~30 days of funding/OI history and the backtest
+currently only replays klines — tracked in the roadmap below.
+
+### Local setup
+
+```powershell
+# Windows
+.\tool\setup.ps1              # creates .venv and installs the project
+.\tool\run_scanner.ps1 -Once  # one scan cycle
+.\tool\run_calibration.ps1    # label calibration backtest on BTC/ETH/INJ
+```
+
+```bash
+# Linux/macOS (same scripts you'd use on a rented server later)
+./tool/setup.sh
+./tool/run_scanner.sh --once
+./tool/run_calibration.sh
+```
+
+No API keys are required for the scanner or calibration backtest — both use
+Binance's public (unauthenticated) Futures REST endpoints. The `.env` file
+(copied from `.env.example` by setup) is only needed once the LLM-agent
+phase starts.
+
 ### Roadmap
 
 - [x] Market Scanner: Binance futures data layer + indicators + anomalies + BTC filter
+- [x] Calibration backtest: measure real historical win-rate/avg-return of
+      every trend/anomaly label, before any LLM is involved
 - [ ] Derivatives Analyst agent wired into the existing LangGraph analyst team
 - [ ] FastAPI read layer over `scanner_data/scanner.db` + a web dashboard
-- [ ] Calibration pipeline: join each scan against its realized forward
-      return, so any agent's or model's stated confidence can be checked
-      against actual outcomes instead of trusted at face value
+- [ ] Extend the calibration backtest to replay historical funding/OI data
+      so OI-based anomalies can be measured too (currently a documented gap)
 
 ---
 
