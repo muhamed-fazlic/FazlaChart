@@ -37,6 +37,21 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="FazlaChart Scanner Dashboard")
 
 
+@app.middleware("http")
+async def _no_cache_dashboard_assets(request, call_next):
+    """The dashboard's HTML/CSS/JS change far more often during active
+    development than a browser's default heuristic caching assumes, and
+    Chrome will otherwise silently serve a stale copy from its disk cache
+    on the next launch (e.g. the desktop shortcut reopening an old tab)
+    without even revalidating. Force a conditional request every time for
+    the index page and everything under /static/ so a server-side change
+    is never masked by a stale local cache."""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 def _storage_path() -> str:
     """Read lazily (not cached at import time) so tests can point this at a
     throwaway database via the SCANNER_STORAGE_PATH env var."""

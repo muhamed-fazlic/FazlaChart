@@ -52,7 +52,7 @@ function renderTable(symbols, anomaliesOnly) {
   const rows = anomaliesOnly ? symbols.filter((s) => s.anomalies.length > 0) : symbols;
 
   if (rows.length === 0) {
-    body.innerHTML = `<tr><td colspan="11" class="muted">No symbols match the current filter.</td></tr>`;
+    body.innerHTML = `<tr><td colspan="12" class="muted">No symbols match the current filter.</td></tr>`;
     return;
   }
 
@@ -70,6 +70,7 @@ function renderTable(symbols, anomaliesOnly) {
       <td class="${signClass(s.open_interest_change_pct_60m)}">${fmt(s.open_interest_change_pct_60m, 2)}%</td>
       <td>${fmt(s.support, 4)} / ${fmt(s.resistance, 4)}</td>
       <td>${s.anomalies.map((a) => `<span class="anomaly-badge">${a}</span>`).join("") || "—"}</td>
+      <td class="winrate-cell muted" data-wr-symbol="${s.symbol}">…</td>
       <td class="muted">${fmtAge(s.age_seconds)}</td>
     </tr>`
     )
@@ -81,6 +82,56 @@ function renderTable(symbols, anomaliesOnly) {
       showDetail(rows[idx]);
     });
   });
+
+  loadWinRates(rows.map((s) => s.symbol));
+}
+
+// Free, LLM-free win rate for every visible row — fetched with a small
+// concurrency limit so 60 coins don't fire 60 simultaneous requests at once.
+const WIN_RATE_CONCURRENCY = 6;
+
+async function loadWinRates(symbols) {
+  let cursor = 0;
+  async function worker() {
+    while (cursor < symbols.length) {
+      const symbol = symbols[cursor++];
+      await loadWinRateCell(symbol);
+    }
+  }
+  const workers = Array.from({ length: Math.min(WIN_RATE_CONCURRENCY, symbols.length) }, worker);
+  await Promise.all(workers);
+}
+
+async function loadWinRateCell(symbol) {
+  const cell = document.querySelector(`.winrate-cell[data-wr-symbol="${symbol}"]`);
+  if (!cell) return; // table may have re-rendered already
+  try {
+    const resp = await fetch(`/api/symbol/${symbol}/calibration`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const liveCell = document.querySelector(`.winrate-cell[data-wr-symbol="${symbol}"]`);
+    if (!liveCell) return;
+    if (!data.matches.length) {
+      liveCell.className = "winrate-cell muted";
+      liveCell.textContent = "n/a";
+      return;
+    }
+    // Most statistically significant match (largest sample) leads the cell.
+    const best = [...data.matches].sort((a, b) => b.n - a.n)[0];
+    const winClass = best.win_rate_pct === null ? "" : best.win_rate_pct >= 55 ? "pos" : best.win_rate_pct <= 45 ? "neg" : "";
+    const lowN = best.n < 30 ? " ⚠" : "";
+    liveCell.className = "winrate-cell";
+    liveCell.innerHTML = `<span class="${winClass}">${fmt(best.win_rate_pct, 1)}%</span> <span class="muted">(n=${best.n}${lowN})</span>`;
+    liveCell.title = data.matches
+      .map((m) => `${m.label} → ${m.direction}: ${fmt(m.win_rate_pct, 1)}% (n=${m.n}, avg net ${fmt(m.avg_net_return_pct, 2)}%)`)
+      .join("\n");
+  } catch (err) {
+    const liveCell = document.querySelector(`.winrate-cell[data-wr-symbol="${symbol}"]`);
+    if (liveCell) {
+      liveCell.className = "winrate-cell muted";
+      liveCell.textContent = "—";
+    }
+  }
 }
 
 function showDetail(symbolRow) {

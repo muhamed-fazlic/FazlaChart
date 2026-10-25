@@ -119,6 +119,8 @@ tbody tr:hover { background: #1c2430; }
 .pos { color: var(--green); }
 .neg { color: var(--red); }
 
+.winrate-cell { font-size: 12px; }
+
 .modal {
   position: fixed;
   inset: 0;
