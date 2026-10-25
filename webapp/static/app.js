@@ -1,4 +1,4 @@
-const REFRESH_MS = 15000;
+const REFRESH_MS = 300000; // matches the scanner's 5-minute scan cycle — no point polling faster than the data changes
 let refreshTimer = null;
 let lastOverview = null;
 let currentDetailSymbol = null;
