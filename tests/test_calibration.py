@@ -33,7 +33,16 @@ def test_every_label_the_anomaly_module_can_emit_has_a_declared_direction():
     from tradingagents.dataflows.vendors.binance.anomaly import detect_anomalies
 
     source = inspect.getsource(detect_anomalies)
-    for flag in ("price_up_volume_not_confirming", "oi_rising_price_flat_funding_spiking", "failed_breakout", "volatility_squeeze_expansion"):
+    for flag in (
+        "price_up_volume_not_confirming",
+        "oi_rising_price_flat_funding_spiking",
+        "failed_breakout",
+        "volatility_squeeze_expansion",
+        "ema9_21_bullish_cross",
+        "ema9_21_bearish_cross",
+        "bullish_pullback_confluence",
+        "bearish_pullback_confluence",
+    ):
         assert flag in source  # sanity: these are still the anomaly names in use
         assert f"anomaly:{flag}" in LABEL_DIRECTION
 

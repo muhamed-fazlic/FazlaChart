@@ -9,8 +9,11 @@ from dataclasses import dataclass, field
 class ScannerConfig:
     # Symbol universe. If `symbols` is empty, the scanner ranks all USDT
     # perpetuals by 24h quote volume and scans the top `top_n_by_volume`.
+    # (Binance's public rate limit has comfortable headroom for this: even
+    # at ~12 request-weight per symbol per cycle, 60 symbols every 300s is
+    # a fraction of the ~2400/min weight budget.)
     symbols: tuple[str, ...] = ()
-    top_n_by_volume: int = 40
+    top_n_by_volume: int = 60
 
     # Timeframes analyzed for every symbol, shortest first.
     timeframes: tuple[str, ...] = ("5m", "15m", "1h", "4h")

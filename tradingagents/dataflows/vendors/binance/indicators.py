@@ -33,7 +33,21 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of ``df`` wrapped with stockstats, with the indicators
     the scanner needs pre-computed (so they are cached on the frame)."""
     wrapped = wrap(df.copy())
-    for indicator in ("close_20_ema", "close_50_ema", "close_200_ema", "rsi", "macd", "macds", "macdh", "atr", "boll", "boll_ub", "boll_lb"):
+    for indicator in (
+        "close_9_ema",
+        "close_20_ema",
+        "close_21_ema",
+        "close_50_ema",
+        "close_200_ema",
+        "rsi",
+        "macd",
+        "macds",
+        "macdh",
+        "atr",
+        "boll",
+        "boll_ub",
+        "boll_lb",
+    ):
         wrapped[indicator]  # triggers stockstats' lazy calculation
     return wrapped
 
@@ -100,3 +114,118 @@ def momentum_fading(df: pd.DataFrame, lookback: int = 5) -> bool:
     new_high = recent["high"].iloc[-1] >= recent["high"].max()
     macdh_falling = recent["macdh"].iloc[-1] < recent["macdh"].iloc[0]
     return bool(new_high and macdh_falling)
+
+
+def ema_cross(df: pd.DataFrame) -> str:
+    """Short-term momentum confirmation via EMA9 vs EMA21 (classic 9/21 cross).
+
+    bullish: EMA9 > EMA21 (short-term momentum is up)
+    bearish: EMA9 < EMA21 (short-term momentum is down)
+    neutral: equal (rare, effectively never with float data)
+    """
+    if df.empty:
+        return "neutral"
+    last = df.iloc[-1]
+    ema9, ema21 = last["close_9_ema"], last["close_21_ema"]
+    if ema9 > ema21:
+        return "bullish"
+    if ema9 < ema21:
+        return "bearish"
+    return "neutral"
+
+
+def ema_cross_event(df: pd.DataFrame) -> str | None:
+    """A *fresh* EMA9/EMA21 cross on the latest closed candle versus the one
+    before it — the actionable moment, unlike :func:`ema_cross`'s ongoing
+    state (which stays "bullish" for the whole stretch after a cross)."""
+    if len(df) < 2:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    now_bullish = last["close_9_ema"] > last["close_21_ema"]
+    was_bullish = prev["close_9_ema"] > prev["close_21_ema"]
+    if now_bullish and not was_bullish:
+        return "bullish_cross"
+    if not now_bullish and was_bullish:
+        return "bearish_cross"
+    return None
+
+
+# Standard retracement/extension ratios; retracement levels sit between the
+# swing low and swing high (pullback/entry zones), extension levels sit
+# beyond the swing high (continuation targets).
+FIB_RETRACEMENT_RATIOS: tuple[float, ...] = (0.382, 0.5, 0.618)
+FIB_EXTENSION_RATIOS: tuple[float, ...] = (0.236, 0.382, 0.618)
+
+
+def fibonacci_levels(df: pd.DataFrame, lookback: int = 50) -> dict[str, Any]:
+    """Fibonacci retracement/extension levels anchored to the most recent
+    swing high/low (the same lookback window :func:`support_resistance` uses).
+
+    Raspon (range) = Vrh (swing high) - Dno (swing low).
+
+    If the swing high happened more recently than the swing low (price is
+    currently in an up-move), retracement levels are measured down from the
+    high (``Vrh - Raspon * ratio``) and extension levels up from the high
+    (``Vrh + Raspon * ratio``) — exactly as in a standard uptrend Fibonacci
+    tool. If the swing low is more recent (a down-move), both are mirrored
+    around the low instead, which is how the same tool is used for shorts.
+    """
+    swing_low, swing_high = support_resistance(df, lookback)
+    rng = swing_high - swing_low
+    empty = {
+        "swing_high": round(swing_high, 8),
+        "swing_low": round(swing_low, 8),
+        "range": round(rng, 8),
+        "swing_direction": None,
+        "retracement": {},
+        "extension": {},
+    }
+    if rng <= 0:
+        return empty
+
+    window = df.iloc[-(lookback + 1):-1] if len(df) > lookback else df.iloc[:-1]
+    if window.empty:
+        return empty
+
+    # Whichever extreme occurred later in time defines the active swing
+    # direction (its index position in `window`, not calendar time, since
+    # `window` is already in chronological order).
+    high_pos = window["high"].to_numpy().argmax()
+    low_pos = window["low"].to_numpy().argmin()
+    swing_is_up = high_pos >= low_pos
+
+    if swing_is_up:
+        retracement = {f"{ratio:.3f}": round(swing_high - rng * ratio, 8) for ratio in FIB_RETRACEMENT_RATIOS}
+        extension = {f"{ratio:.3f}": round(swing_high + rng * ratio, 8) for ratio in FIB_EXTENSION_RATIOS}
+    else:
+        retracement = {f"{ratio:.3f}": round(swing_low + rng * ratio, 8) for ratio in FIB_RETRACEMENT_RATIOS}
+        extension = {f"{ratio:.3f}": round(swing_low - rng * ratio, 8) for ratio in FIB_EXTENSION_RATIOS}
+
+    return {
+        "swing_high": round(swing_high, 8),
+        "swing_low": round(swing_low, 8),
+        "range": round(rng, 8),
+        "swing_direction": "up" if swing_is_up else "down",
+        "retracement": retracement,
+        "extension": extension,
+    }
+
+
+def drawdown_pct(df: pd.DataFrame, lookback: int = 50) -> float:
+    """Percent pullback from the most recent local high (Lokalni Vrh) to the
+    lowest point reached since (Trenutno Dno), within ``lookback`` candles
+    (excludes the still-forming candle, same convention as
+    :func:`support_resistance`).
+
+    Pad (%) = ((Lokalni Vrh - Trenutno Dno) / Lokalni Vrh) * 100
+    """
+    window = df.iloc[-(lookback + 1):-1] if len(df) > lookback else df.iloc[:-1]
+    if window.empty:
+        return 0.0
+    peak_idx = window["high"].idxmax()
+    peak = float(window.loc[peak_idx, "high"])
+    if peak <= 0:
+        return 0.0
+    trough = float(window.loc[peak_idx:, "low"].min())
+    return round((peak - trough) / peak * 100.0, 2)
+

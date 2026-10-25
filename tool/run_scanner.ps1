@@ -6,7 +6,7 @@
     Thin wrapper around `python -m scanner` that takes care of:
       - UTF-8 console output (so the tables/arrows render correctly on Windows)
       - using the project's .venv instead of a global Python
-      - sensible defaults (top 15 symbols by quote volume, 1h interval, loop forever)
+      - sensible defaults (top 60 symbols by quote volume, 5-minute interval, loop forever)
 
     Any extra arguments you pass are forwarded as-is to `python -m scanner`,
     so you can override the defaults, e.g.:
@@ -19,7 +19,7 @@
 
 .PARAMETER TopN
     Number of top symbols (by 24h quote volume) to scan when -Symbols is not given.
-    Default: 15.
+    Default: 60.
 
 .PARAMETER IntervalSeconds
     Seconds to sleep between scan cycles when running continuously.
@@ -37,7 +37,7 @@
 
 param(
     [string[]]$Symbols,
-    [int]$TopN = 15,
+    [int]$TopN = 60,
     [int]$IntervalSeconds = 300,
     [switch]$Once
 )

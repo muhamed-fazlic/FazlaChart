@@ -10,6 +10,10 @@ import pytest
 from tradingagents.dataflows.vendors.binance.indicators import (
     add_indicators,
     classify_trend,
+    drawdown_pct,
+    ema_cross,
+    ema_cross_event,
+    fibonacci_levels,
     klines_to_dataframe,
     relative_volume,
     support_resistance,
@@ -82,3 +86,82 @@ def test_support_resistance_excludes_the_forming_candle():
     support, resistance = support_resistance(df, lookback=5)
     assert support == pytest.approx(min(closes[:-1]) * 0.999, rel=1e-3)
     assert resistance == pytest.approx(max(closes[:-1]) * 1.001, rel=1e-3)
+
+
+def test_ema_cross_bullish_when_ema9_above_ema21():
+    closes = [100 + i * 0.6 for i in range(60)]  # steady uptrend: EMA9 > EMA21
+    df = add_indicators(klines_to_dataframe(_make_klines(closes)))
+    assert ema_cross(df) == "bullish"
+
+
+def test_ema_cross_bearish_when_ema9_below_ema21():
+    closes = [200 - i * 0.6 for i in range(60)]  # steady downtrend: EMA9 < EMA21
+    df = add_indicators(klines_to_dataframe(_make_klines(closes)))
+    assert ema_cross(df) == "bearish"
+
+
+def test_ema_cross_event_detects_a_fresh_bullish_cross():
+    # Down then sharply up: EMA9 flips above EMA21 right on the last candle.
+    closes = [200 - i * 0.6 for i in range(40)] + [180 + i * 8 for i in range(3)]
+    df = add_indicators(klines_to_dataframe(_make_klines(closes)))
+    assert ema_cross_event(df) == "bullish_cross"
+
+
+def test_ema_cross_event_is_none_mid_trend():
+    # Steady uptrend throughout: EMA9 stays above EMA21 the whole time, no fresh cross.
+    closes = [100 + i * 0.6 for i in range(60)]
+    df = add_indicators(klines_to_dataframe(_make_klines(closes)))
+    assert ema_cross_event(df) is None
+
+
+def test_fibonacci_levels_up_swing_matches_formula():
+    # Clean up-swing: low at the start of the window, high at the end.
+    closes = [100 + i for i in range(51)] + [150]  # last candle still forming
+    df = klines_to_dataframe(_make_klines(closes))
+    fib = fibonacci_levels(df, lookback=50)
+    assert fib["swing_direction"] == "up"
+    swing_high, swing_low, rng = fib["swing_high"], fib["swing_low"], fib["range"]
+    assert rng == pytest.approx(swing_high - swing_low)
+    assert fib["retracement"]["0.618"] == pytest.approx(swing_high - rng * 0.618, abs=0.01)
+    assert fib["extension"]["0.618"] == pytest.approx(swing_high + rng * 0.618, abs=0.01)
+
+
+def test_fibonacci_levels_down_swing_is_mirrored():
+    # Clean down-swing: high at the start of the window, low at the end.
+    closes = [150 - i for i in range(51)] + [100]  # last candle still forming
+    df = klines_to_dataframe(_make_klines(closes))
+    fib = fibonacci_levels(df, lookback=50)
+    assert fib["swing_direction"] == "down"
+    swing_low, rng = fib["swing_low"], fib["range"]
+    assert fib["retracement"]["0.618"] == pytest.approx(swing_low + rng * 0.618, abs=0.01)
+    assert fib["extension"]["0.618"] == pytest.approx(swing_low - rng * 0.618, abs=0.01)
+
+
+def _make_klines_ohlc(ohlc: list[tuple[float, float, float, float]], start_ms: int = 0) -> list[dict]:
+    """Build kline dicts from explicit (open, high, low, close) tuples, for
+    tests where the exact high/low matters (unlike :func:`_make_klines`,
+    which derives high/low from the close)."""
+    return [
+        {
+            "open_time": start_ms + i * 3_600_000,
+            "open": o,
+            "high": h,
+            "low": lo,
+            "close": c,
+            "volume": 1000.0,
+            "quote_volume": 1000.0 * c,
+        }
+        for i, (o, h, lo, c) in enumerate(ohlc)
+    ]
+
+
+def test_drawdown_pct_matches_the_worked_example():
+    # Vrh = 0.06239, Dno = 0.05524 -> Pad (%) = 11.46%
+    ohlc = [
+        (0.05000, 0.05000, 0.04800, 0.05000),
+        (0.05800, 0.06239, 0.05800, 0.06100),  # local high (Vrh) in the window
+        (0.05700, 0.05700, 0.05524, 0.05600),  # local low (Dno) after the peak
+        (0.05645, 0.05700, 0.05600, 0.05645),  # still forming, excluded
+    ]
+    df = klines_to_dataframe(_make_klines_ohlc(ohlc))
+    assert drawdown_pct(df, lookback=5) == pytest.approx(11.46, abs=0.01)

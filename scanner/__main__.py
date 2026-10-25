@@ -3,7 +3,7 @@
 Examples:
     python -m scanner
     python -m scanner --symbols BTCUSDT,ETHUSDT,INJUSDT --interval 120
-    python -m scanner --top-n 25 --once
+    python -m scanner --top-n 60 --once
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from scanner.market_scanner import MarketScanner
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Binance futures Market Scanner")
     parser.add_argument("--symbols", type=str, default="", help="Comma-separated symbols, e.g. BTCUSDT,ETHUSDT")
-    parser.add_argument("--top-n", type=int, default=40, help="Scan the top-N USDT perpetuals by 24h volume")
+    parser.add_argument("--top-n", type=int, default=60, help="Scan the top-N USDT perpetuals by 24h volume")
     parser.add_argument("--interval", type=int, default=300, help="Seconds between scan cycles")
     parser.add_argument("--storage", type=str, default="scanner_data/scanner.db", help="SQLite file path")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit (for testing)")

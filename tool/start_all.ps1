@@ -18,7 +18,7 @@
       at a live process), it reuses them instead of starting duplicates.
 
 .PARAMETER Symbols
-    Top-N symbols for the scanner (see `python -m scanner --help`). Default: 25.
+    Top-N symbols for the scanner (see `python -m scanner --help`). Default: 60.
 
 .PARAMETER Interval
     Scanner poll interval in seconds. Default: 300.
@@ -34,7 +34,7 @@
 #>
 
 param(
-    [int]$TopN = 25,
+    [int]$TopN = 60,
     [int]$Interval = 300,
     [int]$DashboardPort = 8000,
     [switch]$NoBrowser

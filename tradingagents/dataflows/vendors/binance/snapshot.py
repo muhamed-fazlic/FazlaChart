@@ -15,12 +15,16 @@ from tradingagents.dataflows.vendors.binance.anomaly import detect_anomalies
 from tradingagents.dataflows.vendors.binance.indicators import (
     add_indicators,
     classify_trend,
+    drawdown_pct,
+    ema_cross,
+    fibonacci_levels,
     klines_to_dataframe,
     momentum_fading,
     relative_volume,
     support_resistance,
     volume_change_pct,
 )
+from tradingagents.dataflows.vendors.binance.pivots import pivot_points_from_ohlc
 
 
 def build_timeframe_snapshot(
@@ -42,6 +46,7 @@ def build_timeframe_snapshot(
     df = add_indicators(df)
     last = df.iloc[-1]
     support, resistance = support_resistance(df)
+    fib = fibonacci_levels(df)
 
     return {
         "symbol": symbol,
@@ -49,9 +54,12 @@ def build_timeframe_snapshot(
         "trend": classify_trend(df),
         "close": round(float(last["close"]), 8),
         "rsi": round(float(last["rsi"]), 2),
+        "ema9": round(float(last["close_9_ema"]), 8),
         "ema20": round(float(last["close_20_ema"]), 8),
+        "ema21": round(float(last["close_21_ema"]), 8),
         "ema50": round(float(last["close_50_ema"]), 8),
         "ema200": round(float(last["close_200_ema"]), 8) if len(df) >= 200 else None,
+        "ema_cross": ema_cross(df),
         "macd": round(float(last["macd"]), 6),
         "macd_signal": round(float(last["macds"]), 6),
         "macd_hist": round(float(last["macdh"]), 6),
@@ -63,6 +71,8 @@ def build_timeframe_snapshot(
         "volume_change_pct": round(volume_change_pct(df), 2),
         "support": round(support, 8),
         "resistance": round(resistance, 8),
+        "drawdown_pct": drawdown_pct(df),
+        "fibonacci": fib,
         "momentum_fading": momentum_fading(df),
         "anomalies": detect_anomalies(df, resistance, funding_rate, open_interest_change_pct_60m),
         "candle_open_time": last["open_time"].isoformat(),
@@ -87,6 +97,18 @@ def build_derivatives_snapshot(symbol: Annotated[str, "futures symbol, e.g. INJU
         "open_interest_change_pct_15m": oi_changes.get(15),
         "open_interest_change_pct_60m": oi_changes.get(60),
     }
+
+
+def build_daily_pivot_snapshot(symbol: Annotated[str, "futures symbol, e.g. INJUSDT"]) -> dict[str, float]:
+    """Classic floor-trader pivot points (P, R1-3, S1-3) from the previous
+    *completed* daily candle. Binance's most recent 1d kline is still forming
+    intraday, so this uses the one before it; ``{}`` if there isn't one yet
+    (brand-new listing)."""
+    klines = client.get_klines(symbol, "1d", limit=3)
+    if len(klines) < 2:
+        return {}
+    prev_day = klines[-2]
+    return pivot_points_from_ohlc(float(prev_day["high"]), float(prev_day["low"]), float(prev_day["close"]))
 
 
 def _oi_changes_over_windows(
@@ -116,6 +138,7 @@ def build_symbol_snapshot(
     for later calibration, never a prediction by itself.
     """
     derivatives = build_derivatives_snapshot(symbol)
+    pivot_points = build_daily_pivot_snapshot(symbol)
     timeframe_snapshots = {
         tf: build_timeframe_snapshot(
             symbol,
@@ -129,4 +152,5 @@ def build_symbol_snapshot(
         "symbol": symbol,
         "timeframes": timeframe_snapshots,
         "derivatives": derivatives,
+        "pivot_points": pivot_points,
     }

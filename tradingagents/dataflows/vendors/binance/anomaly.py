@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from tradingagents.dataflows.vendors.binance.indicators import ema_cross_event, fibonacci_levels
+
 
 def price_up_volume_not_confirming(df: pd.DataFrame, price_move_pct: float = 1.5, lookback: int = 3) -> bool:
     """Price rose sharply over ``lookback`` candles while relative volume stayed flat/low."""
@@ -62,6 +64,67 @@ def volatility_squeeze_expansion(df: pd.DataFrame, lookback: int = 20, expansion
     return bool(recent_avg > 0 and current / recent_avg >= expansion_ratio)
 
 
+def ema9_21_bullish_cross(df: pd.DataFrame) -> bool:
+    """EMA9 just crossed above EMA21 on the latest closed candle — the
+    actionable short-term-momentum-turning-up moment (see
+    :func:`tradingagents.dataflows.vendors.binance.indicators.ema_cross_event`)."""
+    return ema_cross_event(df) == "bullish_cross"
+
+
+def ema9_21_bearish_cross(df: pd.DataFrame) -> bool:
+    """EMA9 just crossed below EMA21 on the latest closed candle."""
+    return ema_cross_event(df) == "bearish_cross"
+
+
+def bullish_pullback_confluence(df: pd.DataFrame, lookback: int = 50) -> bool:
+    """Three independent confirmations lining up for a long, not just one:
+
+    1. The broader trend is bullish (EMA50 above EMA200).
+    2. Price pulled back into the Fibonacci "golden pocket" (0.5-0.618
+       retracement from the recent swing high) of an up-swing.
+    3. EMA9 has just crossed back above EMA21, confirming the bounce.
+
+    This is deliberately rare and highly selective — combining several real,
+    independent signals is how a setup's win rate can realistically be
+    pushed well above any single indicator alone, at the cost of fewer
+    occurrences (see the calibration backtest's sample size for this label).
+    """
+    if len(df) < 200:
+        return False
+    last = df.iloc[-1]
+    if not (last["close_50_ema"] > last["close_200_ema"]):
+        return False
+    fib = fibonacci_levels(df, lookback)
+    if fib.get("swing_direction") != "up":
+        return False
+    retracement = fib.get("retracement", {})
+    pocket_high, pocket_low = retracement.get("0.500"), retracement.get("0.618")
+    if pocket_high is None or pocket_low is None:
+        return False
+    in_pocket = pocket_low <= last["close"] <= pocket_high
+    return bool(in_pocket and ema9_21_bullish_cross(df))
+
+
+def bearish_pullback_confluence(df: pd.DataFrame, lookback: int = 50) -> bool:
+    """Mirror of :func:`bullish_pullback_confluence` for shorts: broader trend
+    bearish (EMA50 below EMA200), price bounced into the golden pocket of a
+    down-swing, and EMA9 has just crossed back below EMA21."""
+    if len(df) < 200:
+        return False
+    last = df.iloc[-1]
+    if not (last["close_50_ema"] < last["close_200_ema"]):
+        return False
+    fib = fibonacci_levels(df, lookback)
+    if fib.get("swing_direction") != "down":
+        return False
+    retracement = fib.get("retracement", {})
+    pocket_low, pocket_high = retracement.get("0.500"), retracement.get("0.618")
+    if pocket_high is None or pocket_low is None:
+        return False
+    in_pocket = pocket_low <= last["close"] <= pocket_high
+    return bool(in_pocket and ema9_21_bearish_cross(df))
+
+
 def detect_anomalies(
     df: pd.DataFrame,
     resistance: float,
@@ -83,4 +146,12 @@ def detect_anomalies(
         flags.append("failed_breakout")
     if volatility_squeeze_expansion(df):
         flags.append("volatility_squeeze_expansion")
+    if ema9_21_bullish_cross(df):
+        flags.append("ema9_21_bullish_cross")
+    if ema9_21_bearish_cross(df):
+        flags.append("ema9_21_bearish_cross")
+    if bullish_pullback_confluence(df):
+        flags.append("bullish_pullback_confluence")
+    if bearish_pullback_confluence(df):
+        flags.append("bearish_pullback_confluence")
     return flags

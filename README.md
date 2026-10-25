@@ -100,8 +100,8 @@ Run it:
 # one cycle, fixed symbols, for a quick check
 python -m scanner --symbols BTCUSDT,ETHUSDT,INJUSDT --once
 
-# continuous 24/7 scan of the top 40 USDT perpetuals by volume, every 5 minutes
-python -m scanner --top-n 40 --interval 300
+# continuous 24/7 scan of the top 60 USDT perpetuals by volume, every 5 minutes
+python -m scanner --top-n 60 --interval 300
 ```
 
 Or use the convenience scripts in [`tool/`](tool) (see **Local setup** below), e.g.

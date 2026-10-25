@@ -5,7 +5,7 @@
 # Usage:
 #   ./tool/run_scanner.sh --once
 #   ./tool/run_scanner.sh --symbols BTCUSDT,ETHUSDT --interval 60
-#   ./tool/run_scanner.sh --top-n 25            # default: loops forever, every 5 min
+#   ./tool/run_scanner.sh --top-n 60            # default: loops forever, every 5 min
 
 set -euo pipefail
 

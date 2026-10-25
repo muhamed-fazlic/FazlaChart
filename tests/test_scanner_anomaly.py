@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 from tradingagents.dataflows.vendors.binance.anomaly import (
+    bearish_pullback_confluence,
+    bullish_pullback_confluence,
     detect_anomalies,
+    ema9_21_bearish_cross,
+    ema9_21_bullish_cross,
     failed_breakout,
     oi_rising_price_flat_funding_spiking,
     price_up_volume_not_confirming,
@@ -74,3 +79,103 @@ def test_detect_anomalies_aggregates_all_checks():
     df = add_indicators(klines_to_dataframe(_make_klines(closes, volumes)))
     anomalies = detect_anomalies(df, resistance=999.0, funding_rate=0.0, oi_change_pct_60m=None)
     assert "price_up_volume_not_confirming" in anomalies
+
+
+def _build_confluence_df(
+    *,
+    broader_trend: str,
+    swing_direction: str,
+    ema_cross: str | None,
+    pocket_close: float | None,
+) -> pd.DataFrame:
+    """Build a 201-row synthetic frame with hand-placed swing high/low and
+    EMA columns, so the confluence conditions (broader trend, Fibonacci
+    pocket, fresh EMA9/21 cross) can be dialed in directly instead of
+    reverse-engineered from a price sequence. Only the columns the
+    confluence/fib/ema-cross functions actually read are populated.
+    """
+    n = 201
+    high = [100.0] * n
+    low = [95.0] * n
+    # fibonacci_levels' 50-candle window is rows [150:200) (it excludes the
+    # last, still-forming row). Placing the swing low at the start of that
+    # window and the swing high at its end makes it an "up" swing (the most
+    # recent extreme is the high); swapping the positions makes it "down".
+    if swing_direction == "up":
+        low[150], high[199] = 90.0, 130.0
+    else:
+        high[150], low[199] = 130.0, 90.0
+
+    close_9_ema = [95.0] * n
+    close_21_ema = [95.0] * n
+    if ema_cross == "bullish_cross":
+        close_9_ema[-2], close_21_ema[-2] = 94.0, 95.0  # bearish the candle before
+        close_9_ema[-1], close_21_ema[-1] = 96.0, 95.0  # flips bullish on the last candle
+    elif ema_cross == "bearish_cross":
+        close_9_ema[-2], close_21_ema[-2] = 96.0, 95.0
+        close_9_ema[-1], close_21_ema[-1] = 94.0, 95.0
+
+    close = [100.0] * n
+    if pocket_close is not None:
+        close[-1] = pocket_close
+
+    return pd.DataFrame(
+        {
+            "high": high,
+            "low": low,
+            "close": close,
+            "close_9_ema": close_9_ema,
+            "close_21_ema": close_21_ema,
+            "close_50_ema": [110.0 if broader_trend == "bullish" else 90.0] * n,
+            "close_200_ema": [100.0] * n,
+        }
+    )
+
+
+def test_bullish_pullback_confluence_fires_when_all_three_conditions_align():
+    df = _build_confluence_df(
+        broader_trend="bullish",
+        swing_direction="up",
+        ema_cross="bullish_cross",
+        pocket_close=107.0,  # inside the 0.5-0.618 retracement of the 90-130 up-swing
+    )
+    assert ema9_21_bullish_cross(df) is True
+    assert bullish_pullback_confluence(df) is True
+
+
+def test_bullish_pullback_confluence_false_without_a_fresh_cross():
+    df = _build_confluence_df(
+        broader_trend="bullish", swing_direction="up", ema_cross=None, pocket_close=107.0
+    )
+    assert bullish_pullback_confluence(df) is False
+
+
+def test_bullish_pullback_confluence_false_outside_the_golden_pocket():
+    df = _build_confluence_df(
+        broader_trend="bullish",
+        swing_direction="up",
+        ema_cross="bullish_cross",
+        pocket_close=129.0,  # near the swing high, not the retracement pocket
+    )
+    assert bullish_pullback_confluence(df) is False
+
+
+def test_bullish_pullback_confluence_false_when_broader_trend_is_not_bullish():
+    df = _build_confluence_df(
+        broader_trend="bearish",
+        swing_direction="up",
+        ema_cross="bullish_cross",
+        pocket_close=107.0,
+    )
+    assert bullish_pullback_confluence(df) is False
+
+
+def test_bearish_pullback_confluence_fires_when_all_three_conditions_align():
+    df = _build_confluence_df(
+        broader_trend="bearish",
+        swing_direction="down",
+        ema_cross="bearish_cross",
+        pocket_close=112.0,  # inside the mirrored 0.5-0.618 pocket (110-114.72) of the 90-130 down-swing
+    )
+    assert ema9_21_bearish_cross(df) is True
+    assert bearish_pullback_confluence(df) is True
