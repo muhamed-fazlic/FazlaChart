@@ -32,13 +32,43 @@ CREATE INDEX IF NOT EXISTS idx_scans_symbol_time ON scans (symbol, scanned_at);
 """
 
 
-def init_db(storage_path: str) -> sqlite3.Connection:
+def init_db(storage_path: str, timeout: float = 10.0) -> sqlite3.Connection:
+    """Open (creating if needed) the scanner database and ensure its schema.
+
+    WAL journal mode lets readers (the dashboard, potentially several at
+    once) proceed concurrently while the scanner holds a write transaction,
+    instead of the default rollback-journal mode's writer-blocks-everyone
+    behaviour; ``timeout`` makes a connection retry-and-wait on a transient
+    lock rather than raising ``database is locked`` immediately, which
+    becomes likely the moment more than one connection touches the database
+    around the same instant (e.g. a scan cycle writing while the dashboard's
+    UI fires several read requests at once).
+    """
     path = Path(storage_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=timeout)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
+
+
+def connect_for_reads(storage_path: str, timeout: float = 10.0) -> sqlite3.Connection:
+    """A plain connection for read-only endpoints that doesn't repeat the
+    schema-creation write statements ``init_db`` runs on every call — those
+    writes are pointless once the schema already exists, and the fewer
+    write-journal touches happen on a hot read path, the less lock
+    contention there is against the scanner's own writer connection.
+
+    Deliberately does NOT (re-)issue ``PRAGMA journal_mode=WAL`` here:
+    switching journal mode itself needs a brief exclusive lock, and once
+    some writer connection has switched the database file to WAL mode that
+    setting is persisted in the file itself, so every later connection
+    (read or write) automatically uses WAL without needing to ask again.
+    Asking again on every single read connection only reintroduces the
+    lock contention this function exists to avoid.
+    """
+    return sqlite3.connect(str(storage_path), timeout=timeout)
 
 
 def save_scan_result(

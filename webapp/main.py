@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from scanner.storage import (
+    connect_for_reads,
     fetch_latest_scan,
     fetch_latest_scan_per_symbol,
     fetch_symbol_history,
@@ -35,6 +36,21 @@ from scanner.storage import (
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="FazlaChart Scanner Dashboard")
+
+
+@app.on_event("startup")
+async def _raise_threadpool_capacity() -> None:
+    """``GET /api/symbol/{symbol}/calibration`` is a sync endpoint, so each
+    call occupies one of anyio's worker-thread pool slots (default 40) for
+    its full duration. On a cold cache (e.g. right after a restart) that
+    call runs a real backtest — a few seconds of network + computation —
+    so a burst of many cold-cache calibration requests can otherwise fill
+    the pool and make unrelated fast endpoints (like ``/api/overview``)
+    queue up behind them. Raising the capacity gives slow, rare cold-cache
+    lookups room without starving the rest of the dashboard."""
+    from anyio import to_thread
+
+    to_thread.current_default_thread_limiter().total_tokens = 200
 
 
 @app.middleware("http")
@@ -65,8 +81,16 @@ def _btc_symbol() -> str:
 def _get_conn() -> sqlite3.Connection:
     # A short-lived connection per request is simplest and safe for SQLite's
     # single-writer/many-reader model; the scanner process holds its own
-    # separate connection for writes.
-    return init_db(_storage_path())
+    # separate connection for writes. Re-running the schema-creation writes
+    # of init_db() on every single request used to add needless write-lock
+    # contention against the scanner's own writes (this is what caused the
+    # "database is locked" crash once the win-rate column started firing
+    # dozens of near-simultaneous requests per page load) — so once the
+    # database file actually exists, just open a plain read connection.
+    path = _storage_path()
+    if not Path(path).exists():
+        return init_db(path)
+    return connect_for_reads(path)
 
 
 def _age_seconds(iso_timestamp: str) -> float:
