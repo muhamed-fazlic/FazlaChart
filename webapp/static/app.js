@@ -92,6 +92,44 @@ function showDetail(symbolRow) {
   document.getElementById("analysis-result").innerHTML = "";
   document.getElementById("analyze-status").textContent = "";
   document.getElementById("detail-modal").classList.remove("hidden");
+  loadCalibrationPreview(symbolRow.symbol);
+}
+
+async function loadCalibrationPreview(symbol) {
+  const el = document.getElementById("calibration-preview");
+  el.className = "calibration-preview muted";
+  el.textContent = "Checking historical win rate (free, no AI)…";
+  try {
+    const resp = await fetch(`/api/symbol/${symbol}/calibration`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    // A stale click (user already moved to a different row) must not paint
+    // over the row now actually open.
+    if (symbol !== currentDetailSymbol) return;
+
+    if (!data.matches.length) {
+      el.className = "calibration-preview muted";
+      el.innerHTML = `No historical calibration data yet for: ${data.active_labels.join(", ")}.`;
+      return;
+    }
+
+    el.className = "calibration-preview";
+    el.innerHTML = data.matches
+      .map((m) => {
+        const lowN = m.n < 30;
+        const winClass = m.win_rate_pct === null ? "" : m.win_rate_pct >= 55 ? "pos" : m.win_rate_pct <= 45 ? "neg" : "";
+        return (
+          `<div><b>${m.label}</b> → ${m.direction}: win rate ` +
+          `<span class="${winClass}"><b>${fmt(m.win_rate_pct, 1)}%</b></span> ` +
+          `(n=${m.n}${lowN ? ", small sample" : ""}, avg net ${fmt(m.avg_net_return_pct, 2)}%)</div>`
+        );
+      })
+      .join("");
+  } catch (err) {
+    if (symbol !== currentDetailSymbol) return;
+    el.className = "calibration-preview muted";
+    el.textContent = "Could not load historical win rate.";
+  }
 }
 
 function hideDetail() {

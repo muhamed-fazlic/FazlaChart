@@ -171,6 +171,58 @@ def test_analyze_endpoint_returns_structured_payload(client, monkeypatch):
     assert captured["model"] == "openai/gpt-oss-120b"
 
 
+def test_calibration_endpoint_returns_matches_without_llm(client, monkeypatch):
+    from scanner.calibration import CalibrationStats
+
+    fake_stats = [
+        CalibrationStats(
+            label="trend:bearish",
+            direction="short",
+            horizon_candles=12,
+            n=387,
+            win_rate_pct=37.0,
+            avg_net_return_pct=-0.173,
+            avg_win_return_pct=0.637,
+            avg_loss_return_pct=-0.647,
+        ),
+        CalibrationStats(
+            label="anomaly:failed_breakout",
+            direction="short",
+            horizon_candles=12,
+            n=41,
+            win_rate_pct=34.1,
+            avg_net_return_pct=-1.283,
+            avg_win_return_pct=0.953,
+            avg_loss_return_pct=-2.442,
+        ),
+    ]
+
+    captured = {}
+
+    def _fake_get_calibration_stats(symbol, timeframe, horizons=(12,), **_kwargs):
+        captured["symbol"] = symbol
+        captured["timeframe"] = timeframe
+        captured["horizons"] = horizons
+        return fake_stats
+
+    monkeypatch.setattr("agents_crypto.calibration_lookup.get_calibration_stats", _fake_get_calibration_stats)
+
+    resp = client.get("/api/symbol/injusdt/calibration")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["symbol"] == "INJUSDT"
+    assert body["active_labels"] == ["trend:bearish", "anomaly:failed_breakout"]
+    assert len(body["matches"]) == 2
+    assert body["matches"][0]["win_rate_pct"] == 37.0
+    assert captured["symbol"] == "INJUSDT"
+    assert captured["timeframe"] == "1h"
+
+
+def test_calibration_endpoint_returns_404_for_unknown_symbol(client):
+    resp = client.get("/api/symbol/DOESNOTEXISTUSDT/calibration")
+    assert resp.status_code == 404
+
+
 def test_analyze_endpoint_returns_502_on_failure(client, monkeypatch):
     def _raise(*_args, **_kwargs):
         raise RuntimeError("Ollama is not reachable")

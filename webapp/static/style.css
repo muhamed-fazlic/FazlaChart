@@ -165,6 +165,17 @@ tbody tr:hover { background: #1c2430; }
 }
 .close-btn:hover { color: var(--text); }
 
+.calibration-preview {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 8px 0 14px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .analysis-bar {
   display: flex;
   align-items: center;

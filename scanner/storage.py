@@ -77,6 +77,25 @@ def fetch_recent_scans(conn: sqlite3.Connection, symbol: str, limit: int = 50) -
     return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
 
 
+def fetch_latest_scan(conn: sqlite3.Connection, symbol: str) -> dict[str, Any] | None:
+    """The single most recent scan row for one symbol, or ``None`` if it has
+    never been scanned — e.g. for a cheap per-symbol lookup that doesn't need
+    every symbol like :func:`fetch_latest_scan_per_symbol` does."""
+    cursor = conn.execute(
+        "SELECT symbol, scanned_at, reference_timeframe, close_price, trend, anomalies_json, snapshot_json"
+        " FROM scans WHERE symbol = ? ORDER BY scanned_at DESC LIMIT 1",
+        (symbol,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    columns = [description[0] for description in cursor.description]
+    result = dict(zip(columns, row, strict=False))
+    result["anomalies"] = json.loads(result.pop("anomalies_json"))
+    result["snapshot"] = json.loads(result.pop("snapshot_json"))
+    return result
+
+
 def fetch_latest_scan_per_symbol(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """One row per symbol — its most recent scan — for a dashboard/overview.
     Includes the full parsed snapshot (indicators, derivatives, anomalies

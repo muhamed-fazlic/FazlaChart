@@ -25,7 +25,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from scanner.storage import fetch_latest_scan_per_symbol, fetch_symbol_history, init_db
+from scanner.storage import (
+    fetch_latest_scan,
+    fetch_latest_scan_per_symbol,
+    fetch_symbol_history,
+    init_db,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -130,6 +135,52 @@ def overview() -> dict[str, Any]:
 
     generated_at = max(r["scanned_at"] for r in rows)
     return {"btc": btc_summary, "symbols": symbols, "generated_at": generated_at}
+
+
+def _active_labels(trend: str, anomalies: list[str]) -> list[str]:
+    """Same label-naming scheme ``agents_crypto.derivatives_risk_agent``
+    uses, duplicated here (it's two lines) instead of imported, so this
+    free endpoint never has to pull in the LLM client stack just to compute
+    which calibration labels are active right now."""
+    return [f"trend:{trend}"] + [f"anomaly:{a}" for a in anomalies]
+
+
+@app.get("/api/symbol/{symbol}/calibration")
+def symbol_calibration(symbol: str, horizon_candles: int = 12) -> dict[str, Any]:
+    """The historical win-rate for whatever label(s) are active on this
+    symbol *right now*, straight from the cached calibration backtest — the
+    exact same ground truth ``POST /api/analyze/{symbol}`` grounds its LLM
+    call in, but with no LLM call and no tokens spent. Meant to be checked
+    first, so an "Analyze with AI" click only happens once this already
+    looks worth spending a call on.
+    """
+    symbol = symbol.upper()
+    conn = _get_conn()
+    try:
+        row = fetch_latest_scan(conn, symbol)
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No scan history for {symbol} yet")
+
+    timeframe = row["reference_timeframe"]
+    tf_snapshot = row["snapshot"].get("timeframes", {}).get(timeframe, {})
+    labels = _active_labels(row["trend"], tf_snapshot.get("anomalies", []))
+
+    # Imported lazily so merely running the dashboard never pulls in the
+    # backtest/pandas machinery unless this endpoint is actually hit.
+    from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats
+
+    calibration_stats = get_calibration_stats(symbol, timeframe, horizons=(horizon_candles,))
+    matches = find_stats_for_labels(calibration_stats, labels, horizon_candles)
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "horizon_candles": horizon_candles,
+        "active_labels": labels,
+        "matches": [m.__dict__ for m in matches],
+    }
 
 
 @app.get("/api/symbol/{symbol}/history")
