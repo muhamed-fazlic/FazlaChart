@@ -63,6 +63,15 @@ def _get(path: str, params: dict[str, Any] | None = None) -> Any:
                 )
                 time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
                 continue
+            if 400 <= response.status_code < 500:
+                # Permanent client error (e.g. unknown/invalid symbol): retrying
+                # with the same request won't help, so fail fast instead of
+                # burning _MAX_RETRIES * backoff seconds on a doomed call.
+                symbol = (params or {}).get("symbol", "?")
+                raise NoMarketDataError(
+                    symbol,
+                    detail=f"Binance rejected {path} (status {response.status_code}): {response.text[:200]}",
+                )
             response.raise_for_status()
             return response.json()
         except requests.RequestException as exc:

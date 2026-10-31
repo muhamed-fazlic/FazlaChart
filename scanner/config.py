@@ -15,6 +15,17 @@ class ScannerConfig:
     symbols: tuple[str, ...] = ()
     top_n_by_volume: int = 60
 
+    # Once a symbol has been scanned, keep refreshing it every cycle even if
+    # it later drops out of the current top-N by volume — otherwise its last
+    # snapshot just sits in the dashboard getting staler and staler forever.
+    # `max_universe_size` is the hard ceiling on how large that "current +
+    # everything ever seen" set is allowed to grow, so a cycle never scans an
+    # unbounded number of symbols; least-recently-scanned known symbols are
+    # dropped first once the ceiling is hit. Binance's public rate limit has
+    # ample headroom for this (see the comment above `top_n_by_volume`).
+    keep_known_symbols: bool = True
+    max_universe_size: int = 250
+
     # Timeframes analyzed for every symbol, shortest first.
     timeframes: tuple[str, ...] = ("5m", "15m", "1h", "4h")
 

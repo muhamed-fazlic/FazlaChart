@@ -22,6 +22,19 @@
     </div>
   </header>
 
+  <section class="symbol-filter">
+    <form id="symbol-filter-form">
+      <input type="text" id="symbol-filter-input" list="symbol-suggestions" placeholder="npr. 1000PEPEUSDT" autocomplete="off" />
+      <datalist id="symbol-suggestions"></datalist>
+      <button type="submit">Prikaži</button>
+    </form>
+    <label class="toggle">
+      <input type="checkbox" id="show-all-toggle" />
+      prikaži sve coine (sporije, troši više resursa)
+    </label>
+    <span id="symbol-filter-status" class="muted"></span>
+  </section>
+
   <section id="btc-banner" class="btc-banner muted">Loading BTC reference…</section>
 
   <main>
@@ -43,7 +56,7 @@
         </tr>
       </thead>
       <tbody id="scan-body">
-        <tr><td colspan="12" class="muted">Loading…</td></tr>
+        <tr><td colspan="12" class="muted">Učitavam top coine sa najjačom strukturom…</td></tr>
       </tbody>
     </table>
   </main>
@@ -67,8 +80,19 @@
       </div>
       <div id="analysis-result" class="analysis-result hidden"></div>
 
-      <h3 class="muted">Raw snapshot</h3>
-      <pre id="detail-json"></pre>
+      <h3 class="muted">Likely SL/TP zones (volume-profile heatmap)</h3>
+      <div id="detail-heatmap" class="heatmap-wrap muted">Loading heatmap…</div>
+
+      <h3 class="muted">Timeframes</h3>
+      <div id="detail-timeframes" class="timeframe-grid"></div>
+
+      <h3 class="muted">Derivatives &amp; pivot points</h3>
+      <div id="detail-derivatives" class="derivatives-grid"></div>
+
+      <details class="raw-json-toggle">
+        <summary class="muted">Raw JSON (debug)</summary>
+        <pre id="detail-json"></pre>
+      </details>
     </div>
   </div>
 

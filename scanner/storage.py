@@ -149,6 +149,17 @@ def fetch_latest_scan_per_symbol(conn: sqlite3.Connection) -> list[dict[str, Any
     return rows
 
 
+def fetch_known_symbols(conn: sqlite3.Connection) -> list[str]:
+    """Every symbol ever persisted, most-recently-scanned first. Used to keep
+    refreshing a symbol that has since fallen out of the current top-N by
+    volume, instead of letting its last snapshot go stale forever once it
+    drops out of rotation."""
+    cursor = conn.execute(
+        "SELECT symbol FROM scans GROUP BY symbol ORDER BY MAX(scanned_at) DESC"
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
 def fetch_symbol_history(conn: sqlite3.Connection, symbol: str, limit: int = 200) -> list[dict[str, Any]]:
     """Chronological (oldest-first) close price + trend history for one
     symbol, for a sparkline/chart on the dashboard."""

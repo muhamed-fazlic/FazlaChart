@@ -24,6 +24,7 @@ from tradingagents.dataflows.vendors.binance.indicators import (
     support_resistance,
     volume_change_pct,
 )
+from tradingagents.dataflows.vendors.binance.liquidity_heatmap import compute_liquidity_heatmap
 from tradingagents.dataflows.vendors.binance.pivots import pivot_points_from_ohlc
 
 
@@ -125,6 +126,23 @@ def _oi_changes_over_windows(
         past_value = float(oi_hist[-1 - bucket_count]["sumOpenInterest"])
         changes[window] = round(((oi_now - past_value) / past_value) * 100.0, 3) if past_value else None
     return changes
+
+
+def build_liquidity_heatmap_snapshot(
+    symbol: Annotated[str, "futures symbol, e.g. INJUSDT"],
+    timeframe: Annotated[str, "kline interval, e.g. 15m, 1h, 4h"] = "1h",
+    limit: int = 200,
+    bins: int = 24,
+) -> dict[str, Any]:
+    """Volume-profile proxy for where TP/SL orders likely cluster (see
+    :mod:`tradingagents.dataflows.vendors.binance.liquidity_heatmap` for the
+    approximation this is built on — it is not real order-book data)."""
+    klines = client.get_klines(symbol, timeframe, limit=limit)
+    df = klines_to_dataframe(klines)
+    heatmap = compute_liquidity_heatmap(df, bins=bins)
+    heatmap["symbol"] = symbol
+    heatmap["timeframe"] = timeframe
+    return heatmap
 
 
 def build_symbol_snapshot(

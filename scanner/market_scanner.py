@@ -13,7 +13,7 @@ from typing import Any
 from scanner.anomaly import collect_all_anomalies
 from scanner.btc_context import build_btc_context
 from scanner.config import ScannerConfig
-from scanner.storage import init_db, save_scan_result
+from scanner.storage import fetch_known_symbols, init_db, save_scan_result
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance import client
 from tradingagents.dataflows.vendors.binance.snapshot import build_symbol_snapshot
@@ -27,11 +27,23 @@ class MarketScanner:
         self.conn = init_db(self.config.storage_path)
 
     def resolve_universe(self) -> list[str]:
-        """The symbols to scan this cycle: explicit list, else top-N by volume."""
+        """The symbols to scan this cycle: explicit list, else top-N by
+        volume unioned with every symbol already known from past cycles (so
+        a symbol that drops out of the current top-N keeps getting
+        refreshed instead of its dashboard row going stale forever), capped
+        at `max_universe_size` with the freshest top-N ranking taking
+        priority over older known symbols when trimming to fit."""
         if self.config.symbols:
             universe = list(self.config.symbols)
         else:
-            universe = client.get_top_symbols_by_quote_volume(top_n=self.config.top_n_by_volume)
+            current_top_n = client.get_top_symbols_by_quote_volume(top_n=self.config.top_n_by_volume)
+            if self.config.keep_known_symbols:
+                known = fetch_known_symbols(self.conn)
+                seen = set(current_top_n)
+                universe = list(current_top_n) + [s for s in known if s not in seen]
+                universe = universe[: self.config.max_universe_size]
+            else:
+                universe = current_top_n
         return [s for s in universe if s not in self.config.symbols_blocklist]
 
     def scan_symbol(self, symbol: str, btc_context: dict[str, Any]) -> dict[str, Any] | None:

@@ -13,11 +13,19 @@
 
 * { box-sizing: border-box; }
 
+html, body {
+  height: 100%;
+}
+
 body {
   margin: 0;
   font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
   background: var(--bg);
   color: var(--text);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
 }
 
 header {
@@ -28,6 +36,7 @@ header {
   border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
   gap: 10px;
+  flex: 0 0 auto;
 }
 
 h1 {
@@ -66,11 +75,17 @@ h1 .subtitle {
   display: flex;
   gap: 18px;
   flex-wrap: wrap;
+  flex: 0 0 auto;
 }
 
 .btc-banner b { color: var(--text); }
 
-main { padding: 0 20px 20px; overflow-x: auto; }
+main {
+  padding: 0 20px 20px;
+  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
 
 table {
   width: 100%;
@@ -241,4 +256,151 @@ footer {
   padding: 12px 20px;
   font-size: 12px;
   border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.symbol-filter {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+.symbol-filter form {
+  display: flex;
+  gap: 8px;
+}
+
+.symbol-filter input[type="text"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  width: 220px;
+  text-transform: uppercase;
+}
+
+.symbol-filter input[type="text"]::placeholder { text-transform: none; }
+
+.symbol-filter button {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.symbol-filter button:hover { border-color: var(--blue); }
+
+#symbol-filter-status { font-size: 13px; }
+
+.timeframe-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin: 8px 0 16px;
+}
+
+.tf-card {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.tf-card-header {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  margin-bottom: 6px;
+  font-size: 14px;
+}
+
+.tf-table {
+  width: 100%;
+  font-size: 12px;
+  border-collapse: collapse;
+  min-width: 0;
+}
+
+.tf-table td {
+  border-bottom: none;
+  padding: 2px 4px;
+  white-space: normal;
+  color: var(--muted);
+}
+
+.tf-table td:nth-child(odd) { color: var(--muted); width: 40%; }
+.tf-table td:nth-child(even) { color: var(--text); }
+
+.anomaly-badges { margin-top: 6px; }
+
+.heatmap-wrap { margin-bottom: 10px; }
+
+.heatmap-bar-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 50px;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  margin: 1px 0;
+}
+
+.heatmap-bar-track {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 3px;
+  height: 14px;
+  position: relative;
+  overflow: hidden;
+}
+
+.heatmap-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: linear-gradient(90deg, #4c7cff, #ff5a5a);
+  border-radius: 3px;
+}
+
+.heatmap-bar-row.is-poc .heatmap-bar-fill { background: linear-gradient(90deg, #ffb340, #ff5a5a); }
+.heatmap-bar-row.is-current td,
+.heatmap-bar-row.is-current { color: #ffd76a; font-weight: 600; }
+
+.heatmap-stop-zones { margin-top: 6px; font-size: 11px; }
+.heatmap-stop-zones li { color: var(--muted); }
+
+.fib-toggle {
+  margin-top: 8px;
+  font-size: 11px;
+}
+
+.fib-toggle summary { cursor: pointer; }
+
+.fib-levels {
+  margin: 4px 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.fib-levels b { color: var(--text); }
+
+.derivatives-grid {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.raw-json-toggle {
+  margin-top: 10px;
+}
+
+.raw-json-toggle summary {
+  cursor: pointer;
+  font-size: 12px;
 }
