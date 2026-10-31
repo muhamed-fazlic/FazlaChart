@@ -441,29 +441,42 @@ footer {
   .symbol-filter form { width: 100%; }
   .symbol-filter input[type="text"] { flex: 1 1 auto; width: auto; }
 
-  main { padding: 0 8px 12px; }
+  main { padding: 0 8px 12px; overflow-x: hidden; }
 
   /* Stacked "card" table: hide the header row, turn every <tr> into a
-     bordered card and every <td> into a label/value line. */
-  table { min-width: 0; font-size: 13px; }
-  thead { display: none; }
+     bordered card and every <td> into a label/value grid line.
+     Every table-related element must be forced to display:block/grid
+     (not just tr/td) — otherwise the browser keeps sizing things via the
+     table layout algorithm's intrinsic/content width, which is what
+     caused the earlier bug where values were pushed off-screen to the
+     right of a hidden horizontal scrollbar. */
+  #scan-table {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    font-size: 13px;
+  }
+  #scan-table thead { display: none; }
+  #scan-table tbody { display: block; width: 100%; }
   #scan-table tbody tr {
     display: block;
+    width: 100%;
     border: 1px solid var(--border);
     border-radius: 8px;
     margin: 0 0 10px;
-    padding: 6px 10px;
+    padding: 4px 10px;
     background: var(--panel);
   }
   #scan-table tbody td {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 10px;
-    padding: 5px 0;
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    column-gap: 10px;
+    align-items: start;
+    padding: 6px 0;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     white-space: normal;
-    text-align: right;
+    text-align: left;
+    width: 100%;
   }
   #scan-table tbody td:last-child { border-bottom: none; }
   #scan-table tbody td::before {
@@ -472,8 +485,6 @@ footer {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.03em;
-    flex: 0 0 auto;
-    text-align: left;
   }
 
   .modal-content {
