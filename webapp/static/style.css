@@ -404,3 +404,97 @@ footer {
   cursor: pointer;
   font-size: 12px;
 }
+
+/* ---------------------------------------------------------------------
+   Mobile layout (phones / narrow viewports).
+   Converts the dense scan table into stacked "cards" per row (classic
+   responsive-table technique using data-label attributes set in app.js),
+   and tightens up spacing/controls so the dashboard is usable on a phone
+   while driving a live trade.
+   --------------------------------------------------------------------- */
+@media (max-width: 760px) {
+  header {
+    padding: 10px 12px;
+  }
+
+  h1 { font-size: 17px; }
+  h1 .subtitle { display: block; margin-left: 0; font-size: 12px; }
+
+  .header-right {
+    width: 100%;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .btc-banner {
+    padding: 8px 12px;
+    font-size: 12px;
+    gap: 10px;
+  }
+
+  .symbol-filter {
+    padding: 8px 12px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .symbol-filter form { width: 100%; }
+  .symbol-filter input[type="text"] { flex: 1 1 auto; width: auto; }
+
+  main { padding: 0 8px 12px; }
+
+  /* Stacked "card" table: hide the header row, turn every <tr> into a
+     bordered card and every <td> into a label/value line. */
+  table { min-width: 0; font-size: 13px; }
+  thead { display: none; }
+  #scan-table tbody tr {
+    display: block;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin: 0 0 10px;
+    padding: 6px 10px;
+    background: var(--panel);
+  }
+  #scan-table tbody td {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    white-space: normal;
+    text-align: right;
+  }
+  #scan-table tbody td:last-child { border-bottom: none; }
+  #scan-table tbody td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex: 0 0 auto;
+    text-align: left;
+  }
+
+  .modal-content {
+    width: 100%;
+    max-width: 100%;
+    max-height: 100vh;
+    height: 100%;
+    border-radius: 0;
+    padding: 14px;
+  }
+
+  .timeframe-grid { grid-template-columns: 1fr; }
+
+  .analysis-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .analysis-bar select, .analysis-bar button { width: 100%; }
+
+  .heatmap-bar-row {
+    grid-template-columns: 80px 1fr 42px;
+    font-size: 10px;
+  }
+}

@@ -60,18 +60,18 @@ function renderTable(symbols, anomaliesOnly) {
     .map(
       (s, idx) => `
     <tr data-idx="${idx}" data-symbol="${s.symbol}">
-      <td><b>${s.symbol}</b></td>
-      <td class="${trendClass(s.trend)}">${s.trend}</td>
-      <td>${fmt(s.close, 4)}</td>
-      <td>${fmt(s.rsi, 1)}</td>
-      <td>${fmt(s.ema20, 4)} / ${fmt(s.ema50, 4)}</td>
-      <td class="${signClass(s.volume_change_pct)}">${fmt(s.volume_change_pct, 1)}%</td>
-      <td>${fmt((s.funding_rate || 0) * 100, 4)}%</td>
-      <td class="${signClass(s.open_interest_change_pct_60m)}">${fmt(s.open_interest_change_pct_60m, 2)}%</td>
-      <td>${fmt(s.support, 4)} / ${fmt(s.resistance, 4)}</td>
-      <td>${s.anomalies.map((a) => `<span class="anomaly-badge">${a}</span>`).join("") || "—"}</td>
-      <td class="winrate-cell muted" data-wr-symbol="${s.symbol}">…</td>
-      <td class="muted">${fmtAge(s.age_seconds)}</td>
+      <td data-label="Symbol"><b>${s.symbol}</b></td>
+      <td data-label="Trend" class="${trendClass(s.trend)}">${s.trend}</td>
+      <td data-label="Close">${fmt(s.close, 4)}</td>
+      <td data-label="RSI">${fmt(s.rsi, 1)}</td>
+      <td data-label="EMA20 / EMA50">${fmt(s.ema20, 4)} / ${fmt(s.ema50, 4)}</td>
+      <td data-label="Vol Δ%" class="${signClass(s.volume_change_pct)}">${fmt(s.volume_change_pct, 1)}%</td>
+      <td data-label="Funding">${fmt((s.funding_rate || 0) * 100, 4)}%</td>
+      <td data-label="OI Δ60m%" class="${signClass(s.open_interest_change_pct_60m)}">${fmt(s.open_interest_change_pct_60m, 2)}%</td>
+      <td data-label="Support / Resistance">${fmt(s.support, 4)} / ${fmt(s.resistance, 4)}</td>
+      <td data-label="Anomalies">${s.anomalies.map((a) => `<span class="anomaly-badge">${a}</span>`).join("") || "—"}</td>
+      <td data-label="Win rate" class="winrate-cell muted" data-wr-symbol="${s.symbol}">…</td>
+      <td data-label="Age" class="muted">${fmtAge(s.age_seconds)}</td>
     </tr>`
     )
     .join("");
@@ -527,18 +527,18 @@ function renderSingleSymbolRow(s) {
     : `<span class="muted" title="Nije u redovnom skeniranju (ispod top-N po volumenu) — podaci su dohvaćeni uživo.">(uživo, nije praćen)</span>`;
   body.innerHTML = `
     <tr data-idx="0" data-symbol="${s.symbol}">
-      <td><b>${s.symbol}</b> ${trackedNote}</td>
-      <td class="${trendClass(s.trend)}">${s.trend}</td>
-      <td>${fmt(s.close, 4)}</td>
-      <td>${fmt(s.rsi, 1)}</td>
-      <td>${fmt(s.ema20, 4)} / ${fmt(s.ema50, 4)}</td>
-      <td class="${signClass(s.volume_change_pct)}">${fmt(s.volume_change_pct, 1)}%</td>
-      <td>${fmt((s.funding_rate || 0) * 100, 4)}%</td>
-      <td class="${signClass(s.open_interest_change_pct_60m)}">${fmt(s.open_interest_change_pct_60m, 2)}%</td>
-      <td>${fmt(s.support, 4)} / ${fmt(s.resistance, 4)}</td>
-      <td>${(s.anomalies || []).map((a) => `<span class="anomaly-badge">${a}</span>`).join("") || "—"}</td>
-      <td class="${wrClass}" title="${wrTitle.replace(/"/g, "&quot;")}">${wrHtml}</td>
-      <td class="muted">${fmtAge(s.age_seconds)}</td>
+      <td data-label="Symbol"><b>${s.symbol}</b> ${trackedNote}</td>
+      <td data-label="Trend" class="${trendClass(s.trend)}">${s.trend}</td>
+      <td data-label="Close">${fmt(s.close, 4)}</td>
+      <td data-label="RSI">${fmt(s.rsi, 1)}</td>
+      <td data-label="EMA20 / EMA50">${fmt(s.ema20, 4)} / ${fmt(s.ema50, 4)}</td>
+      <td data-label="Vol Δ%" class="${signClass(s.volume_change_pct)}">${fmt(s.volume_change_pct, 1)}%</td>
+      <td data-label="Funding">${fmt((s.funding_rate || 0) * 100, 4)}%</td>
+      <td data-label="OI Δ60m%" class="${signClass(s.open_interest_change_pct_60m)}">${fmt(s.open_interest_change_pct_60m, 2)}%</td>
+      <td data-label="Support / Resistance">${fmt(s.support, 4)} / ${fmt(s.resistance, 4)}</td>
+      <td data-label="Anomalies">${(s.anomalies || []).map((a) => `<span class="anomaly-badge">${a}</span>`).join("") || "—"}</td>
+      <td data-label="Win rate" class="${wrClass}" title="${wrTitle.replace(/"/g, "&quot;")}">${wrHtml}</td>
+      <td data-label="Age" class="muted">${fmtAge(s.age_seconds)}</td>
     </tr>`;
   document.querySelector(`tr[data-symbol="${s.symbol}"]`).addEventListener("click", () => showDetail(s));
 }
