@@ -542,6 +542,25 @@ footer {
    while driving a live trade.
    --------------------------------------------------------------------- */
 @media (max-width: 760px) {
+  /* On mobile the growing stack of fixed-size banners (health, BTC, best
+     signal, forward tracking) can add up to more than the viewport height,
+     and the desktop "app shell" layout (body locked to 100vh with only
+     <main> scrolling internally) then clips that overflow instead of
+     letting the user scroll to it. Let the whole page flow and scroll
+     normally on small screens instead. */
+  html, body {
+    height: auto;
+  }
+
+  body {
+    overflow: visible;
+  }
+
+  main {
+    overflow: visible;
+    flex: 0 0 auto;
+  }
+
   header {
     padding: 10px 12px;
   }
