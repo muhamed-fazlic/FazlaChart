@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agents_crypto.risk_calc import compute_risk_levels
+from agents_crypto.risk_calc import KELLY_MAX_FRACTION, compute_kelly_fraction, compute_risk_levels
 
 pytestmark = pytest.mark.unit
 
@@ -28,6 +28,40 @@ def test_risk_reward_ratio_matches_multiplier_ratio():
 def test_rejects_non_positive_price_or_atr(close, atr):
     with pytest.raises(ValueError):
         compute_risk_levels(close=close, atr=atr, bias="long")
+
+
+def test_kelly_fraction_positive_edge_recommends_nonzero_size():
+    # 60% win rate, avg win 2%, avg loss -1% -> clear positive edge.
+    result = compute_kelly_fraction(60.0, avg_win_return_pct=2.0, avg_loss_return_pct=-1.0)
+    assert result.full_kelly_fraction > 0
+    assert 0 < result.recommended_fraction <= KELLY_MAX_FRACTION
+    assert result.warning is None
+
+
+def test_kelly_fraction_negative_edge_recommends_zero():
+    # 40% win rate with a 1:1 win/loss size has no edge at all.
+    result = compute_kelly_fraction(40.0, avg_win_return_pct=1.0, avg_loss_return_pct=-1.0)
+    assert result.full_kelly_fraction <= 0
+    assert result.recommended_fraction == 0.0
+    assert result.warning is not None
+
+
+def test_kelly_fraction_missing_avg_returns_is_safe():
+    result = compute_kelly_fraction(65.0, avg_win_return_pct=None, avg_loss_return_pct=-1.0)
+    assert result.recommended_fraction == 0.0
+    assert result.warning is not None
+
+
+def test_kelly_fraction_is_capped_at_max_fraction():
+    # An extreme, unrealistic edge should still be capped, not scaled unboundedly.
+    result = compute_kelly_fraction(95.0, avg_win_return_pct=10.0, avg_loss_return_pct=-0.1)
+    assert result.recommended_fraction == pytest.approx(KELLY_MAX_FRACTION)
+    assert result.warning is not None
+
+
+def test_kelly_fraction_half_kelly_is_half_of_full():
+    result = compute_kelly_fraction(60.0, avg_win_return_pct=2.0, avg_loss_return_pct=-1.0, fraction_multiplier=0.5)
+    assert result.recommended_fraction == pytest.approx(result.full_kelly_fraction * 0.5, rel=1e-6)
 
 
 def test_rejects_invalid_bias():

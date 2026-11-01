@@ -16,7 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats
-from agents_crypto.risk_calc import compute_risk_levels
+from agents_crypto.risk_calc import compute_kelly_fraction, compute_risk_levels
 from scanner.btc_context import build_btc_context, diverges_from_btc
 from scanner.calibration import current_volatility_regime
 from tradingagents.dataflows.vendors.binance.liquidity_heatmap import compute_liquidity_heatmap
@@ -205,7 +205,20 @@ def _sl_dense_zone_warning(stop_loss: float | None, heatmap: dict[str, Any]) -> 
     return None
 
 
-def _risk_levels_by_timeframe(timeframe_snapshots: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _best_match_for_direction(matches: list[Any], direction: str) -> Any | None:
+    """Among the calibration matches found for this symbol/label, pick the
+    one whose direction agrees with the proposed trade and has the highest
+    conservative (CI lower-bound) win rate — same selection rule used for
+    the Top Signal Now ranking, so Kelly sizing here never contradicts it."""
+    candidates = [m for m in matches if m.direction == direction and m.win_rate_ci_low_pct is not None]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda m: m.win_rate_ci_low_pct)
+
+
+def _risk_levels_by_timeframe(
+    timeframe_snapshots: dict[str, Any], matches_by_tf: dict[str, list[Any]] | None = None
+) -> dict[str, dict[str, Any]]:
     """Entry/SL/TP for every timeframe. Directional (bullish/bearish)
     timeframes get real ATR-based levels; neutral ones get an explicit
     ``bias: "neutral"`` placeholder instead of being silently dropped, so the
@@ -216,14 +229,24 @@ def _risk_levels_by_timeframe(timeframe_snapshots: dict[str, Any]) -> dict[str, 
         if trend not in ("bullish", "bearish") or not tf_snapshot.get("atr"):
             levels_by_tf[tf] = {"bias": "neutral"}
             continue
+        direction = "long" if trend == "bullish" else "short"
         levels = compute_risk_levels(
             close=tf_snapshot["close"],
             atr=tf_snapshot["atr"],
-            bias="long" if trend == "bullish" else "short",
+            bias=direction,
             rsi=tf_snapshot.get("rsi"),
             ema20=tf_snapshot.get("ema20"),
         )
-        levels_by_tf[tf] = levels.__dict__
+        levels_dict = levels.__dict__.copy()
+        match = _best_match_for_direction((matches_by_tf or {}).get(tf, []), direction)
+        if match is not None:
+            kelly = compute_kelly_fraction(match.win_rate_ci_low_pct, match.avg_win_return_pct, match.avg_loss_return_pct)
+            levels_dict["kelly_sizing"] = {
+                "recommended_fraction_pct": round(kelly.recommended_fraction * 100, 2),
+                "full_kelly_fraction_pct": round(kelly.full_kelly_fraction * 100, 2),
+                "warning": kelly.warning,
+            }
+        levels_by_tf[tf] = levels_dict
     return levels_by_tf
 
 
@@ -267,7 +290,7 @@ def assess_symbol(
         matches = find_stats_for_labels(all_regime_stats, labels, horizon_candles)
     matches_json = [m.__dict__ for m in matches]
 
-    multi_timeframe_risk_levels = _risk_levels_by_timeframe(snapshot["timeframes"])
+    multi_timeframe_risk_levels = _risk_levels_by_timeframe(snapshot["timeframes"], matches_by_tf={timeframe: matches})
 
     diverges = diverges_from_btc(tf_snapshot["trend"], btc_context["reference_trend"])
 

@@ -101,6 +101,108 @@ def _extension_check(
     return None, None
 
 
+@dataclass
+class KellySizing:
+    """Fractional-Kelly position-size suggestion derived from a *calibrated*
+    (backtested, not guessed) win rate and average win/loss size.
+
+    Deliberately conservative in three ways: (1) the caller is expected to
+    pass the win rate's 95%-CI *lower bound*, never the raw point estimate,
+    so a lucky small sample can't inflate the suggested size; (2) the result
+    is scaled by ``fraction_multiplier`` (half-Kelly by default — full Kelly
+    is mathematically optimal only for a perfectly known edge, and real
+    edges are estimated with error, so full Kelly tends to oversize and
+    produce brutal drawdowns on real, noisy data); (3) hard-capped at
+    ``KELLY_MAX_FRACTION`` regardless of what the formula says, because no
+    single calibration label — however good it looks — should ever justify
+    betting a huge chunk of capital on one trade.
+    """
+
+    win_rate_used_pct: float
+    full_kelly_fraction: float
+    recommended_fraction: float
+    fraction_multiplier: float
+    warning: str | None = None
+
+
+# Half-Kelly: the standard practitioner compromise between Kelly's optimal
+# long-run growth rate and its extreme sensitivity to estimation error.
+DEFAULT_KELLY_FRACTION_MULTIPLIER = 0.5
+# Never suggest betting more than this fraction of capital on one signal,
+# no matter how good the formula says the edge is.
+KELLY_MAX_FRACTION = 0.25
+# Below this win/loss size, the "edge" is an artifact of rounding/near-zero
+# denominators rather than a real average outcome — treat it as unknown.
+_MIN_MEANINGFUL_RETURN_PCT = 1e-6
+
+
+def compute_kelly_fraction(
+    win_rate_pct: float,
+    avg_win_return_pct: float | None,
+    avg_loss_return_pct: float | None,
+    fraction_multiplier: float = DEFAULT_KELLY_FRACTION_MULTIPLIER,
+) -> KellySizing:
+    """Fractional-Kelly suggested bet size (as a fraction of capital, 0-1).
+
+    ``win_rate_pct`` should be the conservative (95%-CI lower-bound) win
+    rate from calibration, not the raw point estimate — see class docstring.
+    ``avg_win_return_pct`` must be positive, ``avg_loss_return_pct`` must be
+    negative (as stored in ``CalibrationStats``); either missing/zero means
+    there isn't enough resolved history to size off of yet.
+
+    Classic Kelly for a binary bet: f* = p - q/b, where p = win probability,
+    q = 1-p, and b = avg_win / avg_loss (in absolute terms) — the "odds"
+    received on a win relative to what's risked on a loss.
+    """
+    if (
+        avg_win_return_pct is None
+        or avg_loss_return_pct is None
+        or avg_win_return_pct <= _MIN_MEANINGFUL_RETURN_PCT
+        or avg_loss_return_pct >= -_MIN_MEANINGFUL_RETURN_PCT
+    ):
+        return KellySizing(
+            win_rate_used_pct=win_rate_pct,
+            full_kelly_fraction=0.0,
+            recommended_fraction=0.0,
+            fraction_multiplier=fraction_multiplier,
+            warning="Nedovoljno podataka o prosječnom dobitku/gubitku za Kelly proračun — veličina pozicije se ne predlaže.",
+        )
+
+    p = win_rate_pct / 100.0
+    q = 1.0 - p
+    b = avg_win_return_pct / abs(avg_loss_return_pct)
+    full_kelly = p - q / b
+
+    if full_kelly <= 0:
+        return KellySizing(
+            win_rate_used_pct=win_rate_pct,
+            full_kelly_fraction=round(full_kelly, 4),
+            recommended_fraction=0.0,
+            fraction_multiplier=fraction_multiplier,
+            warning=(
+                "Kelly formula daje nultu ili negativnu vrijednost čak i uz konzervativnu (donja CI granica) "
+                "procjenu win rate-a — matematički nema prednosti (edge) po trenutnoj kalibraciji. Preskoči ovaj "
+                "signal ili trguj minimalnom veličinom."
+            ),
+        )
+
+    recommended = min(full_kelly * fraction_multiplier, KELLY_MAX_FRACTION)
+    warning = None
+    if full_kelly * fraction_multiplier > KELLY_MAX_FRACTION:
+        warning = (
+            f"Kelly formula predlaže veći udio kapitala ({full_kelly * fraction_multiplier * 100:.1f}%) — "
+            f"ograničeno na maksimalnih {KELLY_MAX_FRACTION * 100:.0f}% po jednom signalu radi sigurnosti."
+        )
+
+    return KellySizing(
+        win_rate_used_pct=win_rate_pct,
+        full_kelly_fraction=round(full_kelly, 4),
+        recommended_fraction=round(recommended, 4),
+        fraction_multiplier=fraction_multiplier,
+        warning=warning,
+    )
+
+
 def compute_risk_levels(
     close: float,
     atr: float,

@@ -60,15 +60,18 @@ function winRateRangeHtml(low, high) {
 
 function bestSignalEntryHtml(sig) {
   if (!sig.entry) return "";
+  const kelly = sig.kelly_sizing;
   return `
     <div class="best-signal-entry">
       <span>Entry zona: <b>${fmt(sig.entry.entry_zone_low, 4)}–${fmt(sig.entry.entry_zone_high, 4)}</b></span>
       <span>SL: ${fmt(sig.entry.stop_loss, 4)}</span>
       <span>TP: ${fmt(sig.entry.take_profit, 4)}${sig.entry.take_profit_conservative !== undefined && sig.entry.take_profit_conservative !== null ? ` <span class="muted">(konzervativan: ${fmt(sig.entry.take_profit_conservative, 4)})</span>` : ""}</span>
       <span>R:R ${fmt(sig.entry.risk_reward_ratio, 2)}</span>
+      ${kelly ? `<span>💰 Kelly: <b>${fmt(kelly.recommended_fraction_pct, 1)}%</b> kapitala</span>` : ""}
     </div>
     ${sig.entry.extension_warning ? `<div class="best-signal-warning">⏳ ${sig.entry.extension_warning}</div>` : ""}
-    ${sig.entry.volatility_warning ? `<div class="best-signal-warning">⚠️ ${sig.entry.volatility_warning}</div>` : ""}`;
+    ${sig.entry.volatility_warning ? `<div class="best-signal-warning">⚠️ ${sig.entry.volatility_warning}</div>` : ""}
+    ${kelly && kelly.warning ? `<div class="best-signal-warning">💰 ${kelly.warning}</div>` : ""}`;
 }
 
 function bestSignalCardHtml(sig, rank) {
@@ -504,6 +507,11 @@ function renderAssessment(data) {
       const chopWarnRow = lv.chop_zone_warning
         ? `<tr><td></td><td class="neg" colspan="5" style="font-size:11px;">🧲 ${lv.chop_zone_warning}</td></tr>`
         : "";
+      const kellyRow = lv.kelly_sizing
+        ? `<tr><td></td><td colspan="5" style="font-size:11px;">💰 Kelly veličina pozicije: <b>${fmt(lv.kelly_sizing.recommended_fraction_pct, 1)}%</b> kapitala` +
+          (lv.kelly_sizing.warning ? ` <span class="muted">— ${lv.kelly_sizing.warning}</span>` : "") +
+          `</td></tr>`
+        : "";
       const conservativeTp =
         lv.take_profit_conservative !== undefined && lv.take_profit_conservative !== null
           ? ` <span class="muted">(konzervativan: ${fmt(lv.take_profit_conservative, 4)})</span>`
@@ -519,7 +527,7 @@ function renderAssessment(data) {
         <td class="neg">${fmt(lv.stop_loss, 4)} <span class="muted">(${fmt(lv.risk_pct, 2)}%)</span></td>
         <td class="pos">${fmt(lv.take_profit, 4)} <span class="muted">(${fmt(lv.reward_pct, 2)}%)</span>${conservativeTp}</td>
         <td>${fmt(lv.risk_reward_ratio, 2)}</td>
-      </tr>${extensionWarnRow}${warnRow}${chopWarnRow}`;
+      </tr>${extensionWarnRow}${warnRow}${chopWarnRow}${kellyRow}`;
     })
     .join("");
   const riskLevelsHtml = mtfRows

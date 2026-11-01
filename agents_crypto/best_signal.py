@@ -48,7 +48,7 @@ def compute_candidates(rows: list[dict[str, Any]], limit: int = 5) -> dict[str, 
         return {"signals": [], "generated_at": None, "candidates_considered": 0, "cache_coverage": None}
 
     from agents_crypto.calibration_lookup import find_stats_for_labels, get_cached_calibration_stats
-    from agents_crypto.risk_calc import compute_risk_levels
+    from agents_crypto.risk_calc import compute_kelly_fraction, compute_risk_levels
 
     candidates: list[dict[str, Any]] = []
     considered = 0
@@ -112,6 +112,11 @@ def compute_candidates(rows: list[dict[str, Any]], limit: int = 5) -> dict[str, 
                     "extension_warning": levels.extension_warning,
                 }
 
+        # Conservative (CI lower-bound) win rate feeds Kelly sizing, same
+        # philosophy as the ranking itself: never let a lucky point estimate
+        # suggest a bigger bet than the evidence actually supports.
+        kelly = compute_kelly_fraction(best.win_rate_ci_low_pct, best.avg_win_return_pct, best.avg_loss_return_pct)
+
         candidates.append(
             {
                 "symbol": row["symbol"],
@@ -126,6 +131,11 @@ def compute_candidates(rows: list[dict[str, Any]], limit: int = 5) -> dict[str, 
                 "avg_net_return_pct": best.avg_net_return_pct,
                 "regime": best.regime,
                 "entry": entry,
+                "kelly_sizing": {
+                    "recommended_fraction_pct": round(kelly.recommended_fraction * 100, 2),
+                    "full_kelly_fraction_pct": round(kelly.full_kelly_fraction * 100, 2),
+                    "warning": kelly.warning,
+                },
                 "scanned_at": row["scanned_at"],
                 "age_seconds": round(_age_seconds(row["scanned_at"]), 1),
             }
