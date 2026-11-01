@@ -462,7 +462,15 @@ def best_signal(limit: int = 5) -> dict[str, Any]:
             }
         )
 
-    candidates.sort(key=lambda c: c["win_rate_ci_low_pct"], reverse=True)
+    # Primary sort: the CI's conservative lower bound (never the raw point
+    # estimate) — see the module docstring. Ties there (rounded to 1 decimal,
+    # so distinct symbols land on the same number often) are broken by the
+    # raw win rate, then by sample size, instead of falling back to whatever
+    # order rows happened to come out of the database in.
+    candidates.sort(
+        key=lambda c: (c["win_rate_ci_low_pct"], c["win_rate_pct"], c["n"]),
+        reverse=True,
+    )
     generated_at = max(r["scanned_at"] for r in rows)
     return {
         "signals": candidates[: max(1, limit)],
