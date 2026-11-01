@@ -25,6 +25,7 @@ millisecond-perfect fills.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -52,9 +53,22 @@ TIMEFRAME_MINUTES: dict[str, int] = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
 DEFAULT_TRACKING_LIMIT = 10
 
 
-def log_new_signals(conn: Any, rows: list[dict[str, Any]], limit: int = DEFAULT_TRACKING_LIMIT) -> int:
+def log_new_signals(
+    conn: Any,
+    rows: list[dict[str, Any]],
+    limit: int = DEFAULT_TRACKING_LIMIT,
+    on_new_signal: Callable[[dict[str, Any]], None] | None = None,
+) -> int:
     """Log any newly-qualifying Top Signal Now candidate that isn't already
-    being tracked. Returns how many new rows were logged this cycle."""
+    being tracked. Returns how many new rows were logged this cycle.
+
+    ``on_new_signal``, if given, is called once per newly-logged candidate
+    (e.g. to push a Telegram alert — see :mod:`scanner.telegram_alerts`) —
+    never for a candidate that was already being tracked, so an alert fires
+    exactly once per genuinely new opportunity. A failing callback is
+    logged and swallowed, never allowed to stop the rest of this cycle's
+    logging.
+    """
     result = compute_candidates(rows, limit=limit)
     logged = 0
     for candidate in result["signals"]:
@@ -80,6 +94,11 @@ def log_new_signals(conn: Any, rows: list[dict[str, Any]], limit: int = DEFAULT_
             horizon_candles=BEST_SIGNAL_HORIZON_CANDLES,
         )
         logged += 1
+        if on_new_signal is not None:
+            try:
+                on_new_signal(candidate)
+            except Exception:
+                logger.exception("on_new_signal callback failed for %s %s %s; continuing", symbol, timeframe, direction)
     return logged
 
 

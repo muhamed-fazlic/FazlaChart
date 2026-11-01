@@ -49,3 +49,14 @@ class ScannerConfig:
     always_fetch_derivatives: bool = True
 
     symbols_blocklist: tuple[str, ...] = field(default_factory=tuple)
+
+    # Telegram push alerts for high-quality Top Signal Now candidates (see
+    # scanner.telegram_alerts). Left unset by default -- alerting stays off
+    # until both bot_token and chat_id are provided, typically from
+    # TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID env vars (never as CLI flags, to
+    # avoid a bot token showing up in `ps`/process-list output).
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    telegram_min_win_rate_ci_low_pct: float = 60.0
+    telegram_min_n: int = 50
+    telegram_require_btc_alignment: bool = False

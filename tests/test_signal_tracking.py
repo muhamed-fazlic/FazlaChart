@@ -98,6 +98,27 @@ class TestLogNewSignals:
         assert log_new_signals(conn, _rows(conn)) == 0
         assert fetch_recent_signal_outcomes(conn) == []
 
+    def test_on_new_signal_callback_fires_once_per_new_candidate(self, conn):
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])
+        seen = []
+        rows = _rows(conn)
+        assert log_new_signals(conn, rows, on_new_signal=seen.append) == 1
+        assert len(seen) == 1
+        assert seen[0]["symbol"] == "INJUSDT"
+
+        # Still open on the next cycle -- the callback must not fire again.
+        assert log_new_signals(conn, rows, on_new_signal=seen.append) == 0
+        assert len(seen) == 1
+
+    def test_on_new_signal_callback_failure_does_not_block_logging(self, conn):
+        def _boom(_candidate):
+            raise RuntimeError("telegram is down")
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])
+        logged = log_new_signals(conn, _rows(conn), on_new_signal=_boom)
+        assert logged == 1
+        assert len(fetch_recent_signal_outcomes(conn)) == 1
+
 
 class TestResolveOpenSignals:
     def test_resolves_take_profit_when_price_reaches_target(self, conn):

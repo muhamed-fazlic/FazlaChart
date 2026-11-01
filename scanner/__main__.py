@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from scanner.config import ScannerConfig
@@ -51,6 +52,14 @@ def main(argv: list[str] | None = None) -> None:
         storage_path=args.storage,
         keep_known_symbols=not args.no_keep_known_symbols,
         max_universe_size=args.max_universe_size,
+        # Telegram credentials come from the environment, never CLI flags
+        # (which would otherwise leak a bot token into `ps`/process-list
+        # output) -- see scanner/telegram_alerts.py.
+        telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
+        telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,
+        telegram_min_win_rate_ci_low_pct=float(os.environ.get("TELEGRAM_MIN_WIN_RATE_CI_LOW_PCT", "60.0")),
+        telegram_min_n=int(os.environ.get("TELEGRAM_MIN_N", "50")),
+        telegram_require_btc_alignment=os.environ.get("TELEGRAM_REQUIRE_BTC_ALIGNMENT", "").lower() in ("1", "true", "yes"),
     )
     scanner = MarketScanner(config)
 

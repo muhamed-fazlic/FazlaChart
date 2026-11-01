@@ -15,6 +15,7 @@ from scanner.btc_context import build_btc_context
 from scanner.config import ScannerConfig
 from scanner.signal_tracking import log_new_signals, resolve_open_signals
 from scanner.storage import fetch_known_symbols, fetch_latest_scan_per_symbol, init_db, save_scan_result
+from scanner.telegram_alerts import TelegramAlertConfig, maybe_send_alert
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance import client
 from tradingagents.dataflows.vendors.binance.snapshot import build_symbol_snapshot
@@ -26,6 +27,13 @@ class MarketScanner:
     def __init__(self, config: ScannerConfig | None = None):
         self.config = config or ScannerConfig()
         self.conn = init_db(self.config.storage_path)
+        self._telegram = TelegramAlertConfig(
+            bot_token=self.config.telegram_bot_token,
+            chat_id=self.config.telegram_chat_id,
+            min_win_rate_ci_low_pct=self.config.telegram_min_win_rate_ci_low_pct,
+            min_n=self.config.telegram_min_n,
+            require_btc_alignment=self.config.telegram_require_btc_alignment,
+        )
 
     def resolve_universe(self) -> list[str]:
         """The symbols to scan this cycle: explicit list, else top-N by
@@ -89,11 +97,18 @@ class MarketScanner:
         try:
             rows = fetch_latest_scan_per_symbol(self.conn)
             resolved = resolve_open_signals(self.conn, rows)
-            logged = log_new_signals(self.conn, rows)
+            logged = log_new_signals(self.conn, rows, on_new_signal=self._on_new_signal)
             if resolved or logged:
                 logger.info("Signal tracking: resolved %d, logged %d new", resolved, logged)
         except Exception:
             logger.exception("Signal outcome tracking failed this cycle; continuing")
+
+    def _on_new_signal(self, candidate: dict[str, Any]) -> None:
+        """Pushes a Telegram alert for a newly-qualifying candidate when
+        alerting is enabled and the candidate clears the configured quality
+        threshold. A no-op (and never raises) when Telegram isn't configured."""
+        if maybe_send_alert(candidate, self._telegram):
+            logger.info("Telegram alert sent for %s %s %s", candidate["symbol"], candidate["timeframe"], candidate["direction"])
 
     def run_forever(self) -> None:
         """Loop ``run_once`` every ``poll_interval_seconds``, logging and
