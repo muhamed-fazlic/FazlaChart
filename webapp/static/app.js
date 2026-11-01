@@ -600,6 +600,14 @@ function renderAssessment(data) {
         .join("")
     : `<li class="muted">No historical calibration data for the active label(s).</li>`;
 
+  const s = data.sentiment;
+  const sentimentHtml = s
+    ? s.label
+      ? `<span class="${s.label === "bullish" ? "pos" : s.label === "bearish" ? "neg" : "muted"}">${s.label.toUpperCase()}</span>` +
+        ` — StockTwits: ${s.bullish_count} bullish / ${s.bearish_count} bearish / ${s.unlabeled_count} unlabeled (${s.total_messages} msgs)`
+      : `<span class="muted">Nema dovoljno podataka — ${s.insufficient_reason}</span>`
+    : `<span class="muted">Sentiment nije dohvaćen.</span>`;
+
   document.getElementById("analysis-result").innerHTML = `
     <div class="assessment-bias ${biasClass}">Bias: ${a.bias.toUpperCase()}</div>
     <h4>Entry / SL / TP po timeframe-u (ATR-based)</h4>
@@ -608,6 +616,8 @@ function renderAssessment(data) {
     <p>${a.historical_basis}</p>
     <h4>Calibration matches (ground truth, not a guess)</h4>
     <ul>${calibHtml}</ul>
+    <h4>Social sentiment (StockTwits, raw tags — not a prediction)</h4>
+    <p>${sentimentHtml}</p>
     <h4>Key observations</h4>
     <ul>${a.key_observations.map((o) => `<li>${o}</li>`).join("")}</ul>
     <h4>Risk factors</h4>

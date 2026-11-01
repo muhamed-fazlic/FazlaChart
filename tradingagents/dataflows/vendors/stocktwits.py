@@ -71,6 +71,54 @@ def _stocktwits_symbol(ticker: str) -> str:
     return f"{base}.X" if base else ticker.strip().upper()
 
 
+def fetch_stocktwits_sentiment_counts(
+    ticker: str,
+    limit: int = 30,
+    timeout: float = 10.0,
+) -> dict:
+    """Same public stream as :func:`fetch_stocktwits_messages`, but returns
+    raw bullish/bearish/unlabeled counts instead of a prompt-ready text
+    block -- for callers (e.g. the crypto scanner's sentiment snapshot) that
+    want to compute a deterministic label themselves rather than handing a
+    formatted block to an LLM.
+
+    Always returns a dict (never raises); on any failure ``error`` is set
+    and the counts are all 0, so a caller can treat "no data" uniformly
+    without a try/except.
+    """
+    url = _API.format(ticker=_stocktwits_symbol(ticker))
+    req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        logger.warning("StockTwits sentiment fetch failed for %s: %s", ticker, exc)
+        return {"bullish": 0, "bearish": 0, "unlabeled": 0, "total": 0, "bullish_pct": None, "bearish_pct": None, "error": str(exc)}
+
+    messages = (data.get("messages", []) if isinstance(data, dict) else [])[:limit]
+    bullish = bearish = unlabeled = 0
+    for m in messages:
+        entities = m.get("entities") or {}
+        sentiment_obj = entities.get("sentiment") or {}
+        sentiment = sentiment_obj.get("basic") if isinstance(sentiment_obj, dict) else None
+        if sentiment == "Bullish":
+            bullish += 1
+        elif sentiment == "Bearish":
+            bearish += 1
+        else:
+            unlabeled += 1
+    total = bullish + bearish + unlabeled
+    return {
+        "bullish": bullish,
+        "bearish": bearish,
+        "unlabeled": unlabeled,
+        "total": total,
+        "bullish_pct": round(100 * bullish / total, 1) if total else None,
+        "bearish_pct": round(100 * bearish / total, 1) if total else None,
+        "error": None,
+    }
+
+
 def fetch_stocktwits_messages(
     ticker: str,
     limit: int = 30,

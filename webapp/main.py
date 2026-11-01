@@ -720,6 +720,7 @@ def analyze_symbol(
         "calibration_matches": result.calibration_matches,
         "diverges_from_btc": result.diverges_from_btc,
         "liquidity_heatmap": result.liquidity_heatmap,
+        "sentiment": result.sentiment,
     }
 
 

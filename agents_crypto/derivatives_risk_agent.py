@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats
 from agents_crypto.risk_calc import compute_kelly_fraction, compute_risk_levels
+from agents_crypto.sentiment import get_crypto_sentiment_snapshot
 from scanner.btc_context import build_btc_context, diverges_from_btc
 from scanner.calibration import current_volatility_regime
 from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
@@ -80,6 +81,7 @@ class AssessmentResult:
     # all-regime blend for lack of regime-specific history.
     current_regime: str | None = None
     regime_fallback: bool = False
+    sentiment: dict[str, Any] | None = None
 
 
 # Without an explicit timeout, a stuck/hanging connection (dead keep-alive,
@@ -115,6 +117,7 @@ def _build_prompt(
     heatmap_summary: dict[str, Any],
     current_regime: str | None = None,
     regime_fallback: bool = False,
+    sentiment: dict[str, Any] | None = None,
 ) -> str:
     return f"""You are a derivatives/risk analyst for crypto futures. You are given ALREADY-MEASURED,
 objective facts below — you do not have tools, and you must not invent numbers that are not present
@@ -143,6 +146,11 @@ Rules:
   volatility regime ("low"/"normal"/"high") or had to fall back to an all-regime blend for lack of
   regime-specific history (`regime_fallback=True`). If it fell back, say in `historical_basis` that
   the stat is a general blend, not specific to current volatility conditions.
+- `social_sentiment` is raw StockTwits user-labeled Bullish/Bearish message counts, NOT a news
+  analysis and NOT your own read of the market — treat it only as a chatter-volume data point. If
+  its `label` is null (not enough labeled messages), say explicitly that there isn't enough social
+  data to use, don't guess a sentiment of your own. If it IS set, only mention whether it agrees or
+  conflicts with the proposed `bias` — never let it override the trend-derived bias itself.
 
 SYMBOL: {symbol}
 TIMEFRAME: {timeframe}
@@ -167,6 +175,9 @@ DETERMINISTIC RISK LEVELS (ATR-based, already calculated — do not invent diffe
 LIQUIDITY HEATMAP (approximate volume-profile proxy for where TP/SL orders likely cluster —
 NOT real order-book data, just a structural hint):
 {heatmap_summary}
+
+SOCIAL SENTIMENT (StockTwits, raw user-labeled tag counts, a chatter-volume proxy not a prediction):
+{sentiment if sentiment else "N/A — not fetched."}
 
 Produce your structured assessment now."""
 
@@ -351,6 +362,13 @@ def assess_symbol(
     if risk_levels and risk_levels.get("bias") == "neutral":
         risk_levels = None  # keep the prompt's existing "N/A — neutral" branch working
 
+    try:
+        sentiment = get_crypto_sentiment_snapshot(symbol)
+    except Exception:
+        # Social sentiment is a nice-to-have add-on, not grounds to fail an
+        # otherwise-complete assessment.
+        sentiment = None
+
     prompt = _build_prompt(
         symbol,
         timeframe,
@@ -362,6 +380,7 @@ def assess_symbol(
         heatmap_summary=heatmap_summary,
         current_regime=current_regime,
         regime_fallback=regime_fallback,
+        sentiment=sentiment,
     )
 
     chat_model = llm or _build_llm(provider, model, base_url)
@@ -402,5 +421,6 @@ def assess_symbol(
         liquidity_heatmap=heatmap,
         current_regime=current_regime,
         regime_fallback=regime_fallback,
+        sentiment=sentiment,
     )
 
