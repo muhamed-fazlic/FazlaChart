@@ -13,7 +13,8 @@ from typing import Any
 from scanner.anomaly import collect_all_anomalies
 from scanner.btc_context import build_btc_context
 from scanner.config import ScannerConfig
-from scanner.storage import fetch_known_symbols, init_db, save_scan_result
+from scanner.signal_tracking import log_new_signals, resolve_open_signals
+from scanner.storage import fetch_known_symbols, fetch_latest_scan_per_symbol, init_db, save_scan_result
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance import client
 from tradingagents.dataflows.vendors.binance.snapshot import build_symbol_snapshot
@@ -74,7 +75,25 @@ class MarketScanner:
             snapshot = self.scan_symbol(symbol, btc_context)
             if snapshot is not None:
                 results[symbol] = snapshot
+
+        self._track_signal_outcomes()
         return {"btc": btc_context, "symbols": results}
+
+    def _track_signal_outcomes(self) -> None:
+        """Resolve any open tracked signals against this cycle's fresh
+        prices, then log any newly-qualifying Top Signal Now candidates —
+        in that order, so a signal that both resolves and re-qualifies in
+        the same cycle starts a genuinely new tracked trade rather than
+        being treated as still open. Never lets a tracking bug take down
+        the scan cycle itself."""
+        try:
+            rows = fetch_latest_scan_per_symbol(self.conn)
+            resolved = resolve_open_signals(self.conn, rows)
+            logged = log_new_signals(self.conn, rows)
+            if resolved or logged:
+                logger.info("Signal tracking: resolved %d, logged %d new", resolved, logged)
+        except Exception:
+            logger.exception("Signal outcome tracking failed this cycle; continuing")
 
     def run_forever(self) -> None:
         """Loop ``run_once`` every ``poll_interval_seconds``, logging and

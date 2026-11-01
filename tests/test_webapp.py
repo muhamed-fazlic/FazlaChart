@@ -370,3 +370,64 @@ def test_best_signal_recenters_entry_zone_on_patient_entry_when_overextended(tmp
     # the EMA20 retracement, not glued to the already-extended current price.
     assert entry["entry_zone_low"] > 90.0
 
+
+def test_forward_tracking_summary_reports_empty_state_with_no_logged_signals(client):
+    resp = client.get("/api/forward-tracking/summary")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["open_count"] == 0
+    assert body["resolved_count"] == 0
+    assert body["realized_win_rate_pct"] is None
+
+
+def test_forward_tracking_summary_separates_open_from_resolved(tmp_path, monkeypatch):
+    from scanner.storage import log_signal_outcome
+
+    db_path = tmp_path / "scanner_test.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    conn = init_db(str(db_path))
+    log_signal_outcome(
+        conn,
+        symbol="AAAUSDT",
+        timeframe="1h",
+        direction="short",
+        label="trend:bearish",
+        entry_price=10.0,
+        stop_loss=10.5,
+        take_profit=9.0,
+        take_profit_conservative=9.25,
+        promised_win_rate_pct=65.0,
+        promised_win_rate_ci_low_pct=60.0,
+        promised_n=200,
+        horizon_candles=12,
+    )
+    log_signal_outcome(
+        conn,
+        symbol="BBBUSDT",
+        timeframe="1h",
+        direction="long",
+        label="trend:bullish",
+        entry_price=10.0,
+        stop_loss=9.5,
+        take_profit=11.0,
+        take_profit_conservative=10.75,
+        promised_win_rate_pct=70.0,
+        promised_win_rate_ci_low_pct=62.0,
+        promised_n=150,
+        horizon_candles=12,
+    )
+    from scanner.storage import resolve_signal_outcome
+
+    resolve_signal_outcome(conn, 2, "take_profit", 11.0, 0.9)
+    conn.close()
+
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/forward-tracking/summary")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["open_count"] == 1
+    assert body["resolved_count"] == 1
+    assert body["resolved_by_status"]["take_profit"] == 1
+    assert body["realized_win_rate_pct"] == 100.0
+

@@ -127,6 +127,51 @@ async function loadBestSignal() {
   }
 }
 
+// --- Forward tracking (closed-loop validation: promised vs. realized) -----
+// Every Top Signal Now candidate gets logged once (scanner/signal_tracking.py)
+// and resolved against real price action as it plays out live — this panel
+// shows whether the calibration's promised win rate is actually holding up,
+// not just a backtest claim.
+
+function renderForwardTrackingPanel(data) {
+  const el = document.getElementById("forward-tracking-panel");
+  if (!data) {
+    el.className = "forward-tracking-panel muted";
+    el.textContent = "Nema podataka o praćenju uživo još.";
+    return;
+  }
+  if (data.resolved_count === 0) {
+    el.className = "forward-tracking-panel muted";
+    el.textContent = `📡 Praćenje uživo: ${data.open_count} signala u toku, još nema zatvorenih — rezultati stižu kako se SL/TP/timeout dešavaju.`;
+    return;
+  }
+  el.className = "forward-tracking-panel";
+  const byStatus = data.resolved_by_status || {};
+  const realized = data.realized_win_rate_pct;
+  const promised = data.avg_promised_win_rate_ci_low_pct;
+  const gap = realized !== null && promised !== null ? realized - promised : null;
+  const gapClass = gap === null ? "" : gap >= 0 ? "pos" : "neg";
+  el.innerHTML =
+    `<div class="forward-tracking-title">📡 Praćenje uživo (obećano vs. stvarno)</div>` +
+    `<div class="forward-tracking-stats">` +
+    `<span>Zatvoreno: <b>${data.resolved_count}</b> (TP ${byStatus.take_profit || 0} · SL ${byStatus.stop_loss || 0} · timeout ${byStatus.timeout || 0})</span>` +
+    `<span>U toku: <b>${data.open_count}</b></span>` +
+    `<span>Stvarni win rate: <b>${fmt(realized, 1)}%</b></span>` +
+    `<span>Obećana donja granica (prosjek): <b>${fmt(promised, 1)}%</b></span>` +
+    (gap !== null ? `<span class="${gapClass}">razlika: ${gap >= 0 ? "+" : ""}${fmt(gap, 1)}pp</span>` : "") +
+    `</div>`;
+}
+
+async function loadForwardTracking() {
+  try {
+    const res = await fetch("/api/forward-tracking/summary");
+    const data = await res.json();
+    renderForwardTrackingPanel(data);
+  } catch (err) {
+    console.error("Could not load forward tracking summary:", err);
+  }
+}
+
 function renderTable(symbols, anomaliesOnly) {
   const body = document.getElementById("scan-body");
   const rows = anomaliesOnly ? symbols.filter((s) => s.anomalies.length > 0) : symbols;
@@ -710,3 +755,5 @@ populateSymbolSuggestions();
 setFullTableMode(document.getElementById("show-all-toggle").checked);
 loadBestSignal();
 setInterval(loadBestSignal, REFRESH_MS);
+loadForwardTracking();
+setInterval(loadForwardTracking, REFRESH_MS);

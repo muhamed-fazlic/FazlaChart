@@ -29,6 +29,7 @@ from scanner.storage import (
     connect_for_reads,
     fetch_latest_scan,
     fetch_latest_scan_per_symbol,
+    fetch_recent_signal_outcomes,
     fetch_symbol_history,
     init_db,
 )
@@ -368,115 +369,63 @@ def best_signal(limit: int = 5) -> dict[str, Any]:
     Read-only and always fast: it only ever reads whatever's already in the
     on-disk calibration cache (populated by the background warm-up loop and
     by users' own lookups) and never triggers a fresh backtest inline — a
-    symbol simply has no entry here until its cache is warm."""
+    symbol simply has no entry here until its cache is warm.
+
+    The ranking itself lives in ``agents_crypto.best_signal.compute_candidates``
+    so the scanner's live forward-outcome tracker can log exactly what this
+    endpoint would have shown at the same instant (see
+    ``scanner.signal_tracking``), instead of risking the two silently
+    drifting apart over time."""
     conn = _get_conn()
     try:
         rows = fetch_latest_scan_per_symbol(conn)
     finally:
         conn.close()
 
-    if not rows:
-        return {"signals": [], "generated_at": None, "candidates_considered": 0, "cache_coverage": None}
+    from agents_crypto.best_signal import compute_candidates
 
-    from agents_crypto.calibration_lookup import find_stats_for_labels, get_cached_calibration_stats
-    from agents_crypto.risk_calc import compute_risk_levels
+    return compute_candidates(rows, limit=limit)
 
-    candidates: list[dict[str, Any]] = []
-    considered = 0
-    for row in rows:
-        if row["trend"] not in ("bullish", "bearish"):
-            continue
-        considered += 1
-        ref_tf = row["reference_timeframe"]
-        ref = row["snapshot"].get("timeframes", {}).get(ref_tf, {})
-        labels = _active_labels(row["trend"], row["anomalies"])
 
-        stats = get_cached_calibration_stats(row["symbol"], ref_tf)
-        matches = find_stats_for_labels(stats, labels, _BEST_SIGNAL_HORIZON_CANDLES)
-        significant = [
-            m
-            for m in matches
-            if m.direction in ("long", "short")
-            and m.n >= _BEST_SIGNAL_MIN_SAMPLE_SIZE
-            and m.win_rate_ci_low_pct is not None
-            and m.win_rate_ci_low_pct > 50.0
-        ]
-        if not significant:
-            continue
-        # Rank by the CI's conservative lower bound, not the point estimate —
-        # rewards both a high win rate AND enough samples to be confident in it.
-        best = max(significant, key=lambda m: m.win_rate_ci_low_pct)
+@app.get("/api/forward-tracking/summary")
+def forward_tracking_summary(limit: int = 200) -> dict[str, Any]:
+    """Closed-loop validation: compares each Top Signal Now candidate's
+    *promised* calibration win rate against what it actually, live did once
+    resolved (hit its stop, its target, or timed out) — not just its own
+    historical backtest. See ``scanner.signal_tracking`` for how these rows
+    get logged and resolved every scan cycle.
 
-        close, atr = row["close_price"], ref.get("atr")
-        entry = None
-        if close and atr:
-            try:
-                levels = compute_risk_levels(
-                    close, atr, best.direction, rsi=ref.get("rsi"), ema20=ref.get("ema20")
-                )
-            except ValueError:
-                levels = None
-            if levels:
-                # A narrow confirmation band around the current price, not a
-                # single exact tick — ATR-sized, biased slightly toward a
-                # pullback/retest entry in the trade direction rather than
-                # chasing the current price outright. If the move already
-                # looks extended (see risk_calc._extension_check), recenter
-                # the zone on the suggested patient/retracement entry instead
-                # of the current (already-stretched) price.
-                band = atr * 0.25
-                zone_center = levels.patient_entry if levels.patient_entry is not None else close
-                zone = (
-                    (zone_center - band, zone_center + band * 0.4)
-                    if best.direction == "long"
-                    else (zone_center - band * 0.4, zone_center + band)
-                )
-                entry = {
-                    "price": round(close, 8),
-                    "entry_zone_low": round(min(zone), 8),
-                    "entry_zone_high": round(max(zone), 8),
-                    "stop_loss": levels.stop_loss,
-                    "take_profit": levels.take_profit,
-                    "take_profit_conservative": levels.take_profit_conservative,
-                    "risk_reward_ratio": levels.risk_reward_ratio,
-                    "volatility_warning": levels.volatility_warning,
-                    "extension_warning": levels.extension_warning,
-                }
+    Resolved-only statistics are reported separately from the still-open
+    count: an in-progress signal's eventual outcome is unknown, so counting
+    it as a loss (or a win) either way would quietly bias the comparison."""
+    conn = _get_conn()
+    try:
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit)
+    finally:
+        conn.close()
 
-        candidates.append(
-            {
-                "symbol": row["symbol"],
-                "timeframe": ref_tf,
-                "trend": row["trend"],
-                "label": best.label,
-                "direction": best.direction,
-                "n": best.n,
-                "win_rate_pct": best.win_rate_pct,
-                "win_rate_ci_low_pct": best.win_rate_ci_low_pct,
-                "win_rate_ci_high_pct": best.win_rate_ci_high_pct,
-                "avg_net_return_pct": best.avg_net_return_pct,
-                "regime": best.regime,
-                "entry": entry,
-                "scanned_at": row["scanned_at"],
-                "age_seconds": round(_age_seconds(row["scanned_at"]), 1),
-            }
-        )
+    open_count = sum(1 for o in outcomes if o["status"] == "open")
+    resolved = [o for o in outcomes if o["status"] != "open"]
+    by_status = {"take_profit": 0, "stop_loss": 0, "timeout": 0}
+    for o in resolved:
+        by_status[o["status"]] = by_status.get(o["status"], 0) + 1
 
-    # Primary sort: the CI's conservative lower bound (never the raw point
-    # estimate) — see the module docstring. Ties there (rounded to 1 decimal,
-    # so distinct symbols land on the same number often) are broken by the
-    # raw win rate, then by sample size, instead of falling back to whatever
-    # order rows happened to come out of the database in.
-    candidates.sort(
-        key=lambda c: (c["win_rate_ci_low_pct"], c["win_rate_pct"], c["n"]),
-        reverse=True,
-    )
-    generated_at = max(r["scanned_at"] for r in rows)
+    realized_win_rate_pct = None
+    avg_promised_win_rate_ci_low_pct = None
+    if resolved:
+        wins = sum(1 for o in resolved if o["realized_return_pct"] is not None and o["realized_return_pct"] > 0)
+        realized_win_rate_pct = round(wins / len(resolved) * 100, 1)
+        promised = [o["promised_win_rate_ci_low_pct"] for o in resolved if o["promised_win_rate_ci_low_pct"] is not None]
+        if promised:
+            avg_promised_win_rate_ci_low_pct = round(sum(promised) / len(promised), 1)
+
     return {
-        "signals": candidates[: max(1, limit)],
-        "generated_at": generated_at,
-        "candidates_considered": considered,
-        "cache_coverage": f"{len(candidates)}/{considered}",
+        "open_count": open_count,
+        "resolved_count": len(resolved),
+        "resolved_by_status": by_status,
+        "realized_win_rate_pct": realized_win_rate_pct,
+        "avg_promised_win_rate_ci_low_pct": avg_promised_win_rate_ci_low_pct,
+        "recent": outcomes[:20],
     }
 
 
