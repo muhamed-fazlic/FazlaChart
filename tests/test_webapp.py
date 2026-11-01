@@ -88,6 +88,46 @@ def test_health_reports_storage_path(client):
     body = resp.json()
     assert body["ok"] is True
     assert body["storage_exists"] is True
+    assert body["status"] == "healthy"
+    assert body["staleness_seconds"] is not None
+    assert body["symbols_ever_tracked"] == 2
+
+
+def test_health_reports_stale_when_last_scan_is_old(tmp_path, monkeypatch):
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    db_path = tmp_path / "scanner_test_stale.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    monkeypatch.setenv("SCANNER_HEALTH_MAX_STALENESS_SECONDS", "60")
+
+    conn = init_db(str(db_path))
+    save_scan_result(conn, "BTCUSDT", _BTC_SNAPSHOT, [])
+    stale_time = (datetime.now(UTC) - timedelta(seconds=600)).isoformat()
+    conn.execute("UPDATE scans SET scanned_at = ?", (stale_time,))
+    conn.commit()
+    conn.close()
+
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/health")
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["status"] == "stale"
+    assert body["staleness_seconds"] > 60
+
+
+def test_health_reports_no_data_for_empty_database(tmp_path, monkeypatch):
+    db_path = tmp_path / "scanner_test_empty.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    init_db(str(db_path)).close()
+
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/health")
+    body = resp.json()
+    assert body["status"] == "no_data"
+    assert body["ok"] is False
 
 
 def test_overview_returns_btc_summary_and_symbols(client):

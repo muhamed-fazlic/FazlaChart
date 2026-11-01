@@ -114,6 +114,71 @@ async def _start_calibration_warmup_loop() -> None:
     asyncio.create_task(_calibration_warmup_loop())
 
 
+_HEALTH_CHECK_INTERVAL_SECONDS = 120
+_HEALTH_ALERT_COOLDOWN_SECONDS = 3600  # one "scanner looks stuck" alert per hour, not one per 2-minute check
+_health_alert_state: dict[str, Any] = {"last_alert_at": 0.0, "was_stale": False}
+
+
+@app.on_event("startup")
+async def _start_health_watchdog_loop() -> None:
+    """The dashboard process is simpler and far less likely to hang than the
+    scanner (it does no Binance/LLM calls of its own on this path), so it is
+    the natural place to notice "the scanner stopped writing fresh data" and
+    tell a human via Telegram -- rather than relying on someone to notice the
+    numbers on screen stopped moving. Runs independently of whether anyone
+    has the dashboard tab open."""
+    import asyncio
+
+    asyncio.create_task(_health_watchdog_loop())
+
+
+async def _health_watchdog_loop() -> None:
+    import logging
+    import time as _time
+
+    import anyio
+
+    from scanner.health import check_scanner_health
+    from scanner.telegram_alerts import TelegramAlertConfig, send_telegram_message
+
+    logger = logging.getLogger(__name__)
+    telegram = TelegramAlertConfig(
+        bot_token=os.environ.get("TELEGRAM_BOT_TOKEN"),
+        chat_id=os.environ.get("TELEGRAM_CHAT_ID"),
+    )
+    while True:
+        try:
+            if Path(_storage_path()).exists() and telegram.enabled:
+                conn = _get_conn()
+                try:
+                    result = await anyio.to_thread.run_sync(
+                        lambda: check_scanner_health(conn, max_staleness_seconds=_health_max_staleness_seconds())
+                    )
+                finally:
+                    conn.close()
+                now = _time.time()
+                if result.status == "stale":
+                    cooldown_elapsed = now - _health_alert_state["last_alert_at"] > _HEALTH_ALERT_COOLDOWN_SECONDS
+                    if cooldown_elapsed:
+                        minutes = round((result.staleness_seconds or 0) / 60, 1)
+                        message = (
+                            f"\u26a0\ufe0f FazlaChart scanner izgleda zaglavljen — nema novih podataka {minutes} min "
+                            f"(zadnji scan: {result.last_scanned_at}). Provjeri servis na VPS-u."
+                        )
+                        if send_telegram_message(telegram.bot_token, telegram.chat_id, message):
+                            _health_alert_state["last_alert_at"] = now
+                            logger.warning("Sent scanner-staleness Telegram alert (%s min stale)", minutes)
+                elif _health_alert_state["was_stale"]:
+                    # Recovered -- let the next stale episode alert immediately
+                    # rather than waiting out the old cooldown window.
+                    _health_alert_state["last_alert_at"] = 0.0
+                _health_alert_state["was_stale"] = result.status == "stale"
+        except Exception:
+            logger.warning("Health watchdog cycle failed", exc_info=True)
+        await anyio.sleep(_HEALTH_CHECK_INTERVAL_SECONDS)
+
+
+
 async def _calibration_warmup_loop() -> None:
     import logging
 
@@ -202,7 +267,30 @@ def _age_seconds(iso_timestamp: str) -> float:
 def health() -> dict[str, Any]:
     storage_path = _storage_path()
     exists = Path(storage_path).exists()
-    return {"ok": True, "storage_path": storage_path, "storage_exists": exists}
+    if not exists:
+        return {"ok": False, "storage_path": storage_path, "storage_exists": False, "status": "no_data"}
+
+    from scanner.health import check_scanner_health
+
+    conn = _get_conn()
+    try:
+        result = check_scanner_health(conn, max_staleness_seconds=_health_max_staleness_seconds())
+    finally:
+        conn.close()
+    return {
+        "ok": result.status == "healthy",
+        "storage_path": storage_path,
+        "storage_exists": True,
+        "status": result.status,
+        "last_scanned_at": result.last_scanned_at,
+        "staleness_seconds": result.staleness_seconds,
+        "symbols_ever_tracked": result.symbols_ever_tracked,
+        "max_staleness_seconds": result.max_staleness_seconds,
+    }
+
+
+def _health_max_staleness_seconds() -> float:
+    return float(os.environ.get("SCANNER_HEALTH_MAX_STALENESS_SECONDS", "900"))
 
 
 _symbols_cache: dict[str, Any] = {"symbols": None, "fetched_at": 0.0}

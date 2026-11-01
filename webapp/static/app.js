@@ -810,9 +810,35 @@ document.getElementById("detail-modal").addEventListener("click", (e) => {
 });
 document.getElementById("analyze-btn").addEventListener("click", analyzeSymbol);
 
+async function loadHealth() {
+  const el = document.getElementById("health-banner");
+  try {
+    const resp = await fetch("/api/health");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (data.status === "stale") {
+      const minutes = data.staleness_seconds != null ? Math.round(data.staleness_seconds / 60) : "?";
+      el.className = "health-banner neg";
+      el.textContent = `⚠️ Scanner izgleda zaglavljen — nema novih podataka ${minutes} min (zadnji scan: ${data.last_scanned_at || "nikad"}). Provjeri servis na VPS-u.`;
+    } else if (data.status === "no_data") {
+      el.className = "health-banner neg";
+      el.textContent = "⚠️ Scanner još nije upisao nijedan rezultat.";
+    } else {
+      el.className = "health-banner hidden";
+      el.textContent = "";
+    }
+  } catch (err) {
+    // A failed health check itself is not alarming enough to show a banner
+    // (could just be a blip reaching the dashboard's own API) — stay quiet.
+    console.error(err);
+  }
+}
+
 populateSymbolSuggestions();
 setFullTableMode(document.getElementById("show-all-toggle").checked);
 loadBestSignal();
 setInterval(loadBestSignal, REFRESH_MS);
 loadForwardTracking();
 setInterval(loadForwardTracking, REFRESH_MS);
+loadHealth();
+setInterval(loadHealth, 60000); // check more often than the data refresh itself — staleness matters sooner

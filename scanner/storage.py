@@ -190,6 +190,16 @@ def fetch_known_symbols(conn: sqlite3.Connection) -> list[str]:
     return [row[0] for row in cursor.fetchall()]
 
 
+def fetch_scan_health(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The single latest ``scanned_at`` timestamp across every symbol, plus
+    how many distinct symbols have ever been scanned -- the minimal facts
+    needed to answer "is the scanner actually still running?" without
+    pulling every row's full snapshot JSON."""
+    cursor = conn.execute("SELECT MAX(scanned_at), COUNT(DISTINCT symbol) FROM scans")
+    last_scanned_at, symbol_count = cursor.fetchone()
+    return {"last_scanned_at": last_scanned_at, "symbols_ever_tracked": symbol_count or 0}
+
+
 def fetch_symbol_history(conn: sqlite3.Connection, symbol: str, limit: int = 200) -> list[dict[str, Any]]:
     """Chronological (oldest-first) close price + trend history for one
     symbol, for a sparkline/chart on the dashboard."""

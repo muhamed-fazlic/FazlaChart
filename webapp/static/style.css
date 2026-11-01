@@ -80,6 +80,16 @@ h1 .subtitle {
 
 .btc-banner b { color: var(--text); }
 
+.health-banner {
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  flex: 0 0 auto;
+}
+
+.health-banner.hidden { display: none; }
+.health-banner.neg { background: rgba(220, 60, 60, 0.12); color: var(--red); }
+
 main {
   padding: 0 20px 20px;
   overflow: auto;
