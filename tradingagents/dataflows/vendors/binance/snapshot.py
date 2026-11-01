@@ -24,7 +24,9 @@ from tradingagents.dataflows.vendors.binance.indicators import (
     support_resistance,
     volume_change_pct,
 )
+from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
 from tradingagents.dataflows.vendors.binance.liquidity_heatmap import compute_liquidity_heatmap
+from tradingagents.dataflows.vendors.binance.orderbook_depth import compute_orderbook_walls
 from tradingagents.dataflows.vendors.binance.pivots import pivot_points_from_ohlc
 
 
@@ -142,6 +144,17 @@ def build_liquidity_heatmap_snapshot(
     heatmap = compute_liquidity_heatmap(df, bins=bins)
     heatmap["symbol"] = symbol
     heatmap["timeframe"] = timeframe
+
+    current_price = float(df["close"].iloc[-1])
+    try:
+        depth = client.get_order_book_depth(symbol)
+        heatmap["orderbook_walls"] = compute_orderbook_walls(depth, current_price)
+    except (NoMarketDataError, VendorUnavailableError) as exc:
+        # Real depth is a nice-to-have on top of the OHLCV proxy, not a hard
+        # requirement -- degrade gracefully rather than breaking the whole
+        # heatmap response if Binance's depth endpoint hiccups.
+        heatmap["orderbook_walls"] = None
+        heatmap["orderbook_walls_error"] = str(exc)
     return heatmap
 
 

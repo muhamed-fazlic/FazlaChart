@@ -8,10 +8,37 @@ from unittest.mock import patch
 
 import pytest
 
-from agents_crypto.derivatives_risk_agent import DerivativesRiskAssessment, assess_symbol
+from agents_crypto.derivatives_risk_agent import (
+    DerivativesRiskAssessment,
+    _sl_near_wall_warning,
+    assess_symbol,
+)
 from scanner.calibration import CalibrationStats
 
 pytestmark = pytest.mark.unit
+
+
+_FAKE_WALLS = {
+    "bid_walls": [{"side": "bid", "price": 3.40, "notional_usdt": 50000.0}],
+    "ask_walls": [{"side": "ask", "price": 3.50, "notional_usdt": 42000.0}],
+}
+
+
+def test_sl_near_wall_warning_fires_when_stop_sits_on_a_real_wall():
+    warning = _sl_near_wall_warning(3.405, _FAKE_WALLS, tolerance_pct=0.5)
+    assert warning is not None
+    assert "3.4" in warning
+    assert "bid" in warning
+
+
+def test_sl_near_wall_warning_is_none_when_stop_is_far_from_any_wall():
+    assert _sl_near_wall_warning(3.0, _FAKE_WALLS, tolerance_pct=0.5) is None
+
+
+def test_sl_near_wall_warning_handles_missing_walls_and_stop():
+    assert _sl_near_wall_warning(None, _FAKE_WALLS) is None
+    assert _sl_near_wall_warning(3.4, None) is None
+    assert _sl_near_wall_warning(3.4, {"bid_walls": [], "ask_walls": []}) is None
 
 _FAKE_SNAPSHOT = {
     "symbol": "INJUSDT",

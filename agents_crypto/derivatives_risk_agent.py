@@ -19,7 +19,9 @@ from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibrat
 from agents_crypto.risk_calc import compute_kelly_fraction, compute_risk_levels
 from scanner.btc_context import build_btc_context, diverges_from_btc
 from scanner.calibration import current_volatility_regime
+from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
 from tradingagents.dataflows.vendors.binance.liquidity_heatmap import compute_liquidity_heatmap
+from tradingagents.dataflows.vendors.binance.orderbook_depth import compute_orderbook_walls
 from tradingagents.dataflows.vendors.binance.indicators import add_indicators, klines_to_dataframe
 from tradingagents.dataflows.vendors.binance import client as binance_client
 from tradingagents.dataflows.vendors.binance.snapshot import build_symbol_snapshot
@@ -181,8 +183,29 @@ def _heatmap_prompt_summary(heatmap: dict[str, Any], top_bins: int = 5) -> dict[
         "value_area_high": heatmap.get("value_area_high"),
         "top_volume_zones": [{"price_low": b["price_low"], "price_high": b["price_high"], "pct_of_total": b["pct_of_total"]} for b in bins_sorted],
         "likely_stop_zones": heatmap.get("likely_stop_zones", []),
+        "orderbook_walls": heatmap.get("orderbook_walls"),
         "note": heatmap.get("note"),
     }
+
+
+def _sl_near_wall_warning(stop_loss: float | None, walls: dict[str, Any] | None, tolerance_pct: float = 0.5) -> str | None:
+    """If the given stop-loss sits within ``tolerance_pct`` of a real,
+    currently-resting order-book wall, flag it — unlike the OHLCV chop-zone
+    check, this is live data: a stop parked right next to a genuine wall is
+    sitting exactly where a stop-hunt wick is most likely to reach."""
+    if stop_loss is None or not walls:
+        return None
+    for wall in (walls.get("bid_walls") or []) + (walls.get("ask_walls") or []):
+        price = wall["price"]
+        if price == 0:
+            continue
+        if abs(stop_loss - price) / price * 100.0 <= tolerance_pct:
+            return (
+                f"SL ({stop_loss}) je na {abs(stop_loss - price) / price * 100:.2f}% od živog order-book zida "
+                f"({wall['side']}, {wall['notional_usdt']:.0f} USDT na {price}) — moguć je stop-hunt wick do tog nivoa. "
+                "Razmisli o SL dalje od tog nivoa."
+            )
+    return None
 
 
 def _sl_dense_zone_warning(stop_loss: float | None, heatmap: dict[str, Any]) -> str | None:
@@ -297,18 +320,32 @@ def assess_symbol(
     heatmap = compute_liquidity_heatmap(klines_to_dataframe(klines))
     heatmap["symbol"] = symbol
     heatmap["timeframe"] = timeframe
+
+    try:
+        depth = binance_client.get_order_book_depth(symbol)
+        heatmap["orderbook_walls"] = compute_orderbook_walls(depth, tf_snapshot["close"])
+    except (NoMarketDataError, VendorUnavailableError):
+        # Real depth is a nice-to-have on top of the OHLCV proxy, not a hard
+        # requirement -- degrade gracefully if Binance's depth endpoint hiccups.
+        heatmap["orderbook_walls"] = None
+
     heatmap_summary = _heatmap_prompt_summary(heatmap)
 
     # Cross-check every timeframe's stop-loss against this (single, selected-
     # timeframe) heatmap: a dense-volume "chop zone" doesn't move much between
     # timeframes for the same coin, so this is a useful proxy even for the
-    # other timeframes' levels, not just the selected one.
+    # other timeframes' levels, not just the selected one. The order-book
+    # wall check uses the same cross-timeframe assumption, but is grounded in
+    # a live snapshot rather than historical OHLCV.
     for levels in multi_timeframe_risk_levels.values():
         if levels.get("bias") == "neutral":
             continue
         chop_warning = _sl_dense_zone_warning(levels.get("stop_loss"), heatmap)
         if chop_warning:
             levels["chop_zone_warning"] = chop_warning
+        wall_warning = _sl_near_wall_warning(levels.get("stop_loss"), heatmap.get("orderbook_walls"))
+        if wall_warning:
+            levels["orderbook_wall_warning"] = wall_warning
 
     risk_levels = multi_timeframe_risk_levels.get(timeframe)
     if risk_levels and risk_levels.get("bias") == "neutral":

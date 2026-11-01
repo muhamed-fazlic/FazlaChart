@@ -159,6 +159,27 @@ def get_24hr_ticker(symbol: Annotated[str, "futures symbol, e.g. BTCUSDT"] | Non
     return _get("/fapi/v1/ticker/24hr", params)
 
 
+# Binance futures depth endpoint only accepts these exact limit values.
+# https://binance-docs.github.io/apidocs/futures/en/#order-book
+VALID_DEPTH_LIMITS = (5, 10, 20, 50, 100, 500, 1000)
+
+
+def get_order_book_depth(
+    symbol: Annotated[str, "futures symbol, e.g. BTCUSDT"],
+    limit: Annotated[int, "order-book depth, one of VALID_DEPTH_LIMITS"] = 500,
+) -> dict[str, Any]:
+    """Current order-book snapshot: ``{"bids": [[price, qty], ...], "asks": [...]}``,
+    each sorted best-price-first. This is a point-in-time snapshot (not a
+    streamed diff feed) — good enough for "where is resting liquidity sitting
+    right now", not for reconstructing the book's history."""
+    if limit not in VALID_DEPTH_LIMITS:
+        raise ValueError(f"Unsupported depth limit {limit!r}; expected one of {VALID_DEPTH_LIMITS}")
+    data = _get("/fapi/v1/depth", {"symbol": symbol, "limit": limit})
+    if not data or not data.get("bids") or not data.get("asks"):
+        raise NoMarketDataError(symbol, detail="no order-book depth returned")
+    return data
+
+
 def get_top_symbols_by_quote_volume(
     top_n: Annotated[int, "how many symbols to return"] = 50,
     quote_asset: Annotated[str, "quote asset filter"] = "USDT",

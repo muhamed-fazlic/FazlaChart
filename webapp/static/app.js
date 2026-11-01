@@ -400,6 +400,24 @@ function renderHeatmap(data) {
     .map((z) => `<li>${fmt(z.price, 4)} — ${z.reason}</li>`)
     .join("");
 
+  const walls = data.orderbook_walls;
+  const wallItem = (w) =>
+    `<li class="${w.side === "bid" ? "pos" : "neg"}">${fmt(w.price, 4)} (${w.distance_pct > 0 ? "+" : ""}${fmt(w.distance_pct, 2)}%) — ${w.side === "bid" ? "bid" : "ask"} zid, ${fmt(w.notional_usdt / 1000, 1)}k USDT</li>`;
+  const wallRows = walls
+    ? [...walls.bid_walls, ...walls.ask_walls]
+        .sort((a, b) => b.notional_usdt - a.notional_usdt)
+        .slice(0, 6)
+        .map(wallItem)
+        .join("")
+    : "";
+  const orderbookSection = walls
+    ? `
+    <div class="muted" style="font-size: 11px; margin: 8px 0 2px;">Order-book zidovi (live, ne proxy)</div>
+    <ul class="heatmap-stop-zones">${wallRows || "<li>Nema izraženih zidova u trenutnom snapshotu.</li>"}</ul>`
+    : data.orderbook_walls_error
+    ? `<div class="muted" style="font-size: 10px; margin-top: 4px;">Order-book podaci trenutno nedostupni — prikazan samo proxy.</div>`
+    : "";
+
   return `
     <div class="muted" style="font-size: 11px; margin-bottom: 4px;">
       Current: <b>${fmt(current, 4)}</b> · POC (najprometnija zona): <b>${fmt(data.poc_price, 4)}</b> ·
@@ -407,6 +425,7 @@ function renderHeatmap(data) {
     </div>
     ${rows}
     <ul class="heatmap-stop-zones">${stopZones}</ul>
+    ${orderbookSection}
     <div class="muted" style="font-size: 10px; margin-top: 4px;">${data.note || ""}</div>
   `;
 }
@@ -536,6 +555,9 @@ function renderAssessment(data) {
       const chopWarnRow = lv.chop_zone_warning
         ? `<tr><td></td><td class="neg" colspan="5" style="font-size:11px;">🧲 ${lv.chop_zone_warning}</td></tr>`
         : "";
+      const wallWarnRow = lv.orderbook_wall_warning
+        ? `<tr><td></td><td class="neg" colspan="5" style="font-size:11px;">🧱 ${lv.orderbook_wall_warning}</td></tr>`
+        : "";
       const kellyRow = lv.kelly_sizing
         ? `<tr><td></td><td colspan="5" style="font-size:11px;">💰 Kelly veličina pozicije: <b>${fmt(lv.kelly_sizing.recommended_fraction_pct, 1)}%</b> kapitala` +
           (lv.kelly_sizing.warning ? ` <span class="muted">— ${lv.kelly_sizing.warning}</span>` : "") +
@@ -556,7 +578,7 @@ function renderAssessment(data) {
         <td class="neg">${fmt(lv.stop_loss, 4)} <span class="muted">(${fmt(lv.risk_pct, 2)}%)</span></td>
         <td class="pos">${fmt(lv.take_profit, 4)} <span class="muted">(${fmt(lv.reward_pct, 2)}%)</span>${conservativeTp}</td>
         <td>${fmt(lv.risk_reward_ratio, 2)}</td>
-      </tr>${extensionWarnRow}${warnRow}${chopWarnRow}${kellyRow}`;
+      </tr>${extensionWarnRow}${warnRow}${chopWarnRow}${wallWarnRow}${kellyRow}`;
     })
     .join("");
   const riskLevelsHtml = mtfRows
