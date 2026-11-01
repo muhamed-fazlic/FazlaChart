@@ -64,9 +64,10 @@ function bestSignalEntryHtml(sig) {
     <div class="best-signal-entry">
       <span>Entry zona: <b>${fmt(sig.entry.entry_zone_low, 4)}–${fmt(sig.entry.entry_zone_high, 4)}</b></span>
       <span>SL: ${fmt(sig.entry.stop_loss, 4)}</span>
-      <span>TP: ${fmt(sig.entry.take_profit, 4)}</span>
+      <span>TP: ${fmt(sig.entry.take_profit, 4)}${sig.entry.take_profit_conservative !== undefined && sig.entry.take_profit_conservative !== null ? ` <span class="muted">(konzervativan: ${fmt(sig.entry.take_profit_conservative, 4)})</span>` : ""}</span>
       <span>R:R ${fmt(sig.entry.risk_reward_ratio, 2)}</span>
     </div>
+    ${sig.entry.extension_warning ? `<div class="best-signal-warning">⏳ ${sig.entry.extension_warning}</div>` : ""}
     ${sig.entry.volatility_warning ? `<div class="best-signal-warning">⚠️ ${sig.entry.volatility_warning}</div>` : ""}`;
 }
 
@@ -449,20 +450,31 @@ function renderAssessment(data) {
         return `<tr><td><b>${tf}</b></td><td class="trend-neutral" colspan="5">neutralno — nema smjera, nema SL/TP</td></tr>`;
       }
       const biasCls = lv.bias === "long" ? "trend-bullish" : "trend-bearish";
+      const extensionWarnRow = lv.extension_warning
+        ? `<tr><td></td><td class="neg" colspan="5" style="font-size:11px;">⏳ ${lv.extension_warning}</td></tr>`
+        : "";
       const warnRow = lv.volatility_warning
         ? `<tr><td></td><td class="neg" colspan="5" style="font-size:11px;">⚠️ ${lv.volatility_warning}</td></tr>`
         : "";
       const chopWarnRow = lv.chop_zone_warning
         ? `<tr><td></td><td class="neg" colspan="5" style="font-size:11px;">🧲 ${lv.chop_zone_warning}</td></tr>`
         : "";
+      const conservativeTp =
+        lv.take_profit_conservative !== undefined && lv.take_profit_conservative !== null
+          ? ` <span class="muted">(konzervativan: ${fmt(lv.take_profit_conservative, 4)})</span>`
+          : "";
+      const patientEntry =
+        lv.patient_entry !== undefined && lv.patient_entry !== null
+          ? ` <span class="muted">(strpljiv: ${fmt(lv.patient_entry, 4)})</span>`
+          : "";
       return `<tr>
         <td><b>${tf}</b></td>
         <td class="${biasCls}">${lv.bias === "long" ? "LONG" : "SHORT"}</td>
-        <td>${fmt(lv.entry, 4)}</td>
+        <td>${fmt(lv.entry, 4)}${patientEntry}</td>
         <td class="neg">${fmt(lv.stop_loss, 4)} <span class="muted">(${fmt(lv.risk_pct, 2)}%)</span></td>
-        <td class="pos">${fmt(lv.take_profit, 4)} <span class="muted">(${fmt(lv.reward_pct, 2)}%)</span></td>
+        <td class="pos">${fmt(lv.take_profit, 4)} <span class="muted">(${fmt(lv.reward_pct, 2)}%)</span>${conservativeTp}</td>
         <td>${fmt(lv.risk_reward_ratio, 2)}</td>
-      </tr>${warnRow}${chopWarnRow}`;
+      </tr>${extensionWarnRow}${warnRow}${chopWarnRow}`;
     })
     .join("");
   const riskLevelsHtml = mtfRows

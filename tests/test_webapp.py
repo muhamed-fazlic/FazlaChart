@@ -299,3 +299,74 @@ def test_best_signal_surfaces_confirmed_edge_with_entry_zone(client, monkeypatch
     # INJUSDT's fixture snapshot has no "atr" field, so no entry zone can be
     # computed — confirms the endpoint degrades gracefully instead of crashing.
     assert signal["entry"] is None
+
+
+def test_best_signal_recenters_entry_zone_on_patient_entry_when_overextended(tmp_path, monkeypatch):
+    """A short on a symbol whose price has already run far below EMA20 with
+    deeply oversold RSI must not hand back an entry zone glued to the
+    current (already-extended) price — it should recenter on the suggested
+    patient/retracement entry instead, so the user isn't told to short right
+    at the bottom of a move that's statistically due for a bounce."""
+    from scanner.calibration import CalibrationStats
+
+    db_path = tmp_path / "scanner_test.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+
+    extended_snapshot = {
+        "symbol": "EXTUSDT",
+        "timeframes": {
+            "1h": {
+                "symbol": "EXTUSDT",
+                "timeframe": "1h",
+                "trend": "bearish",
+                "close": 90.0,
+                "atr": 2.0,
+                "rsi": 25.0,
+                "ema20": 100.0,
+                "ema50": 105.0,
+                "volume_change_pct": -10.0,
+                "relative_volume": 0.8,
+                "support": 85.0,
+                "resistance": 105.0,
+                "momentum_fading": False,
+                "anomalies": [],
+            },
+        },
+        "derivatives": {"funding_rate": -0.0001, "open_interest_change_pct_60m": -1.0},
+    }
+
+    conn = init_db(str(db_path))
+    save_scan_result(conn, "EXTUSDT", extended_snapshot, [])
+    conn.close()
+
+    from webapp.main import app
+
+    strong_match = [
+        CalibrationStats(
+            label="trend:bearish",
+            direction="short",
+            horizon_candles=12,
+            n=200,
+            win_rate_pct=60.0,
+            avg_net_return_pct=0.5,
+            avg_win_return_pct=1.0,
+            avg_loss_return_pct=-0.8,
+            win_rate_ci_low_pct=53.0,
+            win_rate_ci_high_pct=66.5,
+        ),
+    ]
+    monkeypatch.setattr(
+        "agents_crypto.calibration_lookup.get_cached_calibration_stats", lambda *a, **k: strong_match
+    )
+
+    resp = TestClient(app).get("/api/scan/best-signal")
+    assert resp.status_code == 200
+    signal = resp.json()["signals"][0]
+    entry = signal["entry"]
+    assert entry is not None
+    assert entry["extension_warning"] is not None
+    assert entry["take_profit_conservative"] is not None
+    # The zone must sit above the current close (90.0), recentered toward
+    # the EMA20 retracement, not glued to the already-extended current price.
+    assert entry["entry_zone_low"] > 90.0
+

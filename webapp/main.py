@@ -411,19 +411,25 @@ def best_signal(limit: int = 5) -> dict[str, Any]:
         entry = None
         if close and atr:
             try:
-                levels = compute_risk_levels(close, atr, best.direction)
+                levels = compute_risk_levels(
+                    close, atr, best.direction, rsi=ref.get("rsi"), ema20=ref.get("ema20")
+                )
             except ValueError:
                 levels = None
             if levels:
                 # A narrow confirmation band around the current price, not a
                 # single exact tick — ATR-sized, biased slightly toward a
                 # pullback/retest entry in the trade direction rather than
-                # chasing the current price outright.
+                # chasing the current price outright. If the move already
+                # looks extended (see risk_calc._extension_check), recenter
+                # the zone on the suggested patient/retracement entry instead
+                # of the current (already-stretched) price.
                 band = atr * 0.25
+                zone_center = levels.patient_entry if levels.patient_entry is not None else close
                 zone = (
-                    (close - band, close + band * 0.4)
+                    (zone_center - band, zone_center + band * 0.4)
                     if best.direction == "long"
-                    else (close - band * 0.4, close + band)
+                    else (zone_center - band * 0.4, zone_center + band)
                 )
                 entry = {
                     "price": round(close, 8),
@@ -431,8 +437,10 @@ def best_signal(limit: int = 5) -> dict[str, Any]:
                     "entry_zone_high": round(max(zone), 8),
                     "stop_loss": levels.stop_loss,
                     "take_profit": levels.take_profit,
+                    "take_profit_conservative": levels.take_profit_conservative,
                     "risk_reward_ratio": levels.risk_reward_ratio,
                     "volatility_warning": levels.volatility_warning,
+                    "extension_warning": levels.extension_warning,
                 }
 
         candidates.append(

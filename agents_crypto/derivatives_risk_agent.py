@@ -220,6 +220,8 @@ def _risk_levels_by_timeframe(timeframe_snapshots: dict[str, Any]) -> dict[str, 
             close=tf_snapshot["close"],
             atr=tf_snapshot["atr"],
             bias="long" if trend == "bullish" else "short",
+            rsi=tf_snapshot.get("rsi"),
+            ema20=tf_snapshot.get("ema20"),
         )
         levels_by_tf[tf] = levels.__dict__
     return levels_by_tf
