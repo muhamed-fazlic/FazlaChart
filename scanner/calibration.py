@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from agents_crypto.risk_calc import DEFAULT_SL_ATR_MULTIPLIER, DEFAULT_TP_ATR_MULTIPLIER
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance import client
 from tradingagents.dataflows.vendors.binance.anomaly import detect_anomalies
@@ -68,6 +69,11 @@ class LabeledCase:
     # only the data available as of this candle — never leaks future info.
     # None for cases built by older code paths/tests that don't set it.
     regime: str | None = None
+    # How the position was actually closed in the path-dependent walk-forward
+    # (see _walk_forward_exit): "take_profit", "stop_loss", "timeout" (neither
+    # level touched within the horizon), or None for undirected labels/cases
+    # built directly by tests that don't set it.
+    exit_reason: str | None = None
 
 
 @dataclass
@@ -130,6 +136,50 @@ def _forward_return_pct(df: pd.DataFrame, i: int, horizon: int) -> float | None:
     return (exit_ - entry) / entry * 100.0
 
 
+def _walk_forward_exit(
+    df: pd.DataFrame, i: int, direction: str, entry_close: float, atr: float, max_horizon: int
+) -> tuple[int | None, float | None, str | None]:
+    """Simulate the same SL/TP a live user would actually be shown (same ATR
+    multipliers as :func:`agents_crypto.risk_calc.compute_risk_levels`) and
+    scan forward candle-by-candle to find which is touched first.
+
+    Returns ``(candles_to_exit, exit_price, exit_reason)``. ``candles_to_exit``
+    is ``None`` and ``exit_reason`` is ``"timeout"`` when neither level is
+    touched within ``max_horizon`` candles (the trade is still open at the
+    point every caller-requested horizon must eventually resolve against the
+    close price instead). If both the stop and the target fall within the
+    same candle's high/low range, the stop is assumed to hit first — the
+    conservative assumption, since intra-candle order can't be known from
+    OHLC data alone.
+    """
+    if pd.isna(atr) or atr <= 0:
+        return None, None, None
+
+    sl_distance = atr * DEFAULT_SL_ATR_MULTIPLIER
+    tp_distance = atr * DEFAULT_TP_ATR_MULTIPLIER
+    if direction == "long":
+        stop_loss = entry_close - sl_distance
+        take_profit = entry_close + tp_distance
+    else:
+        stop_loss = entry_close + sl_distance
+        take_profit = entry_close - tp_distance
+
+    for h in range(1, max_horizon + 1):
+        if i + h >= len(df):
+            break
+        low = float(df["low"].iloc[i + h])
+        high = float(df["high"].iloc[i + h])
+        if direction == "long":
+            sl_touched, tp_touched = low <= stop_loss, high >= take_profit
+        else:
+            sl_touched, tp_touched = high >= stop_loss, low <= take_profit
+        if sl_touched:
+            return h, stop_loss, "stop_loss"
+        if tp_touched:
+            return h, take_profit, "take_profit"
+    return None, None, "timeout"
+
+
 # Volatility-regime bucket thresholds: a label's win rate earned during a
 # calm market can look very different from the same label during a wild one
 # (wider stops get hit more, moves overshoot targets faster, etc). Bucketing
@@ -189,8 +239,23 @@ def backtest_symbol(
     limit: int = 1500,
 ) -> list[LabeledCase]:
     """Walk every candle in ``symbol``'s history, label it the way the live
-    scanner would (trend + anomalies, point-in-time), and record the forward
-    return at each horizon. One candle yields one case per label it carries.
+    scanner would (trend + anomalies, point-in-time), and record the outcome
+    at each horizon.
+
+    For directional labels ("long"/"short"), the outcome is **path-dependent**:
+    it reconstructs the same ATR-based SL/TP a live user would actually be
+    shown (see :func:`_walk_forward_exit`) and checks which level is touched
+    first, scanning forward candle-by-candle. If neither is touched within a
+    given horizon, the trade is marked closed at that horizon's candle
+    instead (same as the old point-to-point behaviour). This answers "would
+    the stop or the target have been hit first", not just "was price higher
+    N candles later" — a label can show a positive forward return while the
+    stop was actually hit and then price recovered, which the old point-to-
+    point measure couldn't distinguish.
+
+    Undirected labels (no declared long/short bias) keep the original
+    point-to-point magnitude, since there's no SL/TP side to simulate.
+    One candle yields one case per label it carries, per horizon.
     """
     df = _load_history(symbol, timeframe, limit)
     atr_pct = (df["atr"] / df["close"] * 100.0).replace([float("inf"), float("-inf")], pd.NA)
@@ -206,14 +271,64 @@ def backtest_symbol(
         entry_time = str(window["open_time"].iloc[-1])
         entry_close = float(window["close"].iloc[-1])
         regime = _regime_for_window(atr_pct.iloc[: i + 1].dropna())
+        entry_atr = float(df["atr"].iloc[i])
 
-        for horizon in horizons:
-            forward_return = _forward_return_pct(df, i, horizon)
-            if forward_return is None:
+        # Path-dependent exit depends only on direction (long vs short), not
+        # on which label implied it, so at most two walk-forwards per candle
+        # are needed no matter how many directional labels fire together.
+        exit_by_direction: dict[str, tuple[int | None, float | None, str | None]] = {}
+        for direction in ("long", "short"):
+            needed = any(LABEL_DIRECTION.get(label) == direction for label in labels)
+            if needed:
+                exit_by_direction[direction] = _walk_forward_exit(
+                    df, i, direction, entry_close, entry_atr, max_horizon
+                )
+
+        for label in labels:
+            direction = LABEL_DIRECTION.get(label)
+            if direction is None:
+                # Undirected label: no SL/TP side is defined, fall back to the
+                # original point-to-point magnitude per horizon.
+                for horizon in horizons:
+                    forward_return = _forward_return_pct(df, i, horizon)
+                    if forward_return is None:
+                        continue
+                    cases.append(
+                        LabeledCase(
+                            symbol, timeframe, label, entry_time, entry_close, forward_return, horizon, regime
+                        )
+                    )
                 continue
-            for label in labels:
+
+            hit_candle, exit_price, reason = exit_by_direction.get(direction, (None, None, None))
+            if reason is None:
+                continue  # no usable ATR at this candle (NaN/zero) — skip
+            for horizon in horizons:
+                if hit_candle is not None and hit_candle <= horizon:
+                    # SL/TP resolved the trade before the horizon's end.
+                    forward_return = (exit_price - entry_close) / entry_close * 100.0
+                    horizon_exit_reason = reason
+                else:
+                    # Neither level touched within this horizon: close it out
+                    # at the horizon's candle, same as the old point-to-point
+                    # behaviour, so win rate still reflects "did this trade
+                    # eventually make money", not just "did it hit TP".
+                    forward_return = _forward_return_pct(df, i, horizon)
+                    if forward_return is None:
+                        continue
+                    horizon_exit_reason = "timeout"
                 cases.append(
-                    LabeledCase(symbol, timeframe, label, entry_time, entry_close, forward_return, horizon, regime)
+                    LabeledCase(
+                        symbol,
+                        timeframe,
+                        label,
+                        entry_time,
+                        entry_close,
+                        forward_return,
+                        horizon,
+                        regime,
+                        horizon_exit_reason,
+                    )
                 )
     return cases
 

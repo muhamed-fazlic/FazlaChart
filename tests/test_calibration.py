@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import inspect
 
+import pandas as pd
 import pytest
 
-from scanner.calibration import LABEL_DIRECTION, LabeledCase, summarize
+from scanner.calibration import LABEL_DIRECTION, LabeledCase, _walk_forward_exit, summarize
 
 pytestmark = pytest.mark.unit
 
@@ -123,3 +124,77 @@ def test_directed_label_includes_confidence_interval():
     stats = summarize(cases, cost_pct=0.1)
     assert stats[0].win_rate_ci_low_pct is not None
     assert stats[0].win_rate_ci_low_pct <= stats[0].win_rate_pct <= stats[0].win_rate_ci_high_pct
+
+
+def _ohlc_df(bars: list[tuple[float, float]]) -> pd.DataFrame:
+    """Build a minimal high/low dataframe indexed exactly like the real
+    history: row 0 is the entry candle itself (never consulted by
+    ``_walk_forward_exit``, which only looks at ``i + h`` for ``h >= 1``),
+    and ``bars`` supplies (low, high) for the candles that follow it."""
+    rows = [{"low": 0.0, "high": 0.0}] + [{"low": lo, "high": hi} for lo, hi in bars]
+    return pd.DataFrame(rows)
+
+
+class TestWalkForwardExit:
+    """``_walk_forward_exit`` powers the path-dependent backtest: it must
+    replicate exactly the SL/TP a live user is shown (same ATR multipliers
+    as ``agents_crypto.risk_calc.compute_risk_levels``) and resolve ties
+    conservatively when a single candle's range covers both levels."""
+
+    def test_long_take_profit_hit_first(self):
+        # entry 100, atr 2 -> SL 97.0, TP 105.0 (1.5x/2.5x ATR)
+        df = _ohlc_df([(99.0, 101.0), (104.5, 105.5)])
+        hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "long", 100.0, 2.0, max_horizon=5)
+        assert hit_candle == 2
+        assert exit_price == pytest.approx(105.0)
+        assert reason == "take_profit"
+
+    def test_long_stop_loss_hit_first(self):
+        df = _ohlc_df([(96.5, 101.0)])
+        hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "long", 100.0, 2.0, max_horizon=5)
+        assert hit_candle == 1
+        assert exit_price == pytest.approx(97.0)
+        assert reason == "stop_loss"
+
+    def test_long_both_levels_touched_same_candle_assumes_stop_first(self):
+        # Pathological wide-range candle spanning both SL (97) and TP (105) —
+        # can't know which happened first from OHLC alone, so assume the
+        # worse (stop) outcome rather than overstate the edge.
+        df = _ohlc_df([(96.0, 106.0)])
+        hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "long", 100.0, 2.0, max_horizon=5)
+        assert reason == "stop_loss"
+        assert exit_price == pytest.approx(97.0)
+
+    def test_short_take_profit_hit_first(self):
+        # entry 100, atr 2 -> SL 103.0, TP 95.0 (mirrored for shorts)
+        df = _ohlc_df([(96.0, 102.0), (94.5, 99.0)])
+        hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "short", 100.0, 2.0, max_horizon=5)
+        assert hit_candle == 2
+        assert exit_price == pytest.approx(95.0)
+        assert reason == "take_profit"
+
+    def test_short_stop_loss_hit_first(self):
+        df = _ohlc_df([(99.0, 103.5)])
+        hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "short", 100.0, 2.0, max_horizon=5)
+        assert hit_candle == 1
+        assert exit_price == pytest.approx(103.0)
+        assert reason == "stop_loss"
+
+    def test_neither_level_touched_within_horizon_times_out(self):
+        df = _ohlc_df([(99.0, 101.0), (99.5, 100.5), (99.0, 101.0)])
+        hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "long", 100.0, 2.0, max_horizon=3)
+        assert hit_candle is None
+        assert exit_price is None
+        assert reason == "timeout"
+
+    def test_zero_or_missing_atr_yields_no_decision(self):
+        df = _ohlc_df([(90.0, 110.0)])
+        assert _walk_forward_exit(df, 0, "long", 100.0, 0.0, max_horizon=5) == (None, None, None)
+        assert _walk_forward_exit(df, 0, "long", 100.0, float("nan"), max_horizon=5) == (None, None, None)
+
+    def test_exhausting_dataframe_before_horizon_times_out(self):
+        # Only one future candle available even though max_horizon asks for 5.
+        df = _ohlc_df([(99.0, 101.0)])
+        hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "long", 100.0, 2.0, max_horizon=5)
+        assert hit_candle is None
+        assert reason == "timeout"
