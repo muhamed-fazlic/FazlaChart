@@ -146,8 +146,10 @@ def test_analyze_endpoint_returns_structured_payload(client, monkeypatch):
             caveats="Doesn't account for news.",
         ),
         risk_levels={"entry": 10.0, "stop_loss": 10.3, "take_profit": 9.5, "risk_pct": 3.0, "reward_pct": 5.0, "risk_reward_ratio": 1.67},
+        multi_timeframe_risk_levels={},
         calibration_matches=[{"label": "trend:bearish", "direction": "short", "n": 387, "win_rate_pct": 37.0, "avg_net_return_pct": -0.17}],
         diverges_from_btc=True,
+        liquidity_heatmap={},
     )
 
     captured = {}
@@ -232,3 +234,68 @@ def test_analyze_endpoint_returns_502_on_failure(client, monkeypatch):
     resp = client.post("/api/analyze/INJUSDT")
     assert resp.status_code == 502
     assert "Ollama is not reachable" in resp.json()["detail"]
+
+
+def test_best_signal_requires_statistically_significant_edge(client, monkeypatch):
+    """A match below the sample-size floor or whose 95% CI lower bound
+    doesn't clear 50% must never surface as a "best signal", no matter how
+    high its raw win_rate_pct looks."""
+    from scanner.calibration import CalibrationStats
+
+    weak_match = [
+        CalibrationStats(
+            label="trend:bearish",
+            direction="short",
+            horizon_candles=12,
+            n=10,  # below the minimum sample size
+            win_rate_pct=80.0,
+            avg_net_return_pct=1.0,
+            avg_win_return_pct=2.0,
+            avg_loss_return_pct=-1.0,
+            win_rate_ci_low_pct=44.0,  # straddles 50% anyway
+            win_rate_ci_high_pct=97.0,
+        ),
+    ]
+    monkeypatch.setattr(
+        "agents_crypto.calibration_lookup.get_cached_calibration_stats", lambda *a, **k: weak_match
+    )
+
+    resp = client.get("/api/scan/best-signal")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["signals"] == []
+    assert body["candidates_considered"] == 2  # both BTCUSDT (bullish) and INJUSDT (bearish) are directional
+
+
+def test_best_signal_surfaces_confirmed_edge_with_entry_zone(client, monkeypatch):
+    from scanner.calibration import CalibrationStats
+
+    strong_match = [
+        CalibrationStats(
+            label="trend:bearish",
+            direction="short",
+            horizon_candles=12,
+            n=387,
+            win_rate_pct=65.0,
+            avg_net_return_pct=0.8,
+            avg_win_return_pct=1.5,
+            avg_loss_return_pct=-0.9,
+            win_rate_ci_low_pct=60.1,
+            win_rate_ci_high_pct=69.8,
+        ),
+    ]
+    monkeypatch.setattr(
+        "agents_crypto.calibration_lookup.get_cached_calibration_stats", lambda *a, **k: strong_match
+    )
+
+    resp = client.get("/api/scan/best-signal")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["signals"]) == 1
+    signal = body["signals"][0]
+    assert signal["symbol"] == "INJUSDT"
+    assert signal["direction"] == "short"
+    assert signal["win_rate_ci_low_pct"] == 60.1
+    # INJUSDT's fixture snapshot has no "atr" field, so no entry zone can be
+    # computed — confirms the endpoint degrades gracefully instead of crashing.
+    assert signal["entry"] is None

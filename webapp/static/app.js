@@ -47,6 +47,85 @@ function renderBtcBanner(btc) {
     (anomalies ? `<span>${anomalies}</span>` : "");
 }
 
+// --- Top Signal Now (statistically-grounded shortlist) --------------------
+// Distinct from the heuristic "top movers" table: only ever shows a symbol
+// here if its active label's calibration win rate clears 50% at the 95%
+// confidence interval's conservative lower bound with n>=30 (see
+// /api/scan/best-signal) — never a raw point estimate, never a guess.
+
+function winRateRangeHtml(low, high) {
+  if (low === null || low === undefined || high === null || high === undefined) return "";
+  return `[${fmt(low, 1)}–${fmt(high, 1)}%]`;
+}
+
+function bestSignalEntryHtml(sig) {
+  if (!sig.entry) return "";
+  return `
+    <div class="best-signal-entry">
+      <span>Entry zona: <b>${fmt(sig.entry.entry_zone_low, 4)}–${fmt(sig.entry.entry_zone_high, 4)}</b></span>
+      <span>SL: ${fmt(sig.entry.stop_loss, 4)}</span>
+      <span>TP: ${fmt(sig.entry.take_profit, 4)}</span>
+      <span>R:R ${fmt(sig.entry.risk_reward_ratio, 2)}</span>
+    </div>
+    ${sig.entry.volatility_warning ? `<div class="best-signal-warning">⚠️ ${sig.entry.volatility_warning}</div>` : ""}`;
+}
+
+function bestSignalCardHtml(sig, rank) {
+  const dirClass = sig.direction === "long" ? "trend-bullish" : "trend-bearish";
+  const dirWord = sig.direction === "long" ? "LONG" : "SHORT";
+  return `
+    <div class="best-signal-card${rank === 0 ? " best-signal-top" : ""}" data-symbol="${sig.symbol}">
+      <div class="best-signal-head">
+        <span class="best-signal-rank">#${rank + 1}</span>
+        <b>${sig.symbol}</b>
+        <span class="${dirClass}">${dirWord}</span>
+        <span class="muted">${sig.timeframe}</span>
+      </div>
+      <div class="best-signal-stats">
+        <span>Win rate: <b>${fmt(sig.win_rate_pct, 1)}%</b> ${winRateRangeHtml(sig.win_rate_ci_low_pct, sig.win_rate_ci_high_pct)}</span>
+        <span class="muted">n=${sig.n}</span>
+        <span class="${signClass(sig.avg_net_return_pct)}">avg net: ${fmt(sig.avg_net_return_pct, 2)}%</span>
+        ${sig.regime ? `<span class="muted">regime: ${sig.regime}</span>` : ""}
+      </div>
+      <div class="muted best-signal-label">${sig.label}</div>
+      ${bestSignalEntryHtml(sig)}
+    </div>`;
+}
+
+function renderBestSignalPanel(data) {
+  const el = document.getElementById("best-signal-panel");
+  if (!data || !data.signals || !data.signals.length) {
+    el.className = "best-signal-panel muted";
+    el.innerHTML = data && data.candidates_considered
+      ? `Nema trenutno statistički potvrđenog signala (pregledano ${data.candidates_considered} coina sa trendom, ` +
+        `keš kalibracije spreman za ${data.cache_coverage || "0/0"}). Keš se puni u pozadini — pokušajte opet za koji minut.`
+      : "Nema podataka još — sačekajte da skener i keš kalibracije završe prvi ciklus.";
+    return;
+  }
+  el.className = "best-signal-panel";
+  const [top, ...rest] = data.signals;
+  el.innerHTML =
+    `<div class="best-signal-title">🎯 Top signal sada — statistički potvrđen (n≥30, donja granica 95% CI &gt; 50%)</div>` +
+    bestSignalCardHtml(top, 0) +
+    (rest.length ? `<div class="best-signal-runners">${rest.map((s, i) => bestSignalCardHtml(s, i + 1)).join("")}</div>` : "");
+  el.querySelectorAll(".best-signal-card").forEach((cardEl) => {
+    cardEl.addEventListener("click", () => {
+      document.getElementById("symbol-filter-input").value = cardEl.dataset.symbol;
+      lookupSymbol(cardEl.dataset.symbol);
+    });
+  });
+}
+
+async function loadBestSignal() {
+  try {
+    const res = await fetch("/api/scan/best-signal?limit=4");
+    const data = await res.json();
+    renderBestSignalPanel(data);
+  } catch (err) {
+    console.error("Could not load best signal:", err);
+  }
+}
+
 function renderTable(symbols, anomaliesOnly) {
   const body = document.getElementById("scan-body");
   const rows = anomaliesOnly ? symbols.filter((s) => s.anomalies.length > 0) : symbols;
@@ -129,7 +208,7 @@ function winRateCellHtml(matches) {
     .map((m) =>
       m.win_rate_pct === null
         ? `${m.label}: nema definisan smjer (long/short), pa se ne računa win rate — prosječan pomak ${fmt(m.avg_net_return_pct, 2)}% (n=${m.n})`
-        : `${m.label} → ${m.direction}: ${fmt(m.win_rate_pct, 1)}% (n=${m.n}, avg net ${fmt(m.avg_net_return_pct, 2)}%)`
+        : `${m.label} → ${m.direction}: ${fmt(m.win_rate_pct, 1)}% [95% CI ${fmt(m.win_rate_ci_low_pct, 1)}–${fmt(m.win_rate_ci_high_pct, 1)}%] (n=${m.n}, avg net ${fmt(m.avg_net_return_pct, 2)}%)`
     )
     .join("\n");
   if (best.win_rate_pct === null) {
@@ -142,10 +221,17 @@ function winRateCellHtml(matches) {
       title,
     };
   }
-  const winClass = best.win_rate_pct >= 55 ? "pos" : best.win_rate_pct <= 45 ? "neg" : "";
+  // Colour the cell by the confidence interval, not the raw point estimate:
+  // a 65% win rate whose 95% CI still straddles 50% (coin-flip) is not
+  // trustworthy evidence of an edge, even though the point number "looks
+  // good" — only colour it pos/neg once the whole interval clears 50%.
+  const ciLow = best.win_rate_ci_low_pct;
+  const ciHigh = best.win_rate_ci_high_pct;
+  const winClass = ciLow !== null && ciLow >= 50 ? "pos" : ciHigh !== null && ciHigh <= 50 ? "neg" : "";
+  const ciLabel = ciLow !== null ? ` <span class="muted">[${fmt(ciLow, 0)}–${fmt(ciHigh, 0)}]</span>` : "";
   return {
     className: "winrate-cell",
-    html: `<span class="${winClass}">${fmt(best.win_rate_pct, 1)}%</span> <span class="muted">(n=${best.n}${lowN})</span>`,
+    html: `<span class="${winClass}">${fmt(best.win_rate_pct, 1)}%</span>${ciLabel} <span class="muted">(n=${best.n}${lowN})</span>`,
     title,
   };
 }
@@ -330,10 +416,14 @@ async function loadCalibrationPreview(symbol) {
     el.innerHTML = data.matches
       .map((m) => {
         const lowN = m.n < 30;
-        const winClass = m.win_rate_pct === null ? "" : m.win_rate_pct >= 55 ? "pos" : m.win_rate_pct <= 45 ? "neg" : "";
+        const ciLow = m.win_rate_ci_low_pct;
+        const ciHigh = m.win_rate_ci_high_pct;
+        const winClass =
+          m.win_rate_pct === null ? "" : ciLow !== null && ciLow >= 50 ? "pos" : ciHigh !== null && ciHigh <= 50 ? "neg" : "";
+        const ciLabel = ciLow !== null ? ` [95% CI ${fmt(ciLow, 0)}–${fmt(ciHigh, 0)}%]` : "";
         return (
           `<div><b>${m.label}</b> → ${m.direction}: win rate ` +
-          `<span class="${winClass}"><b>${fmt(m.win_rate_pct, 1)}%</b></span> ` +
+          `<span class="${winClass}"><b>${fmt(m.win_rate_pct, 1)}%</b></span>${ciLabel} ` +
           `(n=${m.n}${lowN ? ", small sample" : ""}, avg net ${fmt(m.avg_net_return_pct, 2)}%)</div>`
         );
       })
@@ -384,10 +474,13 @@ function renderAssessment(data) {
 
   const calibHtml = data.calibration_matches.length
     ? data.calibration_matches
-        .map(
-          (c) =>
-            `<li>${c.label} → ${c.direction}: win rate <b>${fmt(c.win_rate_pct, 1)}%</b> (n=${c.n}, avg net ${fmt(c.avg_net_return_pct, 2)}%)</li>`
-        )
+        .map((c) => {
+          const ciLabel =
+            c.win_rate_ci_low_pct !== null && c.win_rate_ci_low_pct !== undefined
+              ? ` [95% CI ${fmt(c.win_rate_ci_low_pct, 0)}–${fmt(c.win_rate_ci_high_pct, 0)}%]`
+              : "";
+          return `<li>${c.label} → ${c.direction}: win rate <b>${fmt(c.win_rate_pct, 1)}%</b>${ciLabel} (n=${c.n}, avg net ${fmt(c.avg_net_return_pct, 2)}%)</li>`;
+        })
         .join("")
     : `<li class="muted">No historical calibration data for the active label(s).</li>`;
 
@@ -603,3 +696,5 @@ document.getElementById("analyze-btn").addEventListener("click", analyzeSymbol);
 
 populateSymbolSuggestions();
 setFullTableMode(document.getElementById("show-all-toggle").checked);
+loadBestSignal();
+setInterval(loadBestSignal, REFRESH_MS);

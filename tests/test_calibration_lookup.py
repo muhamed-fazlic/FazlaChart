@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats
+from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats, get_cached_calibration_stats
 from scanner.calibration import CalibrationStats
 
 pytestmark = pytest.mark.unit
@@ -95,3 +95,40 @@ def test_find_stats_for_labels_matches_label_and_horizon():
 def test_find_stats_for_labels_filters_by_horizon():
     matches = find_stats_for_labels(_FAKE_STATS, labels=["trend:bearish"], horizon_candles=4)
     assert matches == []
+
+
+def test_get_cached_calibration_stats_never_backtests_on_miss(tmp_path):
+    """A cold/empty cache must return [] immediately — never trigger a
+    backtest — since this is the cache-only path used by endpoints that
+    rank many symbols at once and can't afford to block on one."""
+    cache_path = str(tmp_path / "cal.json")
+    with patch("agents_crypto.calibration_lookup.backtest_symbol") as mock_backtest:
+        stats = get_cached_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)
+        assert stats == []
+        assert not mock_backtest.called
+
+
+def test_get_cached_calibration_stats_reads_warm_cache(tmp_path):
+    cache_path = str(tmp_path / "cal.json")
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.summarize", return_value=_FAKE_STATS),
+    ):
+        get_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)  # warms the cache
+
+    stats = get_cached_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)
+    assert len(stats) == 2
+    assert stats[0].label == "trend:bearish"
+
+
+def test_get_cached_calibration_stats_ignores_expired_entry(tmp_path):
+    cache_path = str(tmp_path / "cal.json")
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.summarize", return_value=_FAKE_STATS),
+    ):
+        get_calibration_stats("BTCUSDT", "1h", cache_path=cache_path, ttl_seconds=0)
+
+    # ttl_seconds=0 means the entry is already stale by the time this reads it.
+    stats = get_cached_calibration_stats("BTCUSDT", "1h", cache_path=cache_path, ttl_seconds=0)
+    assert stats == []

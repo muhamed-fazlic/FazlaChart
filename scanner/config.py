@@ -13,7 +13,7 @@ class ScannerConfig:
     # at ~12 request-weight per symbol per cycle, 60 symbols every 300s is
     # a fraction of the ~2400/min weight budget.)
     symbols: tuple[str, ...] = ()
-    top_n_by_volume: int = 60
+    top_n_by_volume: int = 120
 
     # Once a symbol has been scanned, keep refreshing it every cycle even if
     # it later drops out of the current top-N by volume — otherwise its last

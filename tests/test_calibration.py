@@ -85,3 +85,41 @@ def test_stats_sorted_by_sample_size_descending():
     cases = [_case("trend:bullish", 1.0, horizon=4)] * 3 + [_case("trend:bearish", -1.0, horizon=4)] * 7
     stats = summarize(cases)
     assert [s.n for s in stats] == [7, 3]
+
+
+def test_confidence_interval_widens_with_small_sample_size():
+    """Same 70% point estimate, far fewer trials — the interval must be wider,
+    so a flashy-looking win rate on thin evidence doesn't read as equally
+    trustworthy as one backed by many cases."""
+    from scanner.calibration import wilson_score_interval
+
+    low_n, high_n = wilson_score_interval(70.0, n=10)
+    low_big, high_big = wilson_score_interval(70.0, n=500)
+    assert (high_n - low_n) > (high_big - low_big)
+
+
+def test_confidence_interval_stays_within_bounds():
+    from scanner.calibration import wilson_score_interval
+
+    low, high = wilson_score_interval(100.0, n=5)
+    assert 0.0 <= low <= high <= 100.0
+
+
+def test_confidence_interval_none_when_win_rate_is_none():
+    from scanner.calibration import wilson_score_interval
+
+    assert wilson_score_interval(None, n=50) == (None, None)
+
+
+def test_undirected_label_has_no_confidence_interval():
+    cases = [_case("trend:neutral", forward_return_pct=-3.0), _case("trend:neutral", forward_return_pct=3.0)]
+    stats = summarize(cases, cost_pct=0.1)
+    assert stats[0].win_rate_ci_low_pct is None
+    assert stats[0].win_rate_ci_high_pct is None
+
+
+def test_directed_label_includes_confidence_interval():
+    cases = [_case("trend:bullish", forward_return_pct=1.0)] * 10
+    stats = summarize(cases, cost_pct=0.1)
+    assert stats[0].win_rate_ci_low_pct is not None
+    assert stats[0].win_rate_ci_low_pct <= stats[0].win_rate_pct <= stats[0].win_rate_ci_high_pct

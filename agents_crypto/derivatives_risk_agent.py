@@ -18,8 +18,9 @@ from pydantic import BaseModel, Field
 from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats
 from agents_crypto.risk_calc import compute_risk_levels
 from scanner.btc_context import build_btc_context, diverges_from_btc
+from scanner.calibration import current_volatility_regime
 from tradingagents.dataflows.vendors.binance.liquidity_heatmap import compute_liquidity_heatmap
-from tradingagents.dataflows.vendors.binance.indicators import klines_to_dataframe
+from tradingagents.dataflows.vendors.binance.indicators import add_indicators, klines_to_dataframe
 from tradingagents.dataflows.vendors.binance import client as binance_client
 from tradingagents.dataflows.vendors.binance.snapshot import build_symbol_snapshot
 from tradingagents.llm_clients.factory import create_llm_client
@@ -72,6 +73,11 @@ class AssessmentResult:
     calibration_matches: list[dict[str, Any]]
     diverges_from_btc: bool
     liquidity_heatmap: dict[str, Any]
+    # Volatility regime ("low"/"normal"/"high"/None) the calibration_matches
+    # were scoped to, and whether that scoping had to fall back to the
+    # all-regime blend for lack of regime-specific history.
+    current_regime: str | None = None
+    regime_fallback: bool = False
 
 
 # Without an explicit timeout, a stuck/hanging connection (dead keep-alive,
@@ -105,6 +111,8 @@ def _build_prompt(
     risk_levels: dict[str, Any] | None,
     diverges: bool,
     heatmap_summary: dict[str, Any],
+    current_regime: str | None = None,
+    regime_fallback: bool = False,
 ) -> str:
     return f"""You are a derivatives/risk analyst for crypto futures. You are given ALREADY-MEASURED,
 objective facts below — you do not have tools, and you must not invent numbers that are not present
@@ -118,6 +126,10 @@ Rules:
 - `bias` must follow the CURRENT trend/anomaly labels given, not a contrarian guess.
 - Do not propose your own stop-loss/take-profit; only comment on the ones given in `risk_levels`.
 - Treat a calibration sample size (`n`) under ~30 as too small to be reliable, and say so.
+- Each calibration match includes a 95% confidence interval (`win_rate_ci_low_pct`/`win_rate_ci_high_pct`)
+  around its `win_rate_pct`. If that interval still straddles 50% (e.g. low=42, high=68), you MUST treat
+  the apparent edge as statistically unconfirmed and say so explicitly in `historical_basis` — a high
+  point-estimate win rate with a wide, 50%-straddling interval is NOT reliable evidence of an edge.
 - Use `liquidity_heatmap` to judge whether the given stop-loss/take-profit sit inside a crowded
   stop-hunt zone or high-volume node (riskier/more likely to get wicked) and mention that in
   `risk_reward_commentary` if relevant — it is an approximation from public volume, not real
@@ -125,6 +137,10 @@ Rules:
 - If `risk_levels` includes a `chop_zone_warning`, you MUST mention it in `risk_reward_commentary` —
   it means the given stop-loss sits inside an unusually dense trading zone where price tends to
   whipsaw both directions before breaking out, independent of normal ATR-based sizing.
+- `volatility_regime` below tells you whether the calibration matches were scoped to the CURRENT
+  volatility regime ("low"/"normal"/"high") or had to fall back to an all-regime blend for lack of
+  regime-specific history (`regime_fallback=True`). If it fell back, say in `historical_basis` that
+  the stat is a general blend, not specific to current volatility conditions.
 
 SYMBOL: {symbol}
 TIMEFRAME: {timeframe}
@@ -135,6 +151,9 @@ SNAPSHOT (objective facts from the Market Scanner):
 BTC REFERENCE CONTEXT:
 {btc_context}
 DIVERGES FROM BTC (opposite trend to BTC's 1h reference): {diverges}
+
+CURRENT VOLATILITY REGIME: {current_regime if current_regime else "unknown (insufficient trailing history)"}
+CALIBRATION FELL BACK TO ALL-REGIME BLEND: {regime_fallback}
 
 CALIBRATION BACKTEST MATCHES (historical win-rate/avg-return for the labels active right now,
 computed from real Binance history, net of trading costs — this is ground truth, not a guess):
@@ -224,15 +243,32 @@ def assess_symbol(
     btc_context = build_btc_context()
 
     labels = _active_labels(tf_snapshot)
-    calibration_stats = get_calibration_stats(symbol, timeframe, horizons=(horizon_candles,), use_process=True)
+
+    # Fetched here (not after) so the same klines can double as the basis for
+    # both the liquidity heatmap below and the current volatility-regime
+    # classification used to scope the calibration lookup to "conditions
+    # like right now" instead of blending in every market regime ever seen.
+    klines = binance_client.get_klines(symbol, timeframe, limit=200)
+    indicator_df = add_indicators(klines_to_dataframe(klines))
+    current_regime = current_volatility_regime(indicator_df)
+
+    calibration_stats = get_calibration_stats(
+        symbol, timeframe, horizons=(horizon_candles,), use_process=True, regime=current_regime
+    )
     matches = find_stats_for_labels(calibration_stats, labels, horizon_candles)
+    regime_fallback = False
+    if current_regime is not None and not matches:
+        # Not enough regime-specific history for this label yet — fall back
+        # to the all-regime blend rather than reporting "no data" outright.
+        regime_fallback = True
+        all_regime_stats = get_calibration_stats(symbol, timeframe, horizons=(horizon_candles,), use_process=True)
+        matches = find_stats_for_labels(all_regime_stats, labels, horizon_candles)
     matches_json = [m.__dict__ for m in matches]
 
     multi_timeframe_risk_levels = _risk_levels_by_timeframe(snapshot["timeframes"])
 
     diverges = diverges_from_btc(tf_snapshot["trend"], btc_context["reference_trend"])
 
-    klines = binance_client.get_klines(symbol, timeframe, limit=200)
     heatmap = compute_liquidity_heatmap(klines_to_dataframe(klines))
     heatmap["symbol"] = symbol
     heatmap["timeframe"] = timeframe
@@ -254,7 +290,16 @@ def assess_symbol(
         risk_levels = None  # keep the prompt's existing "N/A — neutral" branch working
 
     prompt = _build_prompt(
-        symbol, timeframe, snapshot, btc_context, matches_json, risk_levels, diverges=diverges, heatmap_summary=heatmap_summary
+        symbol,
+        timeframe,
+        snapshot,
+        btc_context,
+        matches_json,
+        risk_levels,
+        diverges=diverges,
+        heatmap_summary=heatmap_summary,
+        current_regime=current_regime,
+        regime_fallback=regime_fallback,
     )
 
     chat_model = llm or _build_llm(provider, model, base_url)
@@ -293,5 +338,7 @@ def assess_symbol(
         calibration_matches=matches_json,
         diverges_from_btc=diverges,
         liquidity_heatmap=heatmap,
+        current_regime=current_regime,
+        regime_fallback=regime_fallback,
     )
 

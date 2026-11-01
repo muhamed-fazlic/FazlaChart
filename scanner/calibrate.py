@@ -34,18 +34,22 @@ def _render(symbol: str, timeframe: str, stats: list[CalibrationStats]) -> None:
     table.add_column("Dir.", justify="center", no_wrap=True)
     table.add_column("Horizon", justify="right", no_wrap=True)
     table.add_column("N", justify="right")
-    table.add_column("Win rate %", justify="right", no_wrap=True)
+    table.add_column("Win rate % (95% CI)", justify="right", no_wrap=True)
     table.add_column("Avg net return %", justify="right", no_wrap=True)
     table.add_column("Avg win %", justify="right")
     table.add_column("Avg loss %", justify="right")
 
     for s in stats:
+        if s.win_rate_pct is not None:
+            win_rate_cell = f"{s.win_rate_pct} ({s.win_rate_ci_low_pct}–{s.win_rate_ci_high_pct})"
+        else:
+            win_rate_cell = "n/a (undirected)"
         table.add_row(
             s.label,
             s.direction or "—",
             str(s.horizon_candles),
             str(s.n),
-            f"{s.win_rate_pct}" if s.win_rate_pct is not None else "n/a (undirected)",
+            win_rate_cell,
             f"{s.avg_net_return_pct}",
             f"{s.avg_win_return_pct}" if s.avg_win_return_pct is not None else "—",
             f"{s.avg_loss_return_pct}" if s.avg_loss_return_pct is not None else "—",

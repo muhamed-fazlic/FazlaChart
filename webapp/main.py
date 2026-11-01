@@ -95,6 +95,59 @@ async def _warm_up_llm_client_stack() -> None:
         logging.getLogger(__name__).warning("LLM client warm-up failed; will import lazily on first use", exc_info=True)
 
 
+_CALIBRATION_WARMUP_BATCH_SIZE = 2  # matches calibration_lookup's backtest-worker-process cap
+_CALIBRATION_WARMUP_INTERVAL_SECONDS = 20
+
+
+@app.on_event("startup")
+async def _start_calibration_warmup_loop() -> None:
+    """``/api/scan/best-signal`` only ever reads the on-disk calibration
+    cache (see ``get_cached_calibration_stats``) — it never backtests
+    on-demand, to stay fast even when ranking 100+ symbols. Without this
+    loop that cache would stay empty for any symbol a human never happened
+    to click on, making "best signal" silently blind to most of the tracked
+    universe. This fills it in the background, a couple of symbols every
+    ~20s, so it's self-sustaining without ever blocking a real request."""
+    import asyncio
+
+    asyncio.create_task(_calibration_warmup_loop())
+
+
+async def _calibration_warmup_loop() -> None:
+    import logging
+
+    import anyio
+
+    from agents_crypto.calibration_lookup import get_calibration_stats, get_cached_calibration_stats
+
+    logger = logging.getLogger(__name__)
+    while True:
+        try:
+            conn = _get_conn()
+            try:
+                rows = fetch_latest_scan_per_symbol(conn)
+            finally:
+                conn.close()
+            stale = [
+                (r["symbol"], r["reference_timeframe"])
+                for r in rows
+                if r["trend"] in ("bullish", "bearish")
+                and not get_cached_calibration_stats(r["symbol"], r["reference_timeframe"])
+            ]
+            for symbol, timeframe in stale[:_CALIBRATION_WARMUP_BATCH_SIZE]:
+                try:
+                    await anyio.to_thread.run_sync(
+                        lambda s=symbol, tf=timeframe: get_calibration_stats(
+                            s, tf, horizons=(_BEST_SIGNAL_HORIZON_CANDLES,), use_process=True
+                        )
+                    )
+                except Exception:
+                    logger.warning("Calibration warm-up failed for %s/%s", symbol, timeframe, exc_info=True)
+        except Exception:
+            logger.warning("Calibration warm-up cycle failed", exc_info=True)
+        await anyio.sleep(_CALIBRATION_WARMUP_INTERVAL_SECONDS)
+
+
 @app.middleware("http")
 async def _no_cache_dashboard_assets(request, call_next):
     """The dashboard's HTML/CSS/JS change far more often during active
@@ -299,6 +352,135 @@ def _active_labels(trend: str, anomalies: list[str]) -> list[str]:
     return [f"trend:{trend}"] + [f"anomaly:{a}" for a in anomalies]
 
 
+_BEST_SIGNAL_HORIZON_CANDLES = 12
+_BEST_SIGNAL_MIN_SAMPLE_SIZE = 30  # below this, even a high win rate is too noisy to call a real edge
+
+
+@app.get("/api/scan/best-signal")
+def best_signal(limit: int = 5) -> dict[str, Any]:
+    """Statistically-grounded "what's actually worth trading right now"
+    shortlist — NOT a heuristic ranking like ``/api/scan/top``. Ranks every
+    currently-tracked directional symbol by the conservative (95%-CI
+    lower-bound) win rate of its active calibration label(s), so a lucky
+    small sample can never outrank a well-tested edge, and requires a
+    minimum sample size before a label counts as "significant" at all.
+
+    Read-only and always fast: it only ever reads whatever's already in the
+    on-disk calibration cache (populated by the background warm-up loop and
+    by users' own lookups) and never triggers a fresh backtest inline — a
+    symbol simply has no entry here until its cache is warm."""
+    conn = _get_conn()
+    try:
+        rows = fetch_latest_scan_per_symbol(conn)
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"signals": [], "generated_at": None, "candidates_considered": 0, "cache_coverage": None}
+
+    from agents_crypto.calibration_lookup import find_stats_for_labels, get_cached_calibration_stats
+    from agents_crypto.risk_calc import compute_risk_levels
+
+    candidates: list[dict[str, Any]] = []
+    considered = 0
+    for row in rows:
+        if row["trend"] not in ("bullish", "bearish"):
+            continue
+        considered += 1
+        ref_tf = row["reference_timeframe"]
+        ref = row["snapshot"].get("timeframes", {}).get(ref_tf, {})
+        labels = _active_labels(row["trend"], row["anomalies"])
+
+        stats = get_cached_calibration_stats(row["symbol"], ref_tf)
+        matches = find_stats_for_labels(stats, labels, _BEST_SIGNAL_HORIZON_CANDLES)
+        significant = [
+            m
+            for m in matches
+            if m.direction in ("long", "short")
+            and m.n >= _BEST_SIGNAL_MIN_SAMPLE_SIZE
+            and m.win_rate_ci_low_pct is not None
+            and m.win_rate_ci_low_pct > 50.0
+        ]
+        if not significant:
+            continue
+        # Rank by the CI's conservative lower bound, not the point estimate —
+        # rewards both a high win rate AND enough samples to be confident in it.
+        best = max(significant, key=lambda m: m.win_rate_ci_low_pct)
+
+        close, atr = row["close_price"], ref.get("atr")
+        entry = None
+        if close and atr:
+            try:
+                levels = compute_risk_levels(close, atr, best.direction)
+            except ValueError:
+                levels = None
+            if levels:
+                # A narrow confirmation band around the current price, not a
+                # single exact tick — ATR-sized, biased slightly toward a
+                # pullback/retest entry in the trade direction rather than
+                # chasing the current price outright.
+                band = atr * 0.25
+                zone = (
+                    (close - band, close + band * 0.4)
+                    if best.direction == "long"
+                    else (close - band * 0.4, close + band)
+                )
+                entry = {
+                    "price": round(close, 8),
+                    "entry_zone_low": round(min(zone), 8),
+                    "entry_zone_high": round(max(zone), 8),
+                    "stop_loss": levels.stop_loss,
+                    "take_profit": levels.take_profit,
+                    "risk_reward_ratio": levels.risk_reward_ratio,
+                    "volatility_warning": levels.volatility_warning,
+                }
+
+        candidates.append(
+            {
+                "symbol": row["symbol"],
+                "timeframe": ref_tf,
+                "trend": row["trend"],
+                "label": best.label,
+                "direction": best.direction,
+                "n": best.n,
+                "win_rate_pct": best.win_rate_pct,
+                "win_rate_ci_low_pct": best.win_rate_ci_low_pct,
+                "win_rate_ci_high_pct": best.win_rate_ci_high_pct,
+                "avg_net_return_pct": best.avg_net_return_pct,
+                "regime": best.regime,
+                "entry": entry,
+                "scanned_at": row["scanned_at"],
+                "age_seconds": round(_age_seconds(row["scanned_at"]), 1),
+            }
+        )
+
+    candidates.sort(key=lambda c: c["win_rate_ci_low_pct"], reverse=True)
+    generated_at = max(r["scanned_at"] for r in rows)
+    return {
+        "signals": candidates[: max(1, limit)],
+        "generated_at": generated_at,
+        "candidates_considered": considered,
+        "cache_coverage": f"{len(candidates)}/{considered}",
+    }
+
+
+def _regime_matched_calibration(
+    symbol: str, timeframe: str, labels: list[str], horizon_candles: int
+) -> tuple[list[Any], str | None, bool]:
+    """Calibration matches scoped to the symbol's *current* volatility regime
+    when possible, falling back to the all-regime blend when there isn't
+    enough regime-specific history yet (new/thin label) or the regime can't
+    be determined. Returns ``(matches, regime, used_fallback)`` so the caller
+    can tell the UI whether a result is regime-matched or a blended fallback.
+    """
+    from agents_crypto.calibration_lookup import find_regime_matched_stats
+    from scanner.calibration import fetch_current_regime
+
+    regime = fetch_current_regime(symbol, timeframe)
+    matches, used_fallback = find_regime_matched_stats(symbol, timeframe, labels, horizon_candles, regime)
+    return matches, regime, used_fallback
+
+
 @app.get("/api/symbol/{symbol}/calibration")
 def symbol_calibration(symbol: str, horizon_candles: int = 12) -> dict[str, Any]:
     """The historical win-rate for whatever label(s) are active on this
@@ -321,12 +503,7 @@ def symbol_calibration(symbol: str, horizon_candles: int = 12) -> dict[str, Any]
     tf_snapshot = row["snapshot"].get("timeframes", {}).get(timeframe, {})
     labels = _active_labels(row["trend"], tf_snapshot.get("anomalies", []))
 
-    # Imported lazily so merely running the dashboard never pulls in the
-    # backtest/pandas machinery unless this endpoint is actually hit.
-    from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats
-
-    calibration_stats = get_calibration_stats(symbol, timeframe, horizons=(horizon_candles,), use_process=True)
-    matches = find_stats_for_labels(calibration_stats, labels, horizon_candles)
+    matches, regime, used_fallback = _regime_matched_calibration(symbol, timeframe, labels, horizon_candles)
 
     return {
         "symbol": symbol,
@@ -334,6 +511,8 @@ def symbol_calibration(symbol: str, horizon_candles: int = 12) -> dict[str, Any]
         "horizon_candles": horizon_candles,
         "active_labels": labels,
         "matches": [m.__dict__ for m in matches],
+        "current_regime": regime,
+        "regime_fallback": used_fallback,
     }
 
 
@@ -412,13 +591,10 @@ def symbol_lookup(symbol: str, timeframe: str = "1h", horizon_candles: int = 12)
         lookup_timeframe = timeframe
         labels = _active_labels(tf["trend"], tf.get("anomalies", []))
 
-    # Imported lazily so a page that never looks anything up never pulls in
-    # the backtest/pandas machinery.
-    from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats
-
-    calibration_stats = get_calibration_stats(symbol, lookup_timeframe, horizons=(horizon_candles,), use_process=True)
-    matches = find_stats_for_labels(calibration_stats, labels, horizon_candles)
+    matches, regime, used_fallback = _regime_matched_calibration(symbol, lookup_timeframe, labels, horizon_candles)
     summary["calibration_matches"] = [m.__dict__ for m in matches]
+    summary["current_regime"] = regime
+    summary["regime_fallback"] = used_fallback
     return summary
 
 

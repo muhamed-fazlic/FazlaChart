@@ -405,6 +405,94 @@ footer {
   font-size: 12px;
 }
 
+.best-signal-panel {
+  margin: 10px 20px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  flex: 0 0 auto;
+}
+
+.best-signal-panel.muted {
+  font-size: 13px;
+}
+
+.best-signal-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.best-signal-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+
+.best-signal-card:hover {
+  border-color: var(--blue);
+}
+
+.best-signal-card.best-signal-top {
+  border-color: var(--green);
+  background: rgba(63, 185, 80, 0.07);
+}
+
+.best-signal-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 14px;
+}
+
+.best-signal-rank {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.best-signal-stats {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.best-signal-label {
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.best-signal-entry {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+
+.best-signal-warning {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--yellow);
+}
+
+.best-signal-runners {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.best-signal-runners .best-signal-card {
+  margin-bottom: 0;
+}
+
 /* ---------------------------------------------------------------------
    Mobile layout (phones / narrow viewports).
    Converts the dense scan table into stacked "cards" per row (classic
@@ -440,6 +528,19 @@ footer {
 
   .symbol-filter form { width: 100%; }
   .symbol-filter input[type="text"] { flex: 1 1 auto; width: auto; }
+
+  .best-signal-panel {
+    margin: 8px 8px;
+    padding: 10px 12px;
+  }
+
+  .best-signal-runners {
+    grid-template-columns: 1fr;
+  }
+
+  .best-signal-stats, .best-signal-entry {
+    gap: 8px 12px;
+  }
 
   main { padding: 0 8px 12px; overflow-x: hidden; }
 

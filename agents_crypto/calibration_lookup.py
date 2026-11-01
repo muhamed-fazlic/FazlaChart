@@ -58,10 +58,24 @@ def _get_executor() -> ProcessPoolExecutor:
         return _executor
 
 
-def _run_backtest(symbol: str, timeframe: str, horizons: tuple[int, ...]) -> list[CalibrationStats]:
-    """Module-level (picklable) entry point executed in the worker process."""
+_REGIME_KEYS = ("all", "low", "normal", "high")
+
+
+def _run_backtest(symbol: str, timeframe: str, horizons: tuple[int, ...]) -> dict[str, list[CalibrationStats]]:
+    """Module-level (picklable) entry point executed in the worker process.
+
+    Runs the (expensive) backtest once and summarizes it four ways — overall
+    plus each volatility regime — so a caller asking for a specific regime
+    later doesn't pay for another full backtest, just a cheap re-aggregation
+    of cases already computed here.
+    """
     cases = backtest_symbol(symbol, timeframe, horizons)
-    return summarize(cases)
+    return {
+        "all": summarize(cases),
+        "low": summarize(cases, regime_filter="low"),
+        "normal": summarize(cases, regime_filter="normal"),
+        "high": summarize(cases, regime_filter="high"),
+    }
 
 
 def _cache_key(symbol: str, timeframe: str) -> str:
@@ -92,6 +106,7 @@ def get_calibration_stats(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     force_refresh: bool = False,
     use_process: bool = False,
+    regime: str | None = None,
 ) -> list[CalibrationStats]:
     """Calibration stats for ``symbol``/``timeframe``, from cache if fresh.
 
@@ -103,26 +118,35 @@ def get_calibration_stats(
     Real dashboard endpoints pass this; it defaults to ``False`` so unit
     tests can keep mocking ``backtest_symbol``/``summarize`` directly without
     the process-boundary pickling that would otherwise hide the mock.
+
+    ``regime``, when given ("low"/"normal"/"high"), returns stats scoped to
+    that volatility regime only instead of the all-history blend — pass the
+    symbol's *current* regime (see :func:`scanner.calibration.current_volatility_regime`)
+    to answer "how has this label done in conditions like right now".
     """
+    regime_key = regime if regime in ("low", "normal", "high") else "all"
     cache = _load_cache(cache_path)
     key = _cache_key(symbol, timeframe)
     entry = cache.get(key)
 
     if not force_refresh and entry and (time.time() - entry["computed_at"]) < ttl_seconds:
-        return [CalibrationStats(**row) for row in entry["stats"]]
+        regime_rows = entry["stats"].get(regime_key, [])
+        return [CalibrationStats(**row) for row in regime_rows]
 
     if use_process:
-        stats = _run_backtest_deduped(symbol, timeframe, horizons)
+        regime_stats = _run_backtest_deduped(symbol, timeframe, horizons)
     else:
-        cases = backtest_symbol(symbol, timeframe, horizons)
-        stats = summarize(cases)
+        regime_stats = _run_backtest(symbol, timeframe, horizons)
 
-    cache[key] = {"computed_at": time.time(), "stats": [asdict(s) for s in stats]}
+    cache[key] = {
+        "computed_at": time.time(),
+        "stats": {rk: [asdict(s) for s in rows] for rk, rows in regime_stats.items()},
+    }
     _save_cache(cache_path, cache)
-    return stats
+    return regime_stats.get(regime_key, [])
 
 
-def _run_backtest_deduped(symbol: str, timeframe: str, horizons: tuple[int, ...]) -> list[CalibrationStats]:
+def _run_backtest_deduped(symbol: str, timeframe: str, horizons: tuple[int, ...]) -> dict[str, list[CalibrationStats]]:
     """Runs ``_run_backtest`` in the shared worker-process pool, collapsing
     concurrent callers for the same (symbol, timeframe) onto one future
     instead of each starting its own duplicate backtest."""
@@ -148,3 +172,58 @@ def find_stats_for_labels(
     """The subset of ``stats`` matching any of ``labels`` at ``horizon_candles``
     — i.e. "what does history say about the label(s) active right now?"."""
     return [s for s in stats if s.label in labels and s.horizon_candles == horizon_candles]
+
+
+def find_regime_matched_stats(
+    symbol: str,
+    timeframe: str,
+    labels: list[str],
+    horizon_candles: int,
+    current_regime: str | None,
+    use_process: bool = True,
+) -> tuple[list[CalibrationStats], bool]:
+    """Calibration matches scoped to ``current_regime`` ("low"/"normal"/
+    "high"/None, computed by the caller — see
+    :func:`scanner.calibration.current_volatility_regime`), falling back to
+    the all-regime blend whenever there isn't enough regime-specific history
+    yet for the active label(s), or the regime itself is unknown.
+
+    Returns ``(matches, used_fallback)`` so callers can tell the user whether
+    the result is regime-matched evidence or a blended, less-specific one.
+    """
+    if current_regime is not None:
+        regime_stats = get_calibration_stats(
+            symbol, timeframe, horizons=(horizon_candles,), use_process=use_process, regime=current_regime
+        )
+        regime_matches = find_stats_for_labels(regime_stats, labels, horizon_candles)
+        if regime_matches:
+            return regime_matches, False
+
+    all_stats = get_calibration_stats(symbol, timeframe, horizons=(horizon_candles,), use_process=use_process)
+    return find_stats_for_labels(all_stats, labels, horizon_candles), True
+
+
+def get_cached_calibration_stats(
+    symbol: str,
+    timeframe: str = "1h",
+    regime: str | None = None,
+    cache_path: str = DEFAULT_CACHE_PATH,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> list[CalibrationStats]:
+    """Like :func:`get_calibration_stats`, but NEVER triggers a fresh backtest
+    on a cache miss/stale entry — it only ever reads what's already on disk,
+    returning ``[]`` immediately otherwise.
+
+    Used by endpoints that need to cheaply rank many symbols at once (e.g.
+    "best signal right now" across the whole tracked universe): spawning a
+    cold-cache backtest per symbol there would make the request take
+    minutes. Those symbols just get skipped from the ranking until their
+    cache is populated by the normal on-demand path (a user viewing that
+    row, or the background warm-up loop)."""
+    regime_key = regime if regime in ("low", "normal", "high") else "all"
+    cache = _load_cache(cache_path)
+    entry = cache.get(_cache_key(symbol, timeframe))
+    if not entry or (time.time() - entry["computed_at"]) >= ttl_seconds:
+        return []
+    regime_rows = entry["stats"].get(regime_key, [])
+    return [CalibrationStats(**row) for row in regime_rows]
