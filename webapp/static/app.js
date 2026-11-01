@@ -92,6 +92,7 @@ function bestSignalCardHtml(sig, rank) {
         ${sig.regime ? `<span class="muted">regime: ${sig.regime}</span>` : ""}
       </div>
       <div class="muted best-signal-label">${sig.label}</div>
+      ${sig.correlation ? `<div class="best-signal-warning">🔗 ${sig.correlation.note}</div>` : ""}
       ${bestSignalEntryHtml(sig)}
     </div>`;
 }

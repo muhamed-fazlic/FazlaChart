@@ -10,11 +10,63 @@ diverge from it over time.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
+from scanner.btc_context import BTC_SYMBOL, diverges_from_btc
+
 BEST_SIGNAL_HORIZON_CANDLES = 12
 BEST_SIGNAL_MIN_SAMPLE_SIZE = 30  # below this, even a high win rate is too noisy to call a real edge
+
+
+def _tag_correlated_exposure(signals: list[dict[str, Any]], btc_trend: str | None) -> None:
+    """Mutates ``signals`` in place, attaching a ``correlation`` sub-dict to
+    each candidate when 2+ of the surfaced signals likely represent the same
+    underlying bet rather than independent opportunities.
+
+    This doesn't need a live price-correlation computation (which would mean
+    fetching fresh klines per pair, just to rank a shortlist): in crypto
+    futures the dominant source of cross-symbol correlation is simply "the
+    whole market moves with BTC". Two altcoin signals that share a direction
+    AND aren't diverging from BTC's own trend are, in practice, almost always
+    just the same macro bet on BTC's direction wearing two different tickers
+    — if BTC reverses, both move together. Signals that *diverge* from BTC
+    are flagged as more idiosyncratic even when they share a direction, since
+    that divergence is itself evidence of an independent, symbol-specific
+    driver.
+    """
+    groups: dict[tuple[str, bool], list[dict[str, Any]]] = defaultdict(list)
+    for sig in signals:
+        diverges = diverges_from_btc(sig["trend"], btc_trend) if btc_trend else False
+        sig["diverges_from_btc"] = diverges
+        groups[(sig["direction"], diverges)].append(sig)
+
+    for (direction, diverges), members in groups.items():
+        if len(members) < 2:
+            for sig in members:
+                sig["correlation"] = None
+            continue
+        symbols = [m["symbol"] for m in members]
+        if diverges:
+            note = (
+                f"{len(members)} signala ({', '.join(symbols)}) dijele {direction.upper()} smjer i podjednako "
+                "odstupaju od BTC trenda — vjerovatno dijele zajednički uzrok, tretiraj kao jednu "
+                "efektivnu poziciju, ne kao nezavisne prilike."
+            )
+        else:
+            note = (
+                f"{len(members)} signala ({', '.join(symbols)}) dijele {direction.upper()} smjer i prate BTC "
+                f"trend — ovo je vjerovatno jedna efektivna oklada na smjer tržišta, ne {len(members)} "
+                "nezavisnih prilika. Razmisli o manjem ukupnom izlaganju ako uzmeš više od jednog."
+            )
+        for sig in members:
+            sig["correlation"] = {
+                "group_size": len(members),
+                "symbols": [s for s in symbols if s != sig["symbol"]],
+                "diverges_from_btc": diverges,
+                "note": note,
+            }
 
 
 def _active_labels(trend: str, anomalies: list[str]) -> list[str]:
@@ -151,8 +203,13 @@ def compute_candidates(rows: list[dict[str, Any]], limit: int = 5) -> dict[str, 
         reverse=True,
     )
     generated_at = max(r["scanned_at"] for r in rows)
+    top_signals = candidates[: max(1, limit)]
+
+    btc_row = next((r for r in rows if r["symbol"] == BTC_SYMBOL), None)
+    _tag_correlated_exposure(top_signals, btc_row["trend"] if btc_row else None)
+
     return {
-        "signals": candidates[: max(1, limit)],
+        "signals": top_signals,
         "generated_at": generated_at,
         "candidates_considered": considered,
         "cache_coverage": f"{len(candidates)}/{considered}",
