@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +210,27 @@ def fetch_symbol_history(conn: sqlite3.Connection, symbol: str, limit: int = 200
     )
     columns = [description[0] for description in cursor.description]
     return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+
+def prune_old_scans(conn: sqlite3.Connection, retain_days: int = 60) -> int:
+    """Delete `scans` rows older than ``retain_days`` and reclaim their disk
+    space, so the database doesn't grow without bound over months of 24/7
+    operation. Safe to call anytime: calibration always re-derives its
+    stats fresh from live Binance klines rather than this table (see
+    scanner.calibration's module docstring), and every dashboard read only
+    looks at recent rows (``fetch_latest_scan*``, ``fetch_symbol_history``
+    with a row limit). ``signal_outcomes`` (the live forward-tracking
+    record) is untouched here -- that table is the actual track record and
+    stays small regardless of how long the scanner runs. Returns the number
+    of rows deleted.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=retain_days)).isoformat()
+    cursor = conn.execute("DELETE FROM scans WHERE scanned_at < ?", (cutoff,))
+    deleted = cursor.rowcount
+    conn.commit()
+    if deleted:
+        conn.execute("VACUUM")
+    return deleted
 
 
 def log_signal_outcome(

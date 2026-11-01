@@ -14,7 +14,7 @@ from scanner.anomaly import collect_all_anomalies
 from scanner.btc_context import build_btc_context
 from scanner.config import ScannerConfig
 from scanner.signal_tracking import log_new_signals, resolve_open_signals
-from scanner.storage import fetch_known_symbols, fetch_latest_scan_per_symbol, init_db, save_scan_result
+from scanner.storage import fetch_known_symbols, fetch_latest_scan_per_symbol, init_db, prune_old_scans, save_scan_result
 from scanner.telegram_alerts import TelegramAlertConfig, maybe_send_alert
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance import client
@@ -34,6 +34,7 @@ class MarketScanner:
             min_n=self.config.telegram_min_n,
             require_btc_alignment=self.config.telegram_require_btc_alignment,
         )
+        self._last_prune_at: float = 0.0
 
     def resolve_universe(self) -> list[str]:
         """The symbols to scan this cycle: explicit list, else top-N by
@@ -85,6 +86,7 @@ class MarketScanner:
                 results[symbol] = snapshot
 
         self._track_signal_outcomes()
+        self._maybe_prune_old_scans()
         return {"btc": btc_context, "symbols": results}
 
     def _track_signal_outcomes(self) -> None:
@@ -109,6 +111,22 @@ class MarketScanner:
         threshold. A no-op (and never raises) when Telegram isn't configured."""
         if maybe_send_alert(candidate, self._telegram):
             logger.info("Telegram alert sent for %s %s %s", candidate["symbol"], candidate["timeframe"], candidate["direction"])
+
+    def _maybe_prune_old_scans(self) -> None:
+        """Delete `scans` rows older than `scan_retention_days`, at most
+        once every `retention_check_interval_seconds` -- keeps the database
+        from growing without bound over months of 24/7 operation. Never lets
+        a pruning bug take down the scan cycle itself."""
+        now = time.monotonic()
+        if now - self._last_prune_at < self.config.retention_check_interval_seconds:
+            return
+        self._last_prune_at = now
+        try:
+            deleted = prune_old_scans(self.conn, retain_days=self.config.scan_retention_days)
+            if deleted:
+                logger.info("Pruned %d scan rows older than %d days", deleted, self.config.scan_retention_days)
+        except Exception:
+            logger.exception("Scan retention pruning failed; continuing")
 
     def run_forever(self) -> None:
         """Loop ``run_once`` every ``poll_interval_seconds``, logging and

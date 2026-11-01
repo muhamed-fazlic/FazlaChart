@@ -60,3 +60,13 @@ class ScannerConfig:
     telegram_min_win_rate_ci_low_pct: float = 60.0
     telegram_min_n: int = 50
     telegram_require_btc_alignment: bool = False
+
+    # How long raw `scans` rows are kept before being pruned. Calibration
+    # always re-derives its stats fresh from live Binance klines (never from
+    # this table), and every dashboard read only looks at recent rows, so
+    # old scan rows are pure disk growth with no analytical value once
+    # they're this stale. `signal_outcomes` (the live forward-tracking
+    # record) is never pruned by this setting -- that table is the actual
+    # track record and stays tiny regardless.
+    scan_retention_days: int = 60
+    retention_check_interval_seconds: int = 86400
