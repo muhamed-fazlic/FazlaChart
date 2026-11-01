@@ -501,6 +501,12 @@ footer {
   color: var(--yellow);
 }
 
+.forward-tracking-warning {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--yellow);
+}
+
 .best-signal-runners {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));

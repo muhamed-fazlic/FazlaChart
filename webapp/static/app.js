@@ -137,16 +137,19 @@ async function loadBestSignal() {
 // shows whether the calibration's promised win rate is actually holding up,
 // not just a backtest claim.
 
-function renderForwardTrackingPanel(data) {
+function renderForwardTrackingPanel(data, driftStatus) {
   const el = document.getElementById("forward-tracking-panel");
   if (!data) {
     el.className = "forward-tracking-panel muted";
     el.textContent = "Nema podataka o praćenju uživo još.";
     return;
   }
+  const mutedNote = driftNoteHtml(driftStatus);
   if (data.resolved_count === 0) {
     el.className = "forward-tracking-panel muted";
-    el.textContent = `📡 Praćenje uživo: ${data.open_count} signala u toku, još nema zatvorenih — rezultati stižu kako se SL/TP/timeout dešavaju.`;
+    el.innerHTML =
+      `📡 Praćenje uživo: ${data.open_count} signala u toku, još nema zatvorenih — rezultati stižu kako se SL/TP/timeout dešavaju.` +
+      mutedNote;
     return;
   }
   el.className = "forward-tracking-panel";
@@ -163,14 +166,27 @@ function renderForwardTrackingPanel(data) {
     `<span>Stvarni win rate: <b>${fmt(realized, 1)}%</b></span>` +
     `<span>Obećana donja granica (prosjek): <b>${fmt(promised, 1)}%</b></span>` +
     (gap !== null ? `<span class="${gapClass}">razlika: ${gap >= 0 ? "+" : ""}${fmt(gap, 1)}pp</span>` : "") +
-    `</div>`;
+    `</div>` +
+    mutedNote;
+}
+
+// A bucket the live calibration-drift detector has muted (see
+// scanner/drift_detector.py) is simply absent from Top Signal Now — this
+// note exists so that absence is explained instead of silently invisible.
+function driftNoteHtml(driftStatus) {
+  if (!driftStatus || !driftStatus.muted_buckets || !driftStatus.muted_buckets.length) return "";
+  const items = driftStatus.muted_buckets
+    .map((b) => `${b.timeframe}/${b.direction.toUpperCase()} (${fmt(b.realized_win_rate_pct, 1)}% vs. obećanih ${fmt(b.promised_win_rate_ci_low_pct_avg, 1)}%)`)
+    .join(", ");
+  return `<div class="forward-tracking-warning">⏸️ Privremeno isključeno iz preporuka (loš live rezultat): ${items}</div>`;
 }
 
 async function loadForwardTracking() {
   try {
-    const res = await fetch("/api/forward-tracking/summary");
+    const [res, driftRes] = await Promise.all([fetch("/api/forward-tracking/summary"), fetch("/api/drift-status")]);
     const data = await res.json();
-    renderForwardTrackingPanel(data);
+    const driftStatus = await driftRes.json();
+    renderForwardTrackingPanel(data, driftStatus);
   } catch (err) {
     console.error("Could not load forward tracking summary:", err);
   }

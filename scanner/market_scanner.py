@@ -13,9 +13,10 @@ from typing import Any
 from scanner.anomaly import collect_all_anomalies
 from scanner.btc_context import build_btc_context
 from scanner.config import ScannerConfig
+from scanner.drift_detector import active_muted_bucket_set, evaluate_and_apply_drift_mutes
 from scanner.signal_tracking import log_new_signals, resolve_open_signals
 from scanner.storage import fetch_known_symbols, fetch_latest_scan_per_symbol, init_db, prune_old_scans, save_scan_result
-from scanner.telegram_alerts import TelegramAlertConfig, maybe_send_alert
+from scanner.telegram_alerts import TelegramAlertConfig, maybe_send_alert, maybe_send_drift_alert
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance import client
 from tradingagents.dataflows.vendors.binance.snapshot import build_symbol_snapshot
@@ -91,17 +92,27 @@ class MarketScanner:
 
     def _track_signal_outcomes(self) -> None:
         """Resolve any open tracked signals against this cycle's fresh
-        prices, then log any newly-qualifying Top Signal Now candidates —
-        in that order, so a signal that both resolves and re-qualifies in
-        the same cycle starts a genuinely new tracked trade rather than
-        being treated as still open. Never lets a tracking bug take down
-        the scan cycle itself."""
+        prices, re-evaluate the calibration-drift mute state, then log any
+        newly-qualifying Top Signal Now candidates — in that order, so a
+        signal that both resolves and re-qualifies in the same cycle starts
+        a genuinely new tracked trade rather than being treated as still
+        open, and a bucket that just got muted this cycle is respected
+        immediately rather than one cycle late. Never lets a tracking bug
+        take down the scan cycle itself."""
         try:
             rows = fetch_latest_scan_per_symbol(self.conn)
             resolved = resolve_open_signals(self.conn, rows)
-            logged = log_new_signals(self.conn, rows, on_new_signal=self._on_new_signal)
-            if resolved or logged:
-                logger.info("Signal tracking: resolved %d, logged %d new", resolved, logged)
+            mute_changes = evaluate_and_apply_drift_mutes(self.conn, on_mute=self._on_bucket_muted, on_unmute=self._on_bucket_unmuted)
+            muted_buckets = active_muted_bucket_set(self.conn)
+            logged = log_new_signals(self.conn, rows, on_new_signal=self._on_new_signal, muted_buckets=muted_buckets)
+            if resolved or logged or mute_changes["muted"] or mute_changes["unmuted"]:
+                logger.info(
+                    "Signal tracking: resolved %d, logged %d new, muted %s, unmuted %s",
+                    resolved,
+                    logged,
+                    mute_changes["muted"],
+                    mute_changes["unmuted"],
+                )
         except Exception:
             logger.exception("Signal outcome tracking failed this cycle; continuing")
 
@@ -111,6 +122,24 @@ class MarketScanner:
         threshold. A no-op (and never raises) when Telegram isn't configured."""
         if maybe_send_alert(candidate, self._telegram):
             logger.info("Telegram alert sent for %s %s %s", candidate["symbol"], candidate["timeframe"], candidate["direction"])
+
+    def _on_bucket_muted(self, stats: Any) -> None:
+        """Pushes a Telegram notice when the live calibration-drift detector
+        mutes a bucket (see :mod:`scanner.drift_detector`)."""
+        maybe_send_drift_alert(stats, self._telegram, muted=True)
+        logger.warning(
+            "Calibration drift: muted %s/%s (realized %.1f%% vs promised %.1f%%, n=%d)",
+            stats.timeframe, stats.direction, stats.realized_win_rate_pct, stats.promised_win_rate_ci_low_pct_avg, stats.n_resolved,
+        )
+
+    def _on_bucket_unmuted(self, stats: Any) -> None:
+        """Pushes a Telegram notice when a previously-muted bucket's live
+        results have recovered enough to be restored."""
+        maybe_send_drift_alert(stats, self._telegram, muted=False)
+        logger.info(
+            "Calibration drift: restored %s/%s (realized %.1f%% vs promised %.1f%%, n=%d)",
+            stats.timeframe, stats.direction, stats.realized_win_rate_pct, stats.promised_win_rate_ci_low_pct_avg, stats.n_resolved,
+        )
 
     def _maybe_prune_old_scans(self) -> None:
         """Delete `scans` rows older than `scan_retention_days`, at most

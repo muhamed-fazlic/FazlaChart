@@ -387,6 +387,63 @@ def test_best_signal_surfaces_confirmed_edge_with_entry_zone(client, monkeypatch
     assert signal["entry"] is None
 
 
+def test_drift_status_reports_no_muted_buckets_by_default(client):
+    resp = client.get("/api/drift-status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"muted_buckets": [], "count": 0}
+
+
+def test_best_signal_excludes_a_muted_bucket(client, monkeypatch):
+    from scanner.calibration import CalibrationStats
+    from scanner.storage import init_db, mute_bucket
+
+    strong_match = [
+        CalibrationStats(
+            label="trend:bearish",
+            direction="short",
+            horizon_candles=12,
+            n=387,
+            win_rate_pct=65.0,
+            avg_net_return_pct=0.8,
+            avg_win_return_pct=1.5,
+            avg_loss_return_pct=-0.9,
+            win_rate_ci_low_pct=60.1,
+            win_rate_ci_high_pct=69.8,
+        ),
+    ]
+    monkeypatch.setattr(
+        "agents_crypto.calibration_lookup.get_cached_calibration_stats", lambda *a, **k: strong_match
+    )
+
+    import os
+
+    conn = init_db(os.environ["SCANNER_STORAGE_PATH"])
+    mute_bucket(
+        conn,
+        timeframe="1h",
+        direction="short",
+        reason="test mute",
+        realized_win_rate_pct=30.0,
+        promised_win_rate_ci_low_pct_avg=60.1,
+        n_resolved=40,
+    )
+    conn.close()
+
+    resp = client.get("/api/scan/best-signal")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["signals"] == []
+    assert body["muted_buckets"] == [["1h", "short"]]
+
+    drift_resp = client.get("/api/drift-status")
+    assert drift_resp.status_code == 200
+    drift_body = drift_resp.json()
+    assert drift_body["count"] == 1
+    assert drift_body["muted_buckets"][0]["timeframe"] == "1h"
+    assert drift_body["muted_buckets"][0]["direction"] == "short"
+
+
 def test_best_signal_recenters_entry_zone_on_patient_entry_when_overextended(tmp_path, monkeypatch):
     """A short on a symbol whose price has already run far below EMA20 with
     deeply oversold RSI must not hand back an entry zone glued to the

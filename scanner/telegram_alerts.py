@@ -115,3 +115,39 @@ def maybe_send_alert(candidate: dict[str, Any], config: TelegramAlertConfig) -> 
     if not config.enabled or not should_alert(candidate, config):
         return False
     return send_telegram_message(config.bot_token, config.chat_id, format_alert_message(candidate))
+
+
+def format_drift_mute_message(stats: Any) -> str:
+    """Plain-text Telegram notice for a bucket the drift detector just
+    muted (see :mod:`scanner.drift_detector`). ``stats`` is a
+    ``scanner.drift_detector.BucketDriftStats``."""
+    return (
+        f"🔇 Bucket privremeno isključen: {stats.timeframe} {stats.direction.upper()}\n"
+        f"Realizovan win rate (zadnjih {stats.n_resolved} signala): {stats.realized_win_rate_pct:.1f}%\n"
+        f"Obećan win rate (CI-low): {stats.promised_win_rate_ci_low_pct_avg:.1f}%\n"
+        f"Razlika: {stats.drift_pp:.1f}pp ispod obećanog -- ovaj bucket se ne preporučuje dok se "
+        "live rezultati ne poprave."
+    )
+
+
+def format_drift_unmute_message(stats: Any) -> str:
+    """Plain-text Telegram notice for a bucket the drift detector just
+    restored after recovering. ``stats`` is a
+    ``scanner.drift_detector.BucketDriftStats``."""
+    return (
+        f"🔊 Bucket vraćen: {stats.timeframe} {stats.direction.upper()}\n"
+        f"Realizovan win rate (zadnjih {stats.n_resolved} signala): {stats.realized_win_rate_pct:.1f}%\n"
+        f"Obećan win rate (CI-low): {stats.promised_win_rate_ci_low_pct_avg:.1f}%\n"
+        "Live rezultati su se oporavili -- bucket je ponovo uključen u preporuke."
+    )
+
+
+def maybe_send_drift_alert(stats: Any, config: TelegramAlertConfig, *, muted: bool) -> bool:
+    """Best-effort push of a drift mute/unmute notice. Unlike
+    :func:`maybe_send_alert`, this ignores the quality thresholds (
+    ``min_win_rate_ci_low_pct``/``min_n``) since a drift event is itself
+    always worth notifying about when alerting is enabled at all."""
+    if not config.enabled:
+        return False
+    text = format_drift_mute_message(stats) if muted else format_drift_unmute_message(stats)
+    return send_telegram_message(config.bot_token, config.chat_id, text)

@@ -25,8 +25,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from scanner.drift_detector import active_muted_bucket_set
 from scanner.storage import (
     connect_for_reads,
+    fetch_all_active_muted_buckets,
     fetch_latest_scan,
     fetch_latest_scan_per_symbol,
     fetch_recent_signal_outcomes,
@@ -467,12 +469,28 @@ def best_signal(limit: int = 5) -> dict[str, Any]:
     conn = _get_conn()
     try:
         rows = fetch_latest_scan_per_symbol(conn)
+        muted_buckets = active_muted_bucket_set(conn)
     finally:
         conn.close()
 
     from agents_crypto.best_signal import compute_candidates
 
-    return compute_candidates(rows, limit=limit)
+    return compute_candidates(rows, limit=limit, muted_buckets=muted_buckets)
+
+
+@app.get("/api/drift-status")
+def drift_status() -> dict[str, Any]:
+    """Which ``(timeframe, direction)`` buckets the live calibration-drift
+    detector currently has muted (see ``scanner.drift_detector``), and why
+    — surfaced here so a user can see *why* a bucket is missing from Top
+    Signal Now instead of it silently disappearing. Empty list is the
+    normal/healthy state."""
+    conn = _get_conn()
+    try:
+        muted = fetch_all_active_muted_buckets(conn)
+    finally:
+        conn.close()
+    return {"muted_buckets": muted, "count": len(muted)}
 
 
 @app.get("/api/forward-tracking/summary")

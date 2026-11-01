@@ -58,6 +58,7 @@ def log_new_signals(
     rows: list[dict[str, Any]],
     limit: int = DEFAULT_TRACKING_LIMIT,
     on_new_signal: Callable[[dict[str, Any]], None] | None = None,
+    muted_buckets: set[tuple[str, str]] | None = None,
 ) -> int:
     """Log any newly-qualifying Top Signal Now candidate that isn't already
     being tracked. Returns how many new rows were logged this cycle.
@@ -68,8 +69,14 @@ def log_new_signals(
     exactly once per genuinely new opportunity. A failing callback is
     logged and swallowed, never allowed to stop the rest of this cycle's
     logging.
+
+    ``muted_buckets``, if given, is forwarded to
+    :func:`agents_crypto.best_signal.compute_candidates` so a bucket the
+    live calibration-drift detector has muted (see
+    :mod:`scanner.drift_detector`) is never newly tracked either — keeping
+    this tracker's own input in sync with what the dashboard shows.
     """
-    result = compute_candidates(rows, limit=limit)
+    result = compute_candidates(rows, limit=limit, muted_buckets=muted_buckets)
     logged = 0
     for candidate in result["signals"]:
         entry = candidate.get("entry")
@@ -92,6 +99,7 @@ def log_new_signals(
             promised_win_rate_ci_low_pct=candidate.get("win_rate_ci_low_pct"),
             promised_n=candidate.get("n"),
             horizon_candles=BEST_SIGNAL_HORIZON_CANDLES,
+            regime=candidate.get("regime"),
         )
         logged += 1
         if on_new_signal is not None:

@@ -59,6 +59,26 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_status ON signal_outcomes (status);
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol_open ON signal_outcomes (symbol, timeframe, direction, status);
+
+-- Calibration drift guardrail: when a (timeframe, direction) bucket's
+-- *live, realized* win rate falls well short of what it promised over
+-- enough resolved signals, it's muted here so the scanner stops
+-- recommending it until the live evidence improves (see
+-- scanner.drift_detector). This is never touched by the calibration
+-- backtest itself -- only by what actually happened to real tracked
+-- signals in `signal_outcomes`.
+CREATE TABLE IF NOT EXISTS muted_buckets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timeframe TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    muted_at TEXT NOT NULL,
+    unmuted_at TEXT,
+    reason TEXT NOT NULL,
+    realized_win_rate_pct REAL,
+    promised_win_rate_ci_low_pct_avg REAL,
+    n_resolved INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_muted_buckets_active ON muted_buckets (timeframe, direction, unmuted_at);
 """
 
 
@@ -79,8 +99,20 @@ def init_db(storage_path: str, timeout: float = 10.0) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=timeout)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    _migrate_schema(conn)
     conn.commit()
     return conn
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database file already existed.
+    ``CREATE TABLE IF NOT EXISTS`` in ``_SCHEMA`` only creates a table the
+    very first time -- it never adds a new column to a table that already
+    exists on disk, so any such column needs an explicit, idempotent
+    ``ALTER TABLE`` here instead."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(signal_outcomes)")}
+    if "regime" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN regime TEXT")
 
 
 def connect_for_reads(storage_path: str, timeout: float = 10.0) -> sqlite3.Connection:
@@ -248,6 +280,7 @@ def log_signal_outcome(
     promised_win_rate_ci_low_pct: float | None,
     promised_n: int | None,
     horizon_candles: int,
+    regime: str | None = None,
 ) -> None:
     """Record one new live signal to track to its outcome. Callers are
     responsible for not calling this twice for the same still-open trade
@@ -259,8 +292,8 @@ def log_signal_outcome(
             symbol, timeframe, direction, label, logged_at, entry_price,
             stop_loss, take_profit, take_profit_conservative,
             promised_win_rate_pct, promised_win_rate_ci_low_pct, promised_n,
-            horizon_candles, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+            horizon_candles, status, regime
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         """,
         (
             symbol,
@@ -276,6 +309,7 @@ def log_signal_outcome(
             promised_win_rate_ci_low_pct,
             promised_n,
             horizon_candles,
+            regime,
         ),
     )
     conn.commit()
@@ -326,3 +360,97 @@ def fetch_recent_signal_outcomes(conn: sqlite3.Connection, limit: int = 200) -> 
     cursor = conn.execute("SELECT * FROM signal_outcomes ORDER BY logged_at DESC LIMIT ?", (limit,))
     columns = [description[0] for description in cursor.description]
     return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+
+def fetch_resolved_outcomes_by_bucket(
+    conn: sqlite3.Connection, timeframe: str, direction: str, limit: int = 60
+) -> list[dict[str, Any]]:
+    """The most recently *resolved* (``take_profit``/``stop_loss``/
+    ``timeout``) tracked signals for one ``(timeframe, direction)`` bucket,
+    newest first. Capped at ``limit`` so the drift check looks at a rolling
+    recent window rather than all-time history -- a bucket that was bad six
+    months ago but has since recovered should read as recovered, not stay
+    judged by stale evidence forever."""
+    cursor = conn.execute(
+        "SELECT * FROM signal_outcomes WHERE timeframe = ? AND direction = ? AND status != 'open'"
+        " ORDER BY resolved_at DESC LIMIT ?",
+        (timeframe, direction, limit),
+    )
+    columns = [description[0] for description in cursor.description]
+    return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+
+def fetch_distinct_resolved_buckets(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Every ``(timeframe, direction)`` combination that has at least one
+    resolved tracked signal -- the universe of buckets the drift detector
+    needs to evaluate."""
+    cursor = conn.execute("SELECT DISTINCT timeframe, direction FROM signal_outcomes WHERE status != 'open'")
+    return [(row[0], row[1]) for row in cursor.fetchall()]
+
+
+def fetch_active_muted_bucket(conn: sqlite3.Connection, timeframe: str, direction: str) -> dict[str, Any] | None:
+    """The currently-active mute row for this bucket, if any (``unmuted_at``
+    still ``NULL``)."""
+    cursor = conn.execute(
+        "SELECT * FROM muted_buckets WHERE timeframe = ? AND direction = ? AND unmuted_at IS NULL"
+        " ORDER BY muted_at DESC LIMIT 1",
+        (timeframe, direction),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    columns = [description[0] for description in cursor.description]
+    return dict(zip(columns, row, strict=False))
+
+
+def fetch_all_active_muted_buckets(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every bucket currently muted -- used by
+    :func:`agents_crypto.best_signal.compute_candidates` (via its callers)
+    to filter them out of Top Signal Now, and by the dashboard to show the
+    user which buckets are currently suppressed and why."""
+    cursor = conn.execute("SELECT * FROM muted_buckets WHERE unmuted_at IS NULL ORDER BY muted_at DESC")
+    columns = [description[0] for description in cursor.description]
+    return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+
+def mute_bucket(
+    conn: sqlite3.Connection,
+    *,
+    timeframe: str,
+    direction: str,
+    reason: str,
+    realized_win_rate_pct: float,
+    promised_win_rate_ci_low_pct_avg: float,
+    n_resolved: int,
+) -> None:
+    """Suppress a ``(timeframe, direction)`` bucket from being recommended.
+    Callers must check :func:`fetch_active_muted_bucket` first so a bucket
+    already muted doesn't get a second, redundant active row."""
+    conn.execute(
+        """
+        INSERT INTO muted_buckets (
+            timeframe, direction, muted_at, reason,
+            realized_win_rate_pct, promised_win_rate_ci_low_pct_avg, n_resolved
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            timeframe,
+            direction,
+            datetime.now(UTC).isoformat(),
+            reason,
+            realized_win_rate_pct,
+            promised_win_rate_ci_low_pct_avg,
+            n_resolved,
+        ),
+    )
+    conn.commit()
+
+
+def unmute_bucket(conn: sqlite3.Connection, mute_id: int) -> None:
+    """Mark a mute row as lifted (the bucket's recent live performance has
+    recovered)."""
+    conn.execute(
+        "UPDATE muted_buckets SET unmuted_at = ? WHERE id = ?",
+        (datetime.now(UTC).isoformat(), mute_id),
+    )
+    conn.commit()

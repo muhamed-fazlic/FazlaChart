@@ -99,6 +99,33 @@ def test_missing_btc_row_does_not_crash_and_still_groups_by_direction():
     assert all(sig["correlation"]["group_size"] == 2 for sig in result["signals"])
 
 
+def test_muted_bucket_is_excluded_from_signals():
+    rows = [_row("AAAUSDT", "bearish")]
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+        result = compute_candidates(rows, limit=5, muted_buckets={("1h", "short")})
+
+    assert result["signals"] == []
+    assert result["muted_buckets"] == [("1h", "short")]
+
+
+def test_unmuted_direction_is_unaffected_by_a_different_muted_bucket():
+    rows = [_row("AAAUSDT", "bearish")]
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+        result = compute_candidates(rows, limit=5, muted_buckets={("4h", "short")})
+
+    assert len(result["signals"]) == 1
+    assert result["signals"][0]["symbol"] == "AAAUSDT"
+
+
+def test_no_muted_buckets_behaves_exactly_as_before():
+    rows = [_row("AAAUSDT", "bearish")]
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+        result = compute_candidates(rows, limit=5)
+
+    assert len(result["signals"]) == 1
+    assert result["muted_buckets"] == []
+
+
 def test_different_directions_are_never_grouped_together():
     rows = [_row("BTCUSDT", "neutral"), _row("AAAUSDT", "bearish"), _row("BBBUSDT", "bullish")]
 

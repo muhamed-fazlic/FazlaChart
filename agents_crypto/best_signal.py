@@ -84,7 +84,11 @@ def _age_seconds(iso_timestamp: str) -> float:
     return (datetime.now(UTC) - ts).total_seconds()
 
 
-def compute_candidates(rows: list[dict[str, Any]], limit: int = 5) -> dict[str, Any]:
+def compute_candidates(
+    rows: list[dict[str, Any]],
+    limit: int = 5,
+    muted_buckets: set[tuple[str, str]] | None = None,
+) -> dict[str, Any]:
     """Rank every currently-tracked directional symbol by the conservative
     (95%-CI lower-bound) win rate of its active calibration label(s), so a
     lucky small sample can never outrank a well-tested edge, and require a
@@ -95,10 +99,27 @@ def compute_candidates(rows: list[dict[str, Any]], limit: int = 5) -> dict[str, 
     fast: it only ever reads whatever's already in the on-disk calibration
     cache and never triggers a fresh backtest inline — a symbol simply has
     no entry here until its cache is warm.
+
+    ``muted_buckets``, if given, is a set of ``(timeframe, direction)`` pairs
+    that the live calibration-drift detector (see :mod:`scanner.drift_detector`)
+    has found to be underperforming their promised win rate badly enough,
+    over enough resolved live signals, to stop recommending — see
+    :func:`scanner.storage.fetch_all_active_muted_buckets`. A muted bucket's
+    candidates are excluded entirely from both the ranking and the returned
+    count of "significant" matches, so the dashboard and the live tracker
+    (:func:`scanner.signal_tracking.log_new_signals`) never show or track an
+    opportunity this project's own live track record says isn't holding up.
     """
     if not rows:
-        return {"signals": [], "generated_at": None, "candidates_considered": 0, "cache_coverage": None}
+        return {
+            "signals": [],
+            "generated_at": None,
+            "candidates_considered": 0,
+            "cache_coverage": None,
+            "muted_buckets": sorted(muted_buckets or set()),
+        }
 
+    muted_buckets = muted_buckets or set()
     from agents_crypto.calibration_lookup import find_stats_for_labels, get_cached_calibration_stats
     from agents_crypto.risk_calc import compute_kelly_fraction, compute_risk_levels
 
@@ -127,6 +148,8 @@ def compute_candidates(rows: list[dict[str, Any]], limit: int = 5) -> dict[str, 
         # Rank by the CI's conservative lower bound, not the point estimate —
         # rewards both a high win rate AND enough samples to be confident in it.
         best = max(significant, key=lambda m: m.win_rate_ci_low_pct)
+        if (ref_tf, best.direction) in muted_buckets:
+            continue  # live track record says this bucket isn't holding up -- see muted_buckets docstring above
 
         close, atr = row["close_price"], ref.get("atr")
         entry = None
@@ -213,4 +236,5 @@ def compute_candidates(rows: list[dict[str, Any]], limit: int = 5) -> dict[str, 
         "generated_at": generated_at,
         "candidates_considered": considered,
         "cache_coverage": f"{len(candidates)}/{considered}",
+        "muted_buckets": sorted(muted_buckets),
     }
