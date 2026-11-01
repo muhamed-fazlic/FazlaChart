@@ -208,6 +208,7 @@ def test_calibration_endpoint_returns_matches_without_llm(client, monkeypatch):
         return fake_stats
 
     monkeypatch.setattr("agents_crypto.calibration_lookup.get_calibration_stats", _fake_get_calibration_stats)
+    monkeypatch.setattr("agents_crypto.calibration_lookup.get_oos_validation", lambda *a, **k: [])
 
     resp = client.get("/api/symbol/injusdt/calibration")
     assert resp.status_code == 200
@@ -216,8 +217,53 @@ def test_calibration_endpoint_returns_matches_without_llm(client, monkeypatch):
     assert body["active_labels"] == ["trend:bearish", "anomaly:failed_breakout"]
     assert len(body["matches"]) == 2
     assert body["matches"][0]["win_rate_pct"] == 37.0
+    assert body["out_of_sample"] == []
     assert captured["symbol"] == "INJUSDT"
     assert captured["timeframe"] == "1h"
+
+
+def test_calibration_endpoint_includes_out_of_sample_validation(client, monkeypatch):
+    from scanner.calibration import CalibrationStats, OutOfSampleResult
+
+    monkeypatch.setattr(
+        "agents_crypto.calibration_lookup.get_calibration_stats",
+        lambda *a, **k: [
+            CalibrationStats(
+                label="trend:bearish",
+                direction="short",
+                horizon_candles=12,
+                n=100,
+                win_rate_pct=55.0,
+                avg_net_return_pct=0.3,
+                avg_win_return_pct=0.8,
+                avg_loss_return_pct=-0.5,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "agents_crypto.calibration_lookup.get_oos_validation",
+        lambda *a, **k: [
+            OutOfSampleResult(
+                label="trend:bearish",
+                direction="short",
+                horizon_candles=12,
+                train_n=70,
+                train_win_rate_pct=60.0,
+                test_n=30,
+                test_win_rate_pct=40.0,
+                test_win_rate_ci_low_pct=25.0,
+                holds_up=False,
+                warning="Edge se NE potvrđuje na najnovijem periodu.",
+            )
+        ],
+    )
+
+    resp = client.get("/api/symbol/injusdt/calibration")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["out_of_sample"]) == 1
+    assert body["out_of_sample"][0]["holds_up"] is False
+    assert body["out_of_sample"][0]["test_win_rate_ci_low_pct"] == 25.0
 
 
 def test_calibration_endpoint_returns_404_for_unknown_symbol(client):

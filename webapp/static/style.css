@@ -193,6 +193,14 @@ tbody tr:hover { background: #1c2430; }
   line-height: 1.6;
 }
 
+.oos-validation {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.oos-validation > div { margin-top: 2px; }
+
+
 .analysis-bar {
   display: flex;
   align-items: center;

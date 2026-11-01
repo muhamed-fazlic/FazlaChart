@@ -29,7 +29,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from scanner.calibration import CalibrationStats, backtest_symbol, summarize
+from scanner.calibration import CalibrationStats, OutOfSampleResult, backtest_symbol, summarize, validate_out_of_sample
 
 DEFAULT_CACHE_PATH = "scanner_data/calibration_cache.json"
 DEFAULT_TTL_SECONDS = 6 * 3600  # 6 hours: labels/backtests don't meaningfully drift faster than this
@@ -164,6 +164,71 @@ def _run_backtest_deduped(symbol: str, timeframe: str, horizons: tuple[int, ...]
                 del _inflight[key]
 
 
+def _run_oos_validation(symbol: str, timeframe: str, horizons: tuple[int, ...]) -> list[OutOfSampleResult]:
+    """Module-level (picklable) entry point executed in the worker process —
+    see :func:`scanner.calibration.validate_out_of_sample`."""
+    cases = backtest_symbol(symbol, timeframe, horizons)
+    return validate_out_of_sample(cases)
+
+
+# Separate in-flight de-dup map from the main stats backtest's: the two are
+# independent computations over the same underlying cases (recomputed
+# separately, not shared, to keep this additive and not risk disturbing the
+# well-tested stats caching path above) and could otherwise collide on the
+# same cache key if both happened to run concurrently for the same symbol.
+_inflight_oos: dict[str, Future] = {}
+_inflight_oos_lock = Lock()
+
+
+def _run_oos_deduped(symbol: str, timeframe: str, horizons: tuple[int, ...]) -> list[OutOfSampleResult]:
+    key = _cache_key(symbol, timeframe)
+    with _inflight_oos_lock:
+        future = _inflight_oos.get(key)
+        if future is None:
+            future = _get_executor().submit(_run_oos_validation, symbol, timeframe, horizons)
+            _inflight_oos[key] = future
+    try:
+        return future.result()
+    finally:
+        with _inflight_oos_lock:
+            if _inflight_oos.get(key) is future:
+                del _inflight_oos[key]
+
+
+def get_oos_validation(
+    symbol: str,
+    timeframe: str = "1h",
+    horizons: tuple[int, ...] = (4, 12, 24),
+    cache_path: str = DEFAULT_CACHE_PATH,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    force_refresh: bool = False,
+    use_process: bool = False,
+) -> list[OutOfSampleResult]:
+    """Out-of-sample validation for ``symbol``/``timeframe``, cached
+    alongside (but independently refreshed from) the main calibration stats
+    — see :func:`scanner.calibration.validate_out_of_sample`. Answers "does
+    this label's edge survive on data more recent than what it was measured
+    on", not just "what was the historical win rate".
+    """
+    cache = _load_cache(cache_path)
+    key = _cache_key(symbol, timeframe)
+    entry = cache.get(key) or {}
+
+    if not force_refresh and "oos" in entry and (time.time() - entry.get("oos_computed_at", 0)) < ttl_seconds:
+        return [OutOfSampleResult(**row) for row in entry["oos"]]
+
+    if use_process:
+        results = _run_oos_deduped(symbol, timeframe, horizons)
+    else:
+        results = _run_oos_validation(symbol, timeframe, horizons)
+
+    entry["oos"] = [asdict(r) for r in results]
+    entry["oos_computed_at"] = time.time()
+    cache[key] = entry
+    _save_cache(cache_path, cache)
+    return results
+
+
 def find_stats_for_labels(
     stats: list[CalibrationStats],
     labels: list[str],
@@ -172,6 +237,16 @@ def find_stats_for_labels(
     """The subset of ``stats`` matching any of ``labels`` at ``horizon_candles``
     — i.e. "what does history say about the label(s) active right now?"."""
     return [s for s in stats if s.label in labels and s.horizon_candles == horizon_candles]
+
+
+def find_oos_for_labels(
+    results: list[OutOfSampleResult],
+    labels: list[str],
+    horizon_candles: int,
+) -> list[OutOfSampleResult]:
+    """The subset of out-of-sample validation ``results`` matching any of
+    ``labels`` at ``horizon_candles`` — mirrors :func:`find_stats_for_labels`."""
+    return [r for r in results if r.label in labels and r.horizon_candles == horizon_candles]
 
 
 def find_regime_matched_stats(

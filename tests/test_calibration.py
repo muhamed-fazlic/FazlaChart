@@ -10,7 +10,15 @@ import inspect
 import pandas as pd
 import pytest
 
-from scanner.calibration import LABEL_DIRECTION, LabeledCase, _walk_forward_exit, summarize
+from scanner.calibration import (
+    LABEL_DIRECTION,
+    LabeledCase,
+    OOS_MIN_TEST_N,
+    _walk_forward_exit,
+    summarize,
+    train_test_split_cases,
+    validate_out_of_sample,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -198,3 +206,65 @@ class TestWalkForwardExit:
         hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "long", 100.0, 2.0, max_horizon=5)
         assert hit_candle is None
         assert reason == "timeout"
+
+
+def _timed_case(label: str, entry_time: str, forward_return_pct: float, horizon: int = 4) -> LabeledCase:
+    return LabeledCase(
+        symbol="TESTUSDT",
+        timeframe="1h",
+        label=label,
+        entry_time=entry_time,
+        entry_close=100.0,
+        forward_return_pct=forward_return_pct,
+        horizon_candles=horizon,
+    )
+
+
+class TestOutOfSampleValidation:
+    def test_split_keeps_oldest_cases_in_train_and_newest_in_test(self):
+        cases = [_timed_case("trend:bullish", f"2026-01-{day:02d}T00:00:00+00:00", 1.0) for day in range(1, 11)]
+        train, test = train_test_split_cases(cases, test_fraction=0.3)
+        assert len(train) == 7
+        assert len(test) == 3
+        assert max(c.entry_time for c in train) < min(c.entry_time for c in test)
+
+    def test_edge_that_holds_up_on_holdout_is_flagged_true(self):
+        # Consistently profitable long in both train and test windows.
+        cases = [
+            _timed_case("trend:bullish", f"2026-01-{day:02d}T00:00:00+00:00", 2.0) for day in range(1, 51)
+        ]
+        results = validate_out_of_sample(cases, min_test_n=5)
+        assert len(results) == 1
+        assert results[0].holds_up is True
+        assert results[0].warning is None
+
+    def test_edge_that_only_worked_in_sample_is_flagged_false(self):
+        # Profitable in the (older) train window, but a clear loser in the
+        # (newer) held-out test window — the edge did not survive.
+        train_cases = [
+            _timed_case("trend:bullish", f"2026-01-{day:02d}T00:00:00+00:00", 2.0) for day in range(1, 71)
+        ]
+        test_cases = [
+            _timed_case("trend:bullish", f"2026-03-{day:02d}T00:00:00+00:00", -2.0) for day in range(1, 31)
+        ]
+        results = validate_out_of_sample(train_cases + test_cases, test_fraction=0.3, min_test_n=5)
+        assert len(results) == 1
+        assert results[0].holds_up is False
+        assert results[0].warning is not None
+        assert "NE potvrđuje" in results[0].warning
+
+    def test_undersized_test_window_is_flagged_not_held_up(self):
+        cases = [_timed_case("trend:bullish", f"2026-01-{day:02d}T00:00:00+00:00", 2.0) for day in range(1, 11)]
+        results = validate_out_of_sample(cases, test_fraction=0.3, min_test_n=OOS_MIN_TEST_N)
+        assert len(results) == 1
+        assert results[0].holds_up is False
+        assert "premalo" in results[0].warning
+
+    def test_undirected_label_is_excluded_from_results(self):
+        cases = [
+            _timed_case("trend:neutral", f"2026-01-{day:02d}T00:00:00+00:00", 1.0) for day in range(1, 51)
+        ]
+        assert validate_out_of_sample(cases, min_test_n=5) == []
+
+    def test_empty_cases_returns_empty_list(self):
+        assert validate_out_of_sample([]) == []

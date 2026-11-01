@@ -470,6 +470,18 @@ def symbol_calibration(symbol: str, horizon_candles: int = 12) -> dict[str, Any]
 
     matches, regime, used_fallback = _regime_matched_calibration(symbol, timeframe, labels, horizon_candles)
 
+    from agents_crypto.calibration_lookup import find_oos_for_labels, get_oos_validation
+    from tradingagents.dataflows.errors import VendorError
+
+    try:
+        oos_results = get_oos_validation(symbol, timeframe, horizons=(horizon_candles,), use_process=True)
+    except VendorError:
+        # Same graceful-degrade pattern as _regime_matched_calibration's
+        # regime lookup: a transient data-vendor failure here shouldn't
+        # 500 the whole endpoint, it should just mean "no OOS data yet".
+        oos_results = []
+    oos_matches = find_oos_for_labels(oos_results, labels, horizon_candles)
+
     return {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -478,6 +490,7 @@ def symbol_calibration(symbol: str, horizon_candles: int = 12) -> dict[str, Any]
         "matches": [m.__dict__ for m in matches],
         "current_regime": regime,
         "regime_fallback": used_fallback,
+        "out_of_sample": [r.__dict__ for r in oos_matches],
     }
 
 

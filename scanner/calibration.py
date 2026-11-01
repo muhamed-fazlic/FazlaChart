@@ -99,6 +99,103 @@ class CalibrationStats:
     regime: str | None = None
 
 
+@dataclass
+class OutOfSampleResult:
+    """Did a label's edge survive on data the "model" never got to fit to?
+
+    Splits backtest cases by *time*, not a random shuffle: the oldest
+    ``1 - test_fraction`` of cases become the train window, the most recent
+    ``test_fraction`` become a held-out test window. This answers "would
+    this edge still have looked real in the period right before now", which
+    is what actually matters for trading it going forward — a random IID
+    split would let information from the test period's neighbours leak into
+    training and overstate how well the label generalizes.
+    """
+
+    label: str
+    direction: str | None
+    horizon_candles: int
+    train_n: int
+    train_win_rate_pct: float | None
+    test_n: int
+    test_win_rate_pct: float | None
+    test_win_rate_ci_low_pct: float | None
+    # True only when the held-out test window's conservative (CI lower
+    # bound) win rate itself clears 50% — i.e. the edge isn't just an
+    # in-sample artifact of whatever data it was originally measured on.
+    holds_up: bool
+    warning: str | None = None
+
+
+# Below this many held-out cases, even a great-looking test win rate is too
+# noisy to call "confirmed" — same floor used elsewhere (best-signal ranking)
+# for consistency.
+OOS_MIN_TEST_N = 20
+# Most-recent fraction of cases held out as the "test" window.
+OOS_TEST_FRACTION = 0.3
+
+
+def train_test_split_cases(
+    cases: list[LabeledCase], test_fraction: float = OOS_TEST_FRACTION
+) -> tuple[list[LabeledCase], list[LabeledCase]]:
+    """Chronological train/test split — see :class:`OutOfSampleResult`."""
+    ordered = sorted(cases, key=lambda c: c.entry_time)
+    split_idx = int(len(ordered) * (1 - test_fraction))
+    return ordered[:split_idx], ordered[split_idx:]
+
+
+def validate_out_of_sample(
+    cases: list[LabeledCase],
+    cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT,
+    test_fraction: float = OOS_TEST_FRACTION,
+    min_test_n: int = OOS_MIN_TEST_N,
+) -> list[OutOfSampleResult]:
+    """Per (label, horizon) comparison of in-sample (train) vs. held-out
+    (test) win rate — flags labels that only "worked" on the data used to
+    measure them, not on more recent history."""
+    if not cases:
+        return []
+    train_cases, test_cases = train_test_split_cases(cases, test_fraction)
+    train_by_key = {(s.label, s.horizon_candles): s for s in summarize(train_cases, cost_pct)}
+    test_by_key = {(s.label, s.horizon_candles): s for s in summarize(test_cases, cost_pct)}
+
+    results: list[OutOfSampleResult] = []
+    for key, test_stat in test_by_key.items():
+        if test_stat.direction is None:
+            continue  # undirected label: no win rate to validate either side
+        train_stat = train_by_key.get(key)
+        warning = None
+        holds_up = False
+        if test_stat.n < min_test_n:
+            warning = (
+                f"Test prozor ima samo {test_stat.n} slučajeva — premalo za pouzdanu OOS provjeru "
+                f"(potrebno \u2265{min_test_n})."
+            )
+        elif test_stat.win_rate_ci_low_pct is not None and test_stat.win_rate_ci_low_pct > 50.0:
+            holds_up = True
+        else:
+            ci_low_txt = f"{test_stat.win_rate_ci_low_pct}%" if test_stat.win_rate_ci_low_pct is not None else "N/A"
+            warning = (
+                f"Edge se NE potvrđuje na najnovijem (held-out) periodu: donja granica 95% CI win rate-a je "
+                f"{ci_low_txt} — label je možda bio dobar samo na starijim podacima (in-sample), ne i sada."
+            )
+        results.append(
+            OutOfSampleResult(
+                label=key[0],
+                direction=test_stat.direction,
+                horizon_candles=key[1],
+                train_n=train_stat.n if train_stat else 0,
+                train_win_rate_pct=train_stat.win_rate_pct if train_stat else None,
+                test_n=test_stat.n,
+                test_win_rate_pct=test_stat.win_rate_pct,
+                test_win_rate_ci_low_pct=test_stat.win_rate_ci_low_pct,
+                holds_up=holds_up,
+                warning=warning,
+            )
+        )
+    return sorted(results, key=lambda r: (-r.test_n, r.label, r.horizon_candles))
+
+
 # z-score for a 95% confidence level, used by the Wilson score interval below.
 _WILSON_Z_95 = 1.959963985
 

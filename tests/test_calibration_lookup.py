@@ -7,8 +7,14 @@ from unittest.mock import patch
 
 import pytest
 
-from agents_crypto.calibration_lookup import find_stats_for_labels, get_calibration_stats, get_cached_calibration_stats
-from scanner.calibration import CalibrationStats
+from agents_crypto.calibration_lookup import (
+    find_oos_for_labels,
+    find_stats_for_labels,
+    get_calibration_stats,
+    get_cached_calibration_stats,
+    get_oos_validation,
+)
+from scanner.calibration import CalibrationStats, OutOfSampleResult
 
 pytestmark = pytest.mark.unit
 
@@ -132,3 +138,101 @@ def test_get_cached_calibration_stats_ignores_expired_entry(tmp_path):
     # ttl_seconds=0 means the entry is already stale by the time this reads it.
     stats = get_cached_calibration_stats("BTCUSDT", "1h", cache_path=cache_path, ttl_seconds=0)
     assert stats == []
+
+
+_FAKE_OOS = [
+    OutOfSampleResult(
+        label="trend:bearish",
+        direction="short",
+        horizon_candles=12,
+        train_n=70,
+        train_win_rate_pct=60.0,
+        test_n=30,
+        test_win_rate_pct=55.0,
+        test_win_rate_ci_low_pct=42.0,
+        holds_up=True,
+        warning=None,
+    ),
+]
+
+
+def test_get_oos_validation_computes_and_caches_on_first_call(tmp_path):
+    cache_path = str(tmp_path / "cal.json")
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.validate_out_of_sample", return_value=_FAKE_OOS) as mock_validate,
+    ):
+        results = get_oos_validation("BTCUSDT", "1h", cache_path=cache_path)
+        assert mock_validate.called
+        assert len(results) == 1
+        assert results[0].holds_up is True
+
+        # Second call within TTL should hit the cache, not recompute.
+        mock_validate.reset_mock()
+        results_again = get_oos_validation("BTCUSDT", "1h", cache_path=cache_path)
+        assert not mock_validate.called
+        assert results_again == results
+
+
+def test_get_oos_validation_force_refresh_recomputes(tmp_path):
+    cache_path = str(tmp_path / "cal.json")
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.validate_out_of_sample", return_value=_FAKE_OOS),
+    ):
+        get_oos_validation("BTCUSDT", "1h", cache_path=cache_path)
+
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.validate_out_of_sample", return_value=_FAKE_OOS) as mock_validate,
+    ):
+        get_oos_validation("BTCUSDT", "1h", cache_path=cache_path, force_refresh=True)
+        assert mock_validate.called
+
+
+def test_get_oos_validation_stale_cache_recomputes(tmp_path):
+    cache_path = str(tmp_path / "cal.json")
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.validate_out_of_sample", return_value=_FAKE_OOS),
+    ):
+        get_oos_validation("BTCUSDT", "1h", cache_path=cache_path, ttl_seconds=0)
+
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.validate_out_of_sample", return_value=_FAKE_OOS) as mock_validate,
+    ):
+        get_oos_validation("BTCUSDT", "1h", cache_path=cache_path, ttl_seconds=0)
+        assert mock_validate.called
+
+
+def test_get_oos_validation_does_not_disturb_cached_stats(tmp_path):
+    """Computing OOS results must not clobber an already-cached stats entry
+    for the same (symbol, timeframe) — the two are merged into one cache
+    entry, written independently."""
+    cache_path = str(tmp_path / "cal.json")
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.summarize", return_value=_FAKE_STATS),
+    ):
+        get_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)
+
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.validate_out_of_sample", return_value=_FAKE_OOS),
+    ):
+        get_oos_validation("BTCUSDT", "1h", cache_path=cache_path)
+
+    stats = get_cached_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)
+    assert len(stats) == 2
+
+
+def test_find_oos_for_labels_matches_label_and_horizon():
+    matches = find_oos_for_labels(_FAKE_OOS, labels=["trend:bearish", "trend:neutral"], horizon_candles=12)
+    assert len(matches) == 1
+    assert matches[0].label == "trend:bearish"
+
+
+def test_find_oos_for_labels_filters_by_horizon():
+    matches = find_oos_for_labels(_FAKE_OOS, labels=["trend:bearish"], horizon_candles=4)
+    assert matches == []

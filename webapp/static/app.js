@@ -443,6 +443,34 @@ function showDetail(symbolRow) {
   loadLiquidityHeatmap(symbolRow.symbol, symbolRow.reference_timeframe);
 }
 
+// Out-of-sample validation: a label's historical win rate was measured over
+// its whole history, but the edge could be an artifact of an older regime
+// that's since changed. This re-checks the win rate on just the most recent
+// held-out slice of trades (never used to compute the headline number) and
+// flags plainly when that recent slice does NOT confirm the edge — this is
+// a stronger trust signal than the overall win rate alone.
+function oosValidationHtml(oosResults) {
+  if (!oosResults || !oosResults.length) return "";
+  const rows = oosResults
+    .map((o) => {
+      if (o.test_n < 20) {
+        return (
+          `<div class="muted">🧪 <b>${o.label}</b> → ${o.direction}: premalo novijih podataka ` +
+          `za out-of-sample provjeru (n=${o.test_n}).</div>`
+        );
+      }
+      const icon = o.holds_up ? "✅" : "⚠️";
+      const cls = o.holds_up ? "pos" : "neg";
+      return (
+        `<div class="${cls}">${icon} <b>${o.label}</b> → ${o.direction}: train ${fmt(o.train_win_rate_pct, 1)}% ` +
+        `(n=${o.train_n}) vs. najnoviji test ${fmt(o.test_win_rate_pct, 1)}% (n=${o.test_n}, CI-low ${fmt(o.test_win_rate_ci_low_pct, 1)}%)` +
+        `${o.warning ? ` — ${o.warning}` : ""}</div>`
+      );
+    })
+    .join("");
+  return `<div class="oos-validation"><div class="muted">Out-of-sample provjera (edge na najnovijim, neviđenim trejdovima):</div>${rows}</div>`;
+}
+
 async function loadCalibrationPreview(symbol) {
   const el = document.getElementById("calibration-preview");
   el.className = "calibration-preview muted";
@@ -476,7 +504,7 @@ async function loadCalibrationPreview(symbol) {
           `(n=${m.n}${lowN ? ", small sample" : ""}, avg net ${fmt(m.avg_net_return_pct, 2)}%)</div>`
         );
       })
-      .join("");
+      .join("") + oosValidationHtml(data.out_of_sample);
   } catch (err) {
     if (symbol !== currentDetailSymbol) return;
     el.className = "calibration-preview muted";
