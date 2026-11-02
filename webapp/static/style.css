@@ -14,7 +14,7 @@
 * { box-sizing: border-box; }
 
 html, body {
-  height: 100%;
+  height: auto;
 }
 
 body {
@@ -24,8 +24,8 @@ body {
   color: var(--text);
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  overflow: hidden;
+  min-height: 100vh;
+  overflow: visible;
 }
 
 header {
@@ -125,8 +125,6 @@ h1 .subtitle {
 .tab-panel.active {
   display: flex;
   flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 0;
 }
 
 .trades-summary {
@@ -210,9 +208,8 @@ h1 .subtitle {
 
 main {
   padding: 0 20px 20px;
-  overflow: auto;
-  flex: 1 1 auto;
-  min-height: 0;
+  overflow: visible;
+  flex: 0 0 auto;
 }
 
 table {
@@ -666,30 +663,6 @@ footer {
    while driving a live trade.
    --------------------------------------------------------------------- */
 @media (max-width: 760px) {
-  /* On mobile the growing stack of fixed-size banners (health, BTC, best
-     signal, forward tracking) can add up to more than the viewport height,
-     and the desktop "app shell" layout (body locked to 100vh with only
-     <main> scrolling internally) then clips that overflow instead of
-     letting the user scroll to it. Let the whole page flow and scroll
-     normally on small screens instead. */
-  html, body {
-    height: auto;
-  }
-
-  body {
-    overflow: visible;
-  }
-
-  main {
-    overflow: visible;
-    flex: 0 0 auto;
-  }
-
-  .tab-panel.active {
-    overflow: visible;
-    flex: 0 0 auto;
-  }
-
   header {
     padding: 10px 12px;
   }
