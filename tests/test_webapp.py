@@ -574,3 +574,75 @@ def test_forward_tracking_summary_separates_open_from_resolved(tmp_path, monkeyp
     assert body["resolved_by_status"]["take_profit"] == 1
     assert body["realized_win_rate_pct"] == 100.0
 
+
+def test_forward_tracking_trades_reports_empty_state_with_no_logged_signals(client):
+    resp = client.get("/api/forward-tracking/trades")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 0
+    assert body["trades"] == []
+
+
+def test_forward_tracking_trades_returns_full_per_trade_detail(tmp_path, monkeypatch):
+    from scanner.storage import log_signal_outcome, resolve_signal_outcome
+
+    db_path = tmp_path / "scanner_test.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    conn = init_db(str(db_path))
+    log_signal_outcome(
+        conn,
+        symbol="AAAUSDT",
+        timeframe="1h",
+        direction="short",
+        label="trend:bearish",
+        entry_price=10.0,
+        stop_loss=10.5,
+        take_profit=9.0,
+        take_profit_conservative=9.25,
+        promised_win_rate_pct=65.0,
+        promised_win_rate_ci_low_pct=60.0,
+        promised_n=200,
+        horizon_candles=12,
+    )
+    log_signal_outcome(
+        conn,
+        symbol="BBBUSDT",
+        timeframe="1h",
+        direction="long",
+        label="trend:bullish",
+        entry_price=10.0,
+        stop_loss=9.5,
+        take_profit=11.0,
+        take_profit_conservative=10.75,
+        promised_win_rate_pct=70.0,
+        promised_win_rate_ci_low_pct=62.0,
+        promised_n=150,
+        horizon_candles=12,
+    )
+    resolve_signal_outcome(conn, 2, "take_profit", 11.0, 0.9)
+    conn.close()
+
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/forward-tracking/trades")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 2
+    by_symbol = {t["symbol"]: t for t in body["trades"]}
+    assert by_symbol["AAAUSDT"]["status"] == "open"
+    assert by_symbol["AAAUSDT"]["entry_price"] == 10.0
+    assert by_symbol["AAAUSDT"]["stop_loss"] == 10.5
+    assert by_symbol["BBBUSDT"]["status"] == "take_profit"
+    assert by_symbol["BBBUSDT"]["exit_price"] == 11.0
+    assert by_symbol["BBBUSDT"]["realized_return_pct"] == 0.9
+
+    resp_filtered = TestClient(app).get("/api/forward-tracking/trades?status=open")
+    assert resp_filtered.status_code == 200
+    filtered_body = resp_filtered.json()
+    assert filtered_body["count"] == 1
+    assert filtered_body["trades"][0]["symbol"] == "AAAUSDT"
+
+    resp_unknown = TestClient(app).get("/api/forward-tracking/trades?status=bogus")
+    assert resp_unknown.status_code == 200
+    assert resp_unknown.json()["count"] == 2
+

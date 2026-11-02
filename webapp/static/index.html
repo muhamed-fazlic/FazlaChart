@@ -24,6 +24,12 @@
 
   <section id="health-banner" class="health-banner hidden"></section>
 
+  <nav class="tab-bar">
+    <button type="button" class="tab-btn active" data-tab="scanner">📡 Scanner</button>
+    <button type="button" class="tab-btn" data-tab="trades">📊 Analitika trejdova</button>
+  </nav>
+
+  <div id="tab-scanner" class="tab-panel active">
   <section class="symbol-filter">
     <form id="symbol-filter-form">
       <input type="text" id="symbol-filter-input" list="symbol-suggestions" placeholder="npr. 1000PEPEUSDT" autocomplete="off" />
@@ -66,6 +72,43 @@
       </tbody>
     </table>
   </main>
+  </div>
+
+  <div id="tab-trades" class="tab-panel">
+    <section id="trades-summary" class="trades-summary muted">Učitavam analitiku trejdova…</section>
+
+    <section class="trades-filter-bar">
+      <button type="button" class="trades-filter-btn active" data-status="">Svi</button>
+      <button type="button" class="trades-filter-btn" data-status="open">U toku</button>
+      <button type="button" class="trades-filter-btn" data-status="take_profit">TP</button>
+      <button type="button" class="trades-filter-btn" data-status="stop_loss">SL</button>
+      <button type="button" class="trades-filter-btn" data-status="timeout">Timeout</button>
+    </section>
+
+    <main>
+      <table id="trades-table">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>TF</th>
+            <th>Smjer</th>
+            <th>Status</th>
+            <th>Entry</th>
+            <th>SL</th>
+            <th>TP</th>
+            <th>Exit</th>
+            <th>Net %</th>
+            <th>Obećano (CI low)</th>
+            <th>Otvoren</th>
+            <th>Zatvoren</th>
+          </tr>
+        </thead>
+        <tbody id="trades-body">
+          <tr><td colspan="12" class="muted">Učitavam trejdove…</td></tr>
+        </tbody>
+      </table>
+    </main>
+  </div>
 
   <div id="detail-modal" class="modal hidden">
     <div class="modal-content">

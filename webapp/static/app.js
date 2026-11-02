@@ -192,6 +192,134 @@ async function loadForwardTracking() {
   }
 }
 
+// --- Tab switching (Scanner vs. Analitika trejdova) -----------------------
+
+let currentTradesStatusFilter = "";
+
+function switchTab(tab) {
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === tab);
+  });
+  document.getElementById("tab-scanner").classList.toggle("active", tab === "scanner");
+  document.getElementById("tab-trades").classList.toggle("active", tab === "trades");
+  if (tab === "trades") {
+    loadTradesTab();
+  }
+}
+
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+});
+
+// --- Analitika trejdova: every tracked signal, in full detail -------------
+// Distinct from the compact forward-tracking-panel summary strip: this tab
+// shows every individual tracked trade (open and resolved) with its exact
+// entry/SL/TP/exit and promised-vs-realized numbers, not just aggregate
+// counts, so a user can see exactly *what* was traded, not just a tally.
+
+const STATUS_LABELS = {
+  open: "U toku",
+  take_profit: "TP",
+  stop_loss: "SL",
+  timeout: "Timeout",
+};
+
+function statusBadgeHtml(status) {
+  const label = STATUS_LABELS[status] || status;
+  return `<span class="status-badge status-${status}">${label}</span>`;
+}
+
+function fmtDateTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function renderTradesSummary(summary, trades) {
+  const el = document.getElementById("trades-summary");
+  if (!summary) {
+    el.className = "trades-summary muted";
+    el.textContent = "Nema podataka o praćenju trejdova još.";
+    return;
+  }
+  const byStatus = summary.resolved_by_status || {};
+  const resolvedTrades = trades.filter((t) => t.status !== "open" && t.realized_return_pct !== null && t.realized_return_pct !== undefined);
+  const avgNetReturn = resolvedTrades.length
+    ? resolvedTrades.reduce((sum, t) => sum + t.realized_return_pct, 0) / resolvedTrades.length
+    : null;
+  const gap =
+    summary.realized_win_rate_pct !== null && summary.avg_promised_win_rate_ci_low_pct !== null
+      ? summary.realized_win_rate_pct - summary.avg_promised_win_rate_ci_low_pct
+      : null;
+
+  el.className = "trades-summary";
+  el.innerHTML = `
+    <div class="trades-summary-cards">
+      <div class="trades-summary-card"><span class="label">Ukupno trejdova</span><span class="value">${summary.open_count + summary.resolved_count}</span></div>
+      <div class="trades-summary-card"><span class="label">U toku</span><span class="value">${summary.open_count}</span></div>
+      <div class="trades-summary-card"><span class="label">Take profit</span><span class="value pos">${byStatus.take_profit || 0}</span></div>
+      <div class="trades-summary-card"><span class="label">Stop loss</span><span class="value neg">${byStatus.stop_loss || 0}</span></div>
+      <div class="trades-summary-card"><span class="label">Timeout</span><span class="value">${byStatus.timeout || 0}</span></div>
+      <div class="trades-summary-card"><span class="label">Stvarni win rate</span><span class="value">${fmt(summary.realized_win_rate_pct, 1)}%</span></div>
+      <div class="trades-summary-card"><span class="label">Prosječan net return</span><span class="value ${signClass(avgNetReturn)}">${avgNetReturn !== null ? fmt(avgNetReturn, 2) + "%" : "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Obećano vs. stvarno</span><span class="value ${gap !== null ? (gap >= 0 ? "pos" : "neg") : ""}">${gap !== null ? (gap >= 0 ? "+" : "") + fmt(gap, 1) + "pp" : "—"}</span></div>
+    </div>`;
+}
+
+function renderTradesTable(trades) {
+  const body = document.getElementById("trades-body");
+  if (!trades.length) {
+    body.innerHTML = `<tr><td colspan="12" class="muted">Nema trejdova za ovaj filter.</td></tr>`;
+    return;
+  }
+  body.innerHTML = trades
+    .map((t) => {
+      const dirClass = t.direction === "long" ? "trend-bullish" : "trend-bearish";
+      const dirWord = t.direction === "long" ? "LONG" : "SHORT";
+      return `
+    <tr>
+      <td data-label="Symbol"><b>${t.symbol}</b></td>
+      <td data-label="TF">${t.timeframe}</td>
+      <td data-label="Smjer" class="${dirClass}">${dirWord}</td>
+      <td data-label="Status">${statusBadgeHtml(t.status)}</td>
+      <td data-label="Entry">${fmt(t.entry_price, 4)}</td>
+      <td data-label="SL">${fmt(t.stop_loss, 4)}</td>
+      <td data-label="TP">${fmt(t.take_profit, 4)}</td>
+      <td data-label="Exit">${t.exit_price !== null && t.exit_price !== undefined ? fmt(t.exit_price, 4) : "—"}</td>
+      <td data-label="Net %" class="${signClass(t.realized_return_pct)}">${t.realized_return_pct !== null && t.realized_return_pct !== undefined ? fmt(t.realized_return_pct, 2) + "%" : "—"}</td>
+      <td data-label="Obećano (CI low)">${fmt(t.promised_win_rate_ci_low_pct, 1)}%</td>
+      <td data-label="Otvoren">${fmtDateTime(t.logged_at)}</td>
+      <td data-label="Zatvoren">${fmtDateTime(t.resolved_at)}</td>
+    </tr>`;
+    })
+    .join("");
+}
+
+async function loadTradesTab(status) {
+  if (status !== undefined) currentTradesStatusFilter = status;
+  try {
+    const tradesUrl = currentTradesStatusFilter
+      ? `/api/forward-tracking/trades?status=${encodeURIComponent(currentTradesStatusFilter)}`
+      : "/api/forward-tracking/trades";
+    const [summaryRes, tradesRes] = await Promise.all([fetch("/api/forward-tracking/summary"), fetch(tradesUrl)]);
+    const summary = await summaryRes.json();
+    const tradesData = await tradesRes.json();
+    renderTradesSummary(summary, tradesData.trades || []);
+    renderTradesTable(tradesData.trades || []);
+  } catch (err) {
+    console.error("Could not load trades analytics:", err);
+    document.getElementById("trades-body").innerHTML = `<tr><td colspan="12" class="muted">Greška: ${err.message}</td></tr>`;
+  }
+}
+
+document.querySelectorAll(".trades-filter-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".trades-filter-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    loadTradesTab(btn.dataset.status);
+  });
+});
+
 function renderTable(symbols, anomaliesOnly) {
   const body = document.getElementById("scan-body");
   const rows = anomaliesOnly ? symbols.filter((s) => s.anomalies.length > 0) : symbols;
@@ -868,3 +996,6 @@ loadForwardTracking();
 setInterval(loadForwardTracking, REFRESH_MS);
 loadHealth();
 setInterval(loadHealth, 60000); // check more often than the data refresh itself — staleness matters sooner
+setInterval(() => {
+  if (document.getElementById("tab-trades").classList.contains("active")) loadTradesTab();
+}, REFRESH_MS);

@@ -535,6 +535,32 @@ def forward_tracking_summary(limit: int = 200) -> dict[str, Any]:
     }
 
 
+@app.get("/api/forward-tracking/trades")
+def forward_tracking_trades(status: str | None = None, limit: int = 300) -> dict[str, Any]:
+    """Every individual tracked signal (open and resolved), with full
+    entry/SL/TP/exit detail — the per-trade data behind the summary counts
+    shown by ``/api/forward-tracking/summary``. Powers the "Analitika
+    trejdova" tab so a user can see exactly *which* symbol/timeframe/
+    direction produced each take-profit, stop-loss, or timeout, not just an
+    aggregate count.
+
+    ``status``, if given, filters to one of ``open``, ``take_profit``,
+    ``stop_loss``, or ``timeout``. Unknown values are ignored (no filter
+    applied) rather than erroring, since this is a convenience filter, not
+    a strict API contract."""
+    conn = _get_conn()
+    try:
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit)
+    finally:
+        conn.close()
+
+    valid_statuses = {"open", "take_profit", "stop_loss", "timeout"}
+    if status in valid_statuses:
+        outcomes = [o for o in outcomes if o["status"] == status]
+
+    return {"trades": outcomes, "count": len(outcomes)}
+
+
 def _regime_matched_calibration(
     symbol: str, timeframe: str, labels: list[str], horizon_candles: int
 ) -> tuple[list[Any], str | None, bool]:
