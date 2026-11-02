@@ -685,6 +685,11 @@ footer {
     flex: 0 0 auto;
   }
 
+  .tab-panel.active {
+    overflow: visible;
+    flex: 0 0 auto;
+  }
+
   header {
     padding: 10px 12px;
   }
