@@ -646,3 +646,54 @@ def test_forward_tracking_trades_returns_full_per_trade_detail(tmp_path, monkeyp
     assert resp_unknown.status_code == 200
     assert resp_unknown.json()["count"] == 2
 
+
+def test_forward_tracking_by_bucket_reports_empty_state_with_no_logged_signals(client):
+    resp = client.get("/api/forward-tracking/by-bucket")
+    assert resp.status_code == 200
+    assert resp.json() == {"buckets": []}
+
+
+def test_forward_tracking_by_bucket_groups_resolved_outcomes_by_timeframe_and_direction(tmp_path, monkeypatch):
+    from scanner.storage import log_signal_outcome, resolve_signal_outcome
+
+    db_path = tmp_path / "scanner_test.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    conn = init_db(str(db_path))
+
+    # Two 1h/short trades: one win, one loss.
+    log_signal_outcome(
+        conn, symbol="AAAUSDT", timeframe="1h", direction="short", label="trend:bearish",
+        entry_price=10.0, stop_loss=10.5, take_profit=9.0, take_profit_conservative=9.25,
+        promised_win_rate_pct=65.0, promised_win_rate_ci_low_pct=60.0, promised_n=200, horizon_candles=12,
+    )
+    log_signal_outcome(
+        conn, symbol="BBBUSDT", timeframe="1h", direction="short", label="trend:bearish",
+        entry_price=10.0, stop_loss=10.5, take_profit=9.0, take_profit_conservative=9.25,
+        promised_win_rate_pct=65.0, promised_win_rate_ci_low_pct=60.0, promised_n=200, horizon_candles=12,
+    )
+    # One 4h/long trade (still open -- should not count toward resolved buckets).
+    log_signal_outcome(
+        conn, symbol="CCCUSDT", timeframe="4h", direction="long", label="trend:bullish",
+        entry_price=10.0, stop_loss=9.5, take_profit=11.0, take_profit_conservative=10.75,
+        promised_win_rate_pct=70.0, promised_win_rate_ci_low_pct=62.0, promised_n=150, horizon_candles=12,
+    )
+    resolve_signal_outcome(conn, 1, "take_profit", 9.0, 1.0)
+    resolve_signal_outcome(conn, 2, "stop_loss", 10.5, -0.6)
+    conn.close()
+
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/forward-tracking/by-bucket")
+    assert resp.status_code == 200
+    buckets = resp.json()["buckets"]
+    assert len(buckets) == 1  # only the resolved 1h/short bucket; the open 4h/long trade contributes nothing
+    bucket = buckets[0]
+    assert bucket["timeframe"] == "1h"
+    assert bucket["direction"] == "short"
+    assert bucket["resolved_count"] == 2
+    assert bucket["by_status"] == {"take_profit": 1, "stop_loss": 1, "timeout": 0}
+    assert bucket["win_rate_pct"] == 50.0
+    assert bucket["avg_net_return_pct"] == 0.2
+    assert bucket["avg_promised_win_rate_ci_low_pct"] == 60.0
+    assert bucket["gap_pp"] == -10.0
+

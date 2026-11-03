@@ -296,17 +296,59 @@ function renderTradesTable(trades) {
     .join("");
 }
 
+function renderBucketBreakdown(buckets) {
+  const el = document.getElementById("bucket-breakdown");
+  if (!buckets.length) {
+    el.className = "bucket-breakdown muted";
+    el.innerHTML = "Nema zatvorenih trejdova za raspodjelu po bucket-ima.";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = buckets
+    .map((b) => {
+      const dirWord = b.direction === "long" ? "LONG" : "SHORT";
+      const dirClass = b.direction === "long" ? "pos" : "neg";
+      const gapClass = b.gap_pp === null ? "" : b.gap_pp >= 0 ? "pos" : "neg";
+      const netClass = signClass(b.avg_net_return_pct);
+      return `
+    <tr>
+      <td><b>${b.timeframe}</b></td>
+      <td class="${dirClass}">${dirWord}</td>
+      <td>${b.resolved_count} <span class="muted">(TP ${b.by_status.take_profit || 0} · SL ${b.by_status.stop_loss || 0} · timeout ${b.by_status.timeout || 0})</span></td>
+      <td>${fmt(b.win_rate_pct, 1)}%</td>
+      <td class="${netClass}">${b.avg_net_return_pct !== null ? fmt(b.avg_net_return_pct, 2) + "%" : "—"}</td>
+      <td>${fmt(b.avg_promised_win_rate_ci_low_pct, 1)}%</td>
+      <td class="${gapClass}">${b.gap_pp !== null ? (b.gap_pp >= 0 ? "+" : "") + fmt(b.gap_pp, 1) + "pp" : "—"}</td>
+    </tr>`;
+    })
+    .join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">Po bucket-u (timeframe + smjer) — ko zapravo vuče prosjek</div>
+    <table class="bucket-breakdown-table">
+      <thead>
+        <tr><th>TF</th><th>Smjer</th><th>N (zatvoreno)</th><th>Win rate</th><th>Avg net %</th><th>Obećano (CI low)</th><th>Razlika</th></tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 async function loadTradesTab(status) {
   if (status !== undefined) currentTradesStatusFilter = status;
   try {
     const tradesUrl = currentTradesStatusFilter
       ? `/api/forward-tracking/trades?status=${encodeURIComponent(currentTradesStatusFilter)}`
       : "/api/forward-tracking/trades";
-    const [summaryRes, tradesRes] = await Promise.all([fetch("/api/forward-tracking/summary"), fetch(tradesUrl)]);
+    const [summaryRes, tradesRes, bucketRes] = await Promise.all([
+      fetch("/api/forward-tracking/summary"),
+      fetch(tradesUrl),
+      fetch("/api/forward-tracking/by-bucket"),
+    ]);
     const summary = await summaryRes.json();
     const tradesData = await tradesRes.json();
+    const bucketData = await bucketRes.json();
     renderTradesSummary(summary, tradesData.trades || []);
     renderTradesTable(tradesData.trades || []);
+    renderBucketBreakdown(bucketData.buckets || []);
   } catch (err) {
     console.error("Could not load trades analytics:", err);
     document.getElementById("trades-body").innerHTML = `<tr><td colspan="12" class="muted">Greška: ${err.message}</td></tr>`;

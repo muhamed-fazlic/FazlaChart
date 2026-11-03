@@ -561,6 +561,52 @@ def forward_tracking_trades(status: str | None = None, limit: int = 300) -> dict
     return {"trades": outcomes, "count": len(outcomes)}
 
 
+@app.get("/api/forward-tracking/by-bucket")
+def forward_tracking_by_bucket(limit: int = 1000) -> dict[str, Any]:
+    """Resolved trade outcomes grouped by ``(timeframe, direction)`` bucket
+    — lets a user see whether the aggregate win-rate/net-return picture from
+    ``/api/forward-tracking/summary`` is spread evenly across buckets or
+    driven (positively or negatively) by just one or two of them, which a
+    single combined average can hide."""
+    conn = _get_conn()
+    try:
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit)
+    finally:
+        conn.close()
+
+    resolved = [o for o in outcomes if o["status"] != "open"]
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for o in resolved:
+        buckets.setdefault((o["timeframe"], o["direction"]), []).append(o)
+
+    rows = []
+    for (timeframe, direction), items in buckets.items():
+        net_returns = [o["realized_return_pct"] for o in items if o["realized_return_pct"] is not None]
+        wins = sum(1 for r in net_returns if r > 0)
+        promised = [o["promised_win_rate_ci_low_pct"] for o in items if o["promised_win_rate_ci_low_pct"] is not None]
+        win_rate = round(wins / len(net_returns) * 100, 1) if net_returns else None
+        avg_net = round(sum(net_returns) / len(net_returns), 2) if net_returns else None
+        avg_promised = round(sum(promised) / len(promised), 1) if promised else None
+        gap = round(win_rate - avg_promised, 1) if win_rate is not None and avg_promised is not None else None
+        by_status = {"take_profit": 0, "stop_loss": 0, "timeout": 0}
+        for o in items:
+            by_status[o["status"]] = by_status.get(o["status"], 0) + 1
+        rows.append(
+            {
+                "timeframe": timeframe,
+                "direction": direction,
+                "resolved_count": len(items),
+                "by_status": by_status,
+                "win_rate_pct": win_rate,
+                "avg_net_return_pct": avg_net,
+                "avg_promised_win_rate_ci_low_pct": avg_promised,
+                "gap_pp": gap,
+            }
+        )
+    rows.sort(key=lambda r: r["resolved_count"], reverse=True)
+    return {"buckets": rows}
+
+
 def _regime_matched_calibration(
     symbol: str, timeframe: str, labels: list[str], horizon_candles: int
 ) -> tuple[list[Any], str | None, bool]:
