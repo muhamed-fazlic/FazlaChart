@@ -110,13 +110,22 @@ def _age_seconds(iso_timestamp: str) -> float:
     return (datetime.now(UTC) - ts).total_seconds()
 
 
-def _rank_key(candidate: dict[str, Any]) -> tuple[float, float, int]:
-    # Primary: the CI's conservative lower bound (never the raw point
-    # estimate) — see the module docstring. Ties there (rounded to 1
-    # decimal, so distinct symbols land on the same number often) are broken
-    # by the raw win rate, then by sample size, instead of falling back to
-    # whatever order rows happened to come out of the database in.
-    return (candidate["win_rate_ci_low_pct"], candidate["win_rate_pct"], candidate["n"])
+def _rank_key(candidate: dict[str, Any]) -> tuple[float, float, float, int]:
+    # Primary: the Signal Quality Score (see agents_crypto.signal_quality) --
+    # live trend/momentum/volume/multi-timeframe-alignment/volatility
+    # confirmation among candidates that have ALL already cleared the
+    # statistical gate (min sample size + CI-low win rate > 50%, computed in
+    # compute_candidates below). This never lets a candidate with no proven
+    # historical edge outrank one that has one; it only decides order among
+    # candidates that already do. Ties on quality score (rounded to 1
+    # decimal) fall back to the CI's conservative lower bound, then the raw
+    # win rate, then sample size, instead of database row order.
+    return (
+        candidate["quality_score"]["total"],
+        candidate["win_rate_ci_low_pct"],
+        candidate["win_rate_pct"],
+        candidate["n"],
+    )
 
 
 def compute_candidates(
@@ -180,6 +189,7 @@ def compute_candidates(
     muted_buckets = muted_buckets or set()
     from agents_crypto.calibration_lookup import find_stats_for_labels, get_cached_calibration_stats
     from agents_crypto.risk_calc import compute_kelly_fraction, compute_risk_levels
+    from agents_crypto.signal_quality import compute_quality_score
 
     candidates: list[dict[str, Any]] = []
     considered = 0
@@ -264,6 +274,15 @@ def compute_candidates(
             # suggest a bigger bet than the evidence actually supports.
             kelly = compute_kelly_fraction(best.win_rate_ci_low_pct, best.avg_win_return_pct, best.avg_loss_return_pct)
 
+            # Signal Quality Score: re-ranks candidates that already cleared
+            # the statistical gate above by how strongly LIVE conditions
+            # (trend strength, momentum, volume, multi-timeframe alignment,
+            # volatility, plus this same historical win rate) confirm the
+            # label right now -- see agents_crypto.signal_quality for why.
+            quality = compute_quality_score(
+                row, tf_snapshot, tf, best.direction, best.win_rate_ci_low_pct, best.n
+            )
+
             candidates.append(
                 {
                     "symbol": row["symbol"],
@@ -283,10 +302,20 @@ def compute_candidates(
                         "full_kelly_fraction_pct": round(kelly.full_kelly_fraction * 100, 2),
                         "warning": kelly.warning,
                     },
+                    "quality_score": {
+                        "total": quality.total,
+                        "trend_strength": quality.trend_strength,
+                        "momentum": quality.momentum,
+                        "volume_confirmation": quality.volume_confirmation,
+                        "multi_timeframe_alignment": quality.multi_timeframe_alignment,
+                        "volatility_conditions": quality.volatility_conditions,
+                        "historical_performance": quality.historical_performance,
+                    },
                     "scanned_at": row["scanned_at"],
                     "age_seconds": round(_age_seconds(row["scanned_at"]), 1),
                 }
             )
+
 
     generated_at = max(r["scanned_at"] for r in rows)
 
