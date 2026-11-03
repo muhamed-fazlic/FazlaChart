@@ -672,6 +672,14 @@ footer {
   margin-top: 2px;
 }
 
+.quality-score-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--panel-alt, rgba(255, 255, 255, 0.06));
+  cursor: help;
+}
+
 .best-signal-entry {
   display: flex;
   gap: 14px;

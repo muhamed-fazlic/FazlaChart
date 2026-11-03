@@ -85,6 +85,16 @@ function bestSignalEntryHtml(sig) {
     ${kelly && kelly.warning ? `<div class="best-signal-warning">💰 ${kelly.warning}</div>` : ""}`;
 }
 
+function qualityScoreBadgeHtml(qs) {
+  if (!qs || qs.total === undefined || qs.total === null) return "";
+  const cls = qs.total >= 70 ? "pos" : qs.total >= 50 ? "" : "neg";
+  const tooltip =
+    `Trend: ${fmt(qs.trend_strength, 0)} · Momentum: ${fmt(qs.momentum, 0)} · Volumen: ${fmt(qs.volume_confirmation, 0)} · ` +
+    `MTF slaganje: ${fmt(qs.multi_timeframe_alignment, 0)} · Volatilnost: ${fmt(qs.volatility_conditions, 0)} · ` +
+    `Historija: ${fmt(qs.historical_performance, 0)}`;
+  return `<span class="quality-score-badge ${cls}" title="${tooltip}">⚡ Kvalitet: <b>${fmt(qs.total, 0)}</b>/100</span>`;
+}
+
 function bestSignalCardHtml(sig, rank) {
   const dirClass = sig.direction === "long" ? "trend-bullish" : "trend-bearish";
   const dirWord = sig.direction === "long" ? "LONG" : "SHORT";
@@ -95,6 +105,7 @@ function bestSignalCardHtml(sig, rank) {
         <b>${sig.symbol}</b>
         <span class="${dirClass}">${dirWord}</span>
         <span class="muted">${sig.timeframe}</span>
+        ${qualityScoreBadgeHtml(sig.quality_score)}
       </div>
       <div class="best-signal-stats">
         <span>Win rate: <b>${fmt(sig.win_rate_pct, 1)}%</b> ${winRateRangeHtml(sig.win_rate_ci_low_pct, sig.win_rate_ci_high_pct)}</span>
