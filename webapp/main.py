@@ -106,10 +106,11 @@ _CALIBRATION_WARMUP_INTERVAL_SECONDS = 20
 async def _start_calibration_warmup_loop() -> None:
     """``/api/scan/best-signal`` only ever reads the on-disk calibration
     cache (see ``get_cached_calibration_stats``) — it never backtests
-    on-demand, to stay fast even when ranking 100+ symbols. Without this
-    loop that cache would stay empty for any symbol a human never happened
-    to click on, making "best signal" silently blind to most of the tracked
-    universe. This fills it in the background, a couple of symbols every
+    on-demand, to stay fast even when ranking 100+ symbols across 4
+    independent timeframes each. Without this loop that cache would stay
+    empty for any (symbol, timeframe) pair a human never happened to click
+    on, making "best signal" silently blind to most of the tracked
+    universe. This fills it in the background, a couple of pairs every
     ~20s, so it's self-sustaining without ever blocking a real request."""
     import asyncio
 
@@ -186,7 +187,8 @@ async def _calibration_warmup_loop() -> None:
 
     import anyio
 
-    from agents_crypto.calibration_lookup import get_calibration_stats, get_cached_calibration_stats
+    from agents_crypto.best_signal import TRACKED_TIMEFRAMES
+    from agents_crypto.calibration_lookup import get_cached_calibration_stats, get_calibration_stats
 
     logger = logging.getLogger(__name__)
     while True:
@@ -196,11 +198,18 @@ async def _calibration_warmup_loop() -> None:
                 rows = fetch_latest_scan_per_symbol(conn)
             finally:
                 conn.close()
+            # Every (symbol, timeframe) combination compute_candidates can
+            # surface needs its own warm calibration cache entry, not just
+            # the scan row's flattened reference timeframe -- see
+            # TRACKED_TIMEFRAMES's docstring for why each timeframe is an
+            # independent search.
             stale = [
-                (r["symbol"], r["reference_timeframe"])
+                (r["symbol"], tf)
                 for r in rows
-                if r["trend"] in ("bullish", "bearish")
-                and not get_cached_calibration_stats(r["symbol"], r["reference_timeframe"])
+                for tf in TRACKED_TIMEFRAMES
+                if (tf_snapshot := r.get("snapshot", {}).get("timeframes", {}).get(tf))
+                and tf_snapshot.get("trend") in ("bullish", "bearish")
+                and not get_cached_calibration_stats(r["symbol"], tf)
             ]
             for symbol, timeframe in stale[:_CALIBRATION_WARMUP_BATCH_SIZE]:
                 try:

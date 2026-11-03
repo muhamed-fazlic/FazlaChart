@@ -19,6 +19,12 @@ from scanner.btc_context import BTC_SYMBOL, diverges_from_btc
 BEST_SIGNAL_HORIZON_CANDLES = 12
 BEST_SIGNAL_MIN_SAMPLE_SIZE = 30  # below this, even a high win rate is too noisy to call a real edge
 
+# Every timeframe the scanner snapshots gets its own independent candidate
+# search and its own calibration lookup (never mixed with another
+# timeframe's stats) -- a symbol can be a 1h short AND a 4h long
+# simultaneously, and each is ranked purely against its own track record.
+TRACKED_TIMEFRAMES: tuple[str, ...] = ("5m", "15m", "1h", "4h")
+
 
 def _tag_correlated_exposure(signals: list[dict[str, Any]], btc_trend: str | None) -> None:
     """Mutates ``signals`` in place, attaching a ``correlation`` sub-dict to
@@ -84,21 +90,43 @@ def _age_seconds(iso_timestamp: str) -> float:
     return (datetime.now(UTC) - ts).total_seconds()
 
 
+def _rank_key(candidate: dict[str, Any]) -> tuple[float, float, int]:
+    # Primary: the CI's conservative lower bound (never the raw point
+    # estimate) — see the module docstring. Ties there (rounded to 1
+    # decimal, so distinct symbols land on the same number often) are broken
+    # by the raw win rate, then by sample size, instead of falling back to
+    # whatever order rows happened to come out of the database in.
+    return (candidate["win_rate_ci_low_pct"], candidate["win_rate_pct"], candidate["n"])
+
+
 def compute_candidates(
     rows: list[dict[str, Any]],
     limit: int = 5,
     muted_buckets: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Rank every currently-tracked directional symbol by the conservative
-    (95%-CI lower-bound) win rate of its active calibration label(s), so a
-    lucky small sample can never outrank a well-tested edge, and require a
-    minimum sample size before a label counts as "significant" at all.
+    """Rank every currently-tracked directional (symbol, timeframe) pair by
+    the conservative (95%-CI lower-bound) win rate of its active calibration
+    label(s), so a lucky small sample can never outrank a well-tested edge,
+    and require a minimum sample size before a label counts as
+    "significant" at all.
+
+    Every timeframe in :data:`TRACKED_TIMEFRAMES` is searched and calibrated
+    independently per symbol (see that constant's docstring) — a symbol can
+    surface as, say, a 1h short and a 4h long at the same time, each ranked
+    purely against its own (symbol, timeframe) track record, never a
+    different timeframe's.
 
     ``rows`` is the output of :func:`scanner.storage.fetch_latest_scan_per_symbol`
-    (or an equivalent list of per-symbol scan dicts). Read-only and always
-    fast: it only ever reads whatever's already in the on-disk calibration
-    cache and never triggers a fresh backtest inline — a symbol simply has
-    no entry here until its cache is warm.
+    (or an equivalent list of per-symbol scan dicts) — its full ``snapshot``
+    (every timeframe's trend/anomalies/indicators, not just the flattened
+    reference-timeframe columns) is what gets walked here. Read-only and
+    always fast: it only ever reads whatever's already in the on-disk
+    calibration cache and never triggers a fresh backtest inline — a
+    (symbol, timeframe) pair simply has no entry here until its cache is
+    warm.
+
+    ``limit`` caps how many candidates are kept **per timeframe** (see
+    ``signals_by_timeframe`` below), not overall.
 
     ``muted_buckets``, if given, is a set of ``(timeframe, direction)`` pairs
     that the live calibration-drift detector (see :mod:`scanner.drift_detector`)
@@ -109,10 +137,20 @@ def compute_candidates(
     count of "significant" matches, so the dashboard and the live tracker
     (:func:`scanner.signal_tracking.log_new_signals`) never show or track an
     opportunity this project's own live track record says isn't holding up.
+
+    Returns a dict with:
+    - ``signals``: every surfaced candidate across all timeframes, flattened
+      into one list and sorted by the same conservative ranking (for the
+      live tracker, and any caller that just wants "everything that
+      qualified" regardless of timeframe).
+    - ``signals_by_timeframe``: the same candidates grouped by timeframe,
+      each list independently capped at ``limit`` and sorted the same way —
+      what the dashboard's per-timeframe Top N panel renders.
     """
     if not rows:
         return {
             "signals": [],
+            "signals_by_timeframe": {tf: [] for tf in TRACKED_TIMEFRAMES},
             "generated_at": None,
             "candidates_considered": 0,
             "cache_coverage": None,
@@ -126,113 +164,133 @@ def compute_candidates(
     candidates: list[dict[str, Any]] = []
     considered = 0
     for row in rows:
-        if row["trend"] not in ("bullish", "bearish"):
-            continue
-        considered += 1
-        ref_tf = row["reference_timeframe"]
-        ref = row["snapshot"].get("timeframes", {}).get(ref_tf, {})
-        labels = _active_labels(row["trend"], row["anomalies"])
+        timeframes_snapshot = row.get("snapshot", {}).get("timeframes", {})
+        for tf in TRACKED_TIMEFRAMES:
+            tf_snapshot = timeframes_snapshot.get(tf)
+            if not tf_snapshot:
+                continue  # this cycle's snapshot didn't include this timeframe for this symbol
+            trend = tf_snapshot.get("trend")
+            if trend not in ("bullish", "bearish"):
+                continue
+            considered += 1
+            # Anomalies here come from this timeframe's own (unprefixed)
+            # list, not the flattened/cross-timeframe ``row["anomalies"]``
+            # (which prefixes each entry with its timeframe, e.g.
+            # "1h:failed_breakout") — using the per-timeframe list both
+            # keeps each timeframe's labels scoped to itself AND matches the
+            # unprefixed label format the historical backtest in
+            # scanner.calibration actually trained on, so anomaly-based
+            # labels can match calibration stats at all.
+            labels = _active_labels(trend, tf_snapshot.get("anomalies", []))
 
-        stats = get_cached_calibration_stats(row["symbol"], ref_tf)
-        matches = find_stats_for_labels(stats, labels, BEST_SIGNAL_HORIZON_CANDLES)
-        significant = [
-            m
-            for m in matches
-            if m.direction in ("long", "short")
-            and m.n >= BEST_SIGNAL_MIN_SAMPLE_SIZE
-            and m.win_rate_ci_low_pct is not None
-            and m.win_rate_ci_low_pct > 50.0
-        ]
-        if not significant:
-            continue
-        # Rank by the CI's conservative lower bound, not the point estimate —
-        # rewards both a high win rate AND enough samples to be confident in it.
-        best = max(significant, key=lambda m: m.win_rate_ci_low_pct)
-        if (ref_tf, best.direction) in muted_buckets:
-            continue  # live track record says this bucket isn't holding up -- see muted_buckets docstring above
+            stats = get_cached_calibration_stats(row["symbol"], tf)
+            matches = find_stats_for_labels(stats, labels, BEST_SIGNAL_HORIZON_CANDLES)
+            significant = [
+                m
+                for m in matches
+                if m.direction in ("long", "short")
+                and m.n >= BEST_SIGNAL_MIN_SAMPLE_SIZE
+                and m.win_rate_ci_low_pct is not None
+                and m.win_rate_ci_low_pct > 50.0
+            ]
+            if not significant:
+                continue
+            # Rank by the CI's conservative lower bound, not the point
+            # estimate — rewards both a high win rate AND enough samples to
+            # be confident in it.
+            best = max(significant, key=lambda m: m.win_rate_ci_low_pct)
+            if (tf, best.direction) in muted_buckets:
+                continue  # live track record says this bucket isn't holding up -- see muted_buckets docstring above
 
-        close, atr = row["close_price"], ref.get("atr")
-        entry = None
-        if close and atr:
-            try:
-                levels = compute_risk_levels(
-                    close, atr, best.direction, rsi=ref.get("rsi"), ema20=ref.get("ema20")
-                )
-            except ValueError:
-                levels = None
-            if levels:
-                # A narrow confirmation band around the current price, not a
-                # single exact tick — ATR-sized, biased slightly toward a
-                # pullback/retest entry in the trade direction rather than
-                # chasing the current price outright. If the move already
-                # looks extended (see risk_calc._extension_check), recenter
-                # the zone on the suggested patient/retracement entry instead
-                # of the current (already-stretched) price.
-                band = atr * 0.25
-                zone_center = levels.patient_entry if levels.patient_entry is not None else close
-                zone = (
-                    (zone_center - band, zone_center + band * 0.4)
-                    if best.direction == "long"
-                    else (zone_center - band * 0.4, zone_center + band)
-                )
-                entry = {
-                    "price": round(close, 8),
-                    "entry_zone_low": round(min(zone), 8),
-                    "entry_zone_high": round(max(zone), 8),
-                    "stop_loss": levels.stop_loss,
-                    "take_profit": levels.take_profit,
-                    "take_profit_conservative": levels.take_profit_conservative,
-                    "risk_reward_ratio": levels.risk_reward_ratio,
-                    "volatility_warning": levels.volatility_warning,
-                    "extension_warning": levels.extension_warning,
+            close, atr = tf_snapshot.get("close"), tf_snapshot.get("atr")
+            entry = None
+            if close and atr:
+                try:
+                    levels = compute_risk_levels(
+                        close, atr, best.direction, rsi=tf_snapshot.get("rsi"), ema20=tf_snapshot.get("ema20")
+                    )
+                except ValueError:
+                    levels = None
+                if levels:
+                    # A narrow confirmation band around the current price, not a
+                    # single exact tick — ATR-sized, biased slightly toward a
+                    # pullback/retest entry in the trade direction rather than
+                    # chasing the current price outright. If the move already
+                    # looks extended (see risk_calc._extension_check), recenter
+                    # the zone on the suggested patient/retracement entry instead
+                    # of the current (already-stretched) price.
+                    band = atr * 0.25
+                    zone_center = levels.patient_entry if levels.patient_entry is not None else close
+                    zone = (
+                        (zone_center - band, zone_center + band * 0.4)
+                        if best.direction == "long"
+                        else (zone_center - band * 0.4, zone_center + band)
+                    )
+                    entry = {
+                        "price": round(close, 8),
+                        "entry_zone_low": round(min(zone), 8),
+                        "entry_zone_high": round(max(zone), 8),
+                        "stop_loss": levels.stop_loss,
+                        "take_profit": levels.take_profit,
+                        "take_profit_conservative": levels.take_profit_conservative,
+                        "risk_reward_ratio": levels.risk_reward_ratio,
+                        "volatility_warning": levels.volatility_warning,
+                        "extension_warning": levels.extension_warning,
+                    }
+
+            # Conservative (CI lower-bound) win rate feeds Kelly sizing, same
+            # philosophy as the ranking itself: never let a lucky point estimate
+            # suggest a bigger bet than the evidence actually supports.
+            kelly = compute_kelly_fraction(best.win_rate_ci_low_pct, best.avg_win_return_pct, best.avg_loss_return_pct)
+
+            candidates.append(
+                {
+                    "symbol": row["symbol"],
+                    "timeframe": tf,
+                    "trend": trend,
+                    "label": best.label,
+                    "direction": best.direction,
+                    "n": best.n,
+                    "win_rate_pct": best.win_rate_pct,
+                    "win_rate_ci_low_pct": best.win_rate_ci_low_pct,
+                    "win_rate_ci_high_pct": best.win_rate_ci_high_pct,
+                    "avg_net_return_pct": best.avg_net_return_pct,
+                    "regime": best.regime,
+                    "entry": entry,
+                    "kelly_sizing": {
+                        "recommended_fraction_pct": round(kelly.recommended_fraction * 100, 2),
+                        "full_kelly_fraction_pct": round(kelly.full_kelly_fraction * 100, 2),
+                        "warning": kelly.warning,
+                    },
+                    "scanned_at": row["scanned_at"],
+                    "age_seconds": round(_age_seconds(row["scanned_at"]), 1),
                 }
+            )
 
-        # Conservative (CI lower-bound) win rate feeds Kelly sizing, same
-        # philosophy as the ranking itself: never let a lucky point estimate
-        # suggest a bigger bet than the evidence actually supports.
-        kelly = compute_kelly_fraction(best.win_rate_ci_low_pct, best.avg_win_return_pct, best.avg_loss_return_pct)
-
-        candidates.append(
-            {
-                "symbol": row["symbol"],
-                "timeframe": ref_tf,
-                "trend": row["trend"],
-                "label": best.label,
-                "direction": best.direction,
-                "n": best.n,
-                "win_rate_pct": best.win_rate_pct,
-                "win_rate_ci_low_pct": best.win_rate_ci_low_pct,
-                "win_rate_ci_high_pct": best.win_rate_ci_high_pct,
-                "avg_net_return_pct": best.avg_net_return_pct,
-                "regime": best.regime,
-                "entry": entry,
-                "kelly_sizing": {
-                    "recommended_fraction_pct": round(kelly.recommended_fraction * 100, 2),
-                    "full_kelly_fraction_pct": round(kelly.full_kelly_fraction * 100, 2),
-                    "warning": kelly.warning,
-                },
-                "scanned_at": row["scanned_at"],
-                "age_seconds": round(_age_seconds(row["scanned_at"]), 1),
-            }
-        )
-
-    # Primary sort: the CI's conservative lower bound (never the raw point
-    # estimate) — see the module docstring. Ties there (rounded to 1 decimal,
-    # so distinct symbols land on the same number often) are broken by the
-    # raw win rate, then by sample size, instead of falling back to whatever
-    # order rows happened to come out of the database in.
-    candidates.sort(
-        key=lambda c: (c["win_rate_ci_low_pct"], c["win_rate_pct"], c["n"]),
-        reverse=True,
-    )
     generated_at = max(r["scanned_at"] for r in rows)
-    top_signals = candidates[: max(1, limit)]
+
+    # Group by timeframe first, rank + cap each group independently at
+    # `limit`, then flatten back into one globally-ranked list -- so a
+    # timeframe with fewer qualifying candidates never gets crowded out by
+    # another timeframe having more.
+    by_timeframe: dict[str, list[dict[str, Any]]] = {tf: [] for tf in TRACKED_TIMEFRAMES}
+    for c in candidates:
+        by_timeframe[c["timeframe"]].append(c)
+
+    signals_by_timeframe: dict[str, list[dict[str, Any]]] = {}
+    flattened: list[dict[str, Any]] = []
+    for tf in TRACKED_TIMEFRAMES:
+        ranked = sorted(by_timeframe[tf], key=_rank_key, reverse=True)[: max(1, limit)]
+        signals_by_timeframe[tf] = ranked
+        flattened.extend(ranked)
+    flattened.sort(key=_rank_key, reverse=True)
 
     btc_row = next((r for r in rows if r["symbol"] == BTC_SYMBOL), None)
-    _tag_correlated_exposure(top_signals, btc_row["trend"] if btc_row else None)
+    _tag_correlated_exposure(flattened, btc_row["trend"] if btc_row else None)
 
     return {
-        "signals": top_signals,
+        "signals": flattened,
+        "signals_by_timeframe": signals_by_timeframe,
         "generated_at": generated_at,
         "candidates_considered": considered,
         "cache_coverage": f"{len(candidates)}/{considered}",

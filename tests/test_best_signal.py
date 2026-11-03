@@ -51,6 +51,21 @@ def _row(symbol: str, trend: str, scanned_at: str = "2026-01-01T00:00:00+00:00")
     }
 
 
+def _multi_tf_row(symbol: str, trend_by_tf: dict[str, str], scanned_at: str = "2026-01-01T00:00:00+00:00") -> dict:
+    """A row whose snapshot carries a different trend per timeframe --
+    exercises the multi-timeframe candidate search directly, instead of
+    every timeframe collapsing to the one flattened ``trend`` field."""
+    return {
+        "symbol": symbol,
+        "scanned_at": scanned_at,
+        "reference_timeframe": "1h",
+        "close_price": 100.0,
+        "trend": trend_by_tf.get("1h", "neutral"),
+        "anomalies": [],
+        "snapshot": {"timeframes": {tf: {"trend": trend, "close": 100.0} for tf, trend in trend_by_tf.items()}},
+    }
+
+
 def test_two_bearish_altcoins_aligned_with_bearish_btc_are_flagged_correlated():
     rows = [_row("BTCUSDT", "bearish"), _row("AAAUSDT", "bearish"), _row("BBBUSDT", "bearish")]
     with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
@@ -137,3 +152,80 @@ def test_different_directions_are_never_grouped_together():
 
     assert len(result["signals"]) == 2
     assert all(sig["correlation"] is None for sig in result["signals"])
+
+
+class TestMultiTimeframe:
+    """A symbol can qualify on more than one timeframe at once -- each
+    timeframe is searched and calibrated independently of the others."""
+
+    def test_one_symbol_qualifying_on_two_timeframes_surfaces_both(self):
+        rows = [_multi_tf_row("AAAUSDT", {"1h": "bearish", "4h": "bullish"})]
+
+        def _stats(_symbol, timeframe):
+            return [_STRONG_SHORT] if timeframe == "1h" else [_STRONG_LONG]
+
+        with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", side_effect=_stats):
+            result = compute_candidates(rows, limit=5)
+
+        by_tf = {sig["timeframe"]: sig for sig in result["signals"]}
+        assert set(by_tf) == {"1h", "4h"}
+        assert by_tf["1h"]["direction"] == "short"
+        assert by_tf["4h"]["direction"] == "long"
+
+    def test_signals_by_timeframe_groups_each_timeframe_independently(self):
+        rows = [
+            _multi_tf_row("AAAUSDT", {"1h": "bearish"}),
+            _multi_tf_row("BBBUSDT", {"4h": "bearish"}),
+        ]
+        with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+            result = compute_candidates(rows, limit=5)
+
+        assert [s["symbol"] for s in result["signals_by_timeframe"]["1h"]] == ["AAAUSDT"]
+        assert [s["symbol"] for s in result["signals_by_timeframe"]["4h"]] == ["BBBUSDT"]
+        assert result["signals_by_timeframe"]["5m"] == []
+        assert result["signals_by_timeframe"]["15m"] == []
+
+    def test_limit_caps_each_timeframe_independently_not_the_overall_total(self):
+        rows = [
+            _multi_tf_row("AAAUSDT", {"1h": "bearish", "4h": "bearish"}),
+            _multi_tf_row("BBBUSDT", {"1h": "bearish", "4h": "bearish"}),
+            _multi_tf_row("CCCUSDT", {"1h": "bearish", "4h": "bearish"}),
+        ]
+        with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+            result = compute_candidates(rows, limit=2)
+
+        assert len(result["signals_by_timeframe"]["1h"]) == 2
+        assert len(result["signals_by_timeframe"]["4h"]) == 2
+        assert len(result["signals"]) == 4  # 2 per timeframe x 2 timeframes, not capped at 2 overall
+
+    def test_muting_one_timeframes_bucket_does_not_affect_another_timeframe(self):
+        rows = [_multi_tf_row("AAAUSDT", {"1h": "bearish", "4h": "bearish"})]
+        with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+            result = compute_candidates(rows, limit=5, muted_buckets={("1h", "short")})
+
+        assert result["signals_by_timeframe"]["1h"] == []
+        assert [s["timeframe"] for s in result["signals_by_timeframe"]["4h"]] == ["4h"]
+
+    def test_anomaly_label_is_looked_up_per_timeframe_unprefixed(self):
+        """Each timeframe's own anomaly list (unprefixed) must be used to
+        build labels, not the flattened cross-timeframe list (which would be
+        prefixed like "1h:failed_breakout" and could never match a
+        calibration label such as "anomaly:failed_breakout")."""
+        row = _multi_tf_row("AAAUSDT", {"1h": "bearish"})
+        row["snapshot"]["timeframes"]["1h"]["anomalies"] = ["failed_breakout"]
+        row["anomalies"] = ["1h:failed_breakout"]  # flattened/prefixed -- must be ignored for label-building
+
+        seen_labels = {}
+
+        def _find_stats(_stats, labels, _horizon):
+            seen_labels["labels"] = labels
+            return [_STRONG_SHORT]
+
+        with (
+            patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]),
+            patch("agents_crypto.calibration_lookup.find_stats_for_labels", side_effect=_find_stats),
+        ):
+            compute_candidates([row], limit=5)
+
+        assert "anomaly:failed_breakout" in seen_labels["labels"]
+        assert "anomaly:1h:failed_breakout" not in seen_labels["labels"]

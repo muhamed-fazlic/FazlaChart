@@ -46,11 +46,13 @@ logger = logging.getLogger(__name__)
 TIMEFRAME_MINUTES: dict[str, int] = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
 
 # How many of the Top Signal Now panel's ranked candidates to actually track
-# to an outcome. Deliberately a bit wider than the panel's own default
-# display limit (5) so a symbol that qualifies but narrowly misses the
-# visible shortlist is still tracked, without trying to track every
-# marginally-significant match across the whole universe.
-DEFAULT_TRACKING_LIMIT = 10
+# to an outcome, **per timeframe** (see ``agents_crypto.best_signal.TRACKED_TIMEFRAMES``
+# and ``compute_candidates``'s ``limit`` parameter) -- matches the dashboard's
+# own per-timeframe display limit exactly, so this tracks precisely what a
+# user would have seen on the dashboard at that moment, on every timeframe,
+# not a subtly different (and much larger, now that there are 4 independent
+# timeframes instead of 1) recomputation.
+DEFAULT_TRACKING_LIMIT = 5
 
 
 def log_new_signals(
@@ -124,9 +126,17 @@ def resolve_open_signals(conn: Any, rows: list[dict[str, Any]]) -> int:
     resolved = 0
     for outcome in fetch_open_signal_outcomes(conn):
         current = rows_by_symbol.get(outcome["symbol"])
-        if current is None or current["reference_timeframe"] != outcome["timeframe"]:
-            continue  # symbol dropped out of rotation this cycle, or timeframe mismatch -- wait for it to come back
-        close = current["close_price"]
+        if current is None:
+            continue  # symbol dropped out of rotation this cycle -- wait for it to come back
+        # Each tracked signal carries its own timeframe (5m/15m/1h/4h, not
+        # just the scan row's flattened reference timeframe) -- resolve it
+        # against *that* timeframe's own close price from the full
+        # snapshot, never the flattened one, so a 4h signal is never
+        # (mis)resolved against a 1h close.
+        tf_snapshot = current.get("snapshot", {}).get("timeframes", {}).get(outcome["timeframe"])
+        if tf_snapshot is None or tf_snapshot.get("close") is None:
+            continue  # this cycle's snapshot doesn't carry the outcome's own timeframe yet -- wait for it
+        close = tf_snapshot["close"]
         direction, stop_loss, take_profit = outcome["direction"], outcome["stop_loss"], outcome["take_profit"]
 
         if direction == "long":

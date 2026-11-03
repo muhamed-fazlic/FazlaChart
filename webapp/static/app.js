@@ -52,6 +52,17 @@ function renderBtcBanner(btc) {
 // here if its active label's calibration win rate clears 50% at the 95%
 // confidence interval's conservative lower bound with n>=30 (see
 // /api/scan/best-signal) — never a raw point estimate, never a guess.
+// Every timeframe (5m/15m/1h/4h) is ranked and calibrated independently, so
+// this renders as one tab per timeframe rather than one blended list.
+
+const BEST_SIGNAL_TIMEFRAMES = ["5m", "15m", "1h", "4h"];
+const BEST_SIGNAL_TIMEFRAME_LABELS = {
+  "5m": "5m · Scalp",
+  "15m": "15m · Short-term",
+  "1h": "1h · Intraday",
+  "4h": "4h · Swing",
+};
+let activeBestSignalTimeframe = "1h";
 
 function winRateRangeHtml(low, high) {
   if (low === null || low === undefined || high === null || high === undefined) return "";
@@ -97,22 +108,50 @@ function bestSignalCardHtml(sig, rank) {
     </div>`;
 }
 
+function bestSignalTabsHtml(signalsByTimeframe) {
+  return BEST_SIGNAL_TIMEFRAMES.map((tf) => {
+    const count = (signalsByTimeframe[tf] || []).length;
+    const activeClass = tf === activeBestSignalTimeframe ? " best-signal-tab-active" : "";
+    return `<button type="button" class="best-signal-tab${activeClass}" data-tf="${tf}">${BEST_SIGNAL_TIMEFRAME_LABELS[tf]} (${count})</button>`;
+  }).join("");
+}
+
 function renderBestSignalPanel(data) {
   const el = document.getElementById("best-signal-panel");
-  if (!data || !data.signals || !data.signals.length) {
+  const byTimeframe = (data && data.signals_by_timeframe) || {};
+  const totalSignals = Object.values(byTimeframe).reduce((sum, list) => sum + list.length, 0);
+  if (!data || !totalSignals) {
     el.className = "best-signal-panel muted";
     el.innerHTML = data && data.candidates_considered
-      ? `Nema trenutno statistički potvrđenog signala (pregledano ${data.candidates_considered} coina sa trendom, ` +
-        `keš kalibracije spreman za ${data.cache_coverage || "0/0"}). Keš se puni u pozadini — pokušajte opet za koji minut.`
+      ? `Nema trenutno statistički potvrđenog signala ni na jednom timeframe-u (pregledano ${data.candidates_considered} ` +
+        `kombinacija coin+timeframe sa trendom, keš kalibracije spreman za ${data.cache_coverage || "0/0"}). Keš se puni ` +
+        "u pozadini — pokušajte opet za koji minut."
       : "Nema podataka još — sačekajte da skener i keš kalibracije završe prvi ciklus.";
     return;
   }
   el.className = "best-signal-panel";
-  const [top, ...rest] = data.signals;
+  // Never land the user on a tab that's currently empty if another one has signals.
+  if (!(byTimeframe[activeBestSignalTimeframe] || []).length) {
+    activeBestSignalTimeframe = BEST_SIGNAL_TIMEFRAMES.find((tf) => (byTimeframe[tf] || []).length) || activeBestSignalTimeframe;
+  }
+  const signals = byTimeframe[activeBestSignalTimeframe] || [];
+  const [top, ...rest] = signals;
+  const bodyHtml = signals.length
+    ? bestSignalCardHtml(top, 0) +
+      (rest.length ? `<div class="best-signal-runners">${rest.map((s, i) => bestSignalCardHtml(s, i + 1)).join("")}</div>` : "")
+    : `<div class="muted best-signal-empty-tf">Nema statistički potvrđenog signala na ${activeBestSignalTimeframe} timeframe-u trenutno.</div>`;
+
   el.innerHTML =
-    `<div class="best-signal-title">🎯 Top signal sada — statistički potvrđen (n≥30, donja granica 95% CI &gt; 50%)</div>` +
-    bestSignalCardHtml(top, 0) +
-    (rest.length ? `<div class="best-signal-runners">${rest.map((s, i) => bestSignalCardHtml(s, i + 1)).join("")}</div>` : "");
+    `<div class="best-signal-title">🎯 Top signal sada — statistički potvrđen (n≥30, donja granica 95% CI &gt; 50%), odvojeno po timeframe-u</div>` +
+    `<div class="best-signal-tabs">${bestSignalTabsHtml(byTimeframe)}</div>` +
+    bodyHtml;
+
+  el.querySelectorAll(".best-signal-tab").forEach((tabEl) => {
+    tabEl.addEventListener("click", () => {
+      activeBestSignalTimeframe = tabEl.dataset.tf;
+      renderBestSignalPanel(data);
+    });
+  });
   el.querySelectorAll(".best-signal-card").forEach((cardEl) => {
     cardEl.addEventListener("click", () => {
       document.getElementById("symbol-filter-input").value = cardEl.dataset.symbol;
@@ -123,7 +162,7 @@ function renderBestSignalPanel(data) {
 
 async function loadBestSignal() {
   try {
-    const res = await fetch("/api/scan/best-signal?limit=4");
+    const res = await fetch("/api/scan/best-signal?limit=5");
     const data = await res.json();
     renderBestSignalPanel(data);
   } catch (err) {

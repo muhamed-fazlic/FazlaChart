@@ -18,13 +18,15 @@ from scanner.storage import fetch_recent_signal_outcomes, init_db, save_scan_res
 pytestmark = pytest.mark.unit
 
 
-def _snapshot(symbol: str, trend: str, close: float, atr: float = 0.2) -> dict:
+def _snapshot(symbol: str, trend: str, close: float, atr: float = 0.2, timeframe: str = "1h") -> dict:
+    """Single-timeframe snapshot for the common-case tests below. For
+    multi-timeframe scenarios see ``_multi_tf_snapshot``."""
     return {
         "symbol": symbol,
         "timeframes": {
-            "1h": {
+            timeframe: {
                 "symbol": symbol,
-                "timeframe": "1h",
+                "timeframe": timeframe,
                 "trend": trend,
                 "close": close,
                 "atr": atr,
@@ -33,6 +35,30 @@ def _snapshot(symbol: str, trend: str, close: float, atr: float = 0.2) -> dict:
                 "ema50": close,
                 "anomalies": [],
             },
+        },
+        "derivatives": {},
+    }
+
+
+def _multi_tf_snapshot(symbol: str, closes_by_tf: dict[str, float], trend: str = "bearish", atr: float = 0.2) -> dict:
+    """A snapshot carrying several timeframes at once, each with its own
+    close price -- used to prove a tracked signal resolves against its own
+    timeframe's close, not whichever timeframe happens to be first/default."""
+    return {
+        "symbol": symbol,
+        "timeframes": {
+            tf: {
+                "symbol": symbol,
+                "timeframe": tf,
+                "trend": trend,
+                "close": close,
+                "atr": atr,
+                "rsi": 45.0,
+                "ema20": close,
+                "ema50": close,
+                "anomalies": [],
+            }
+            for tf, close in closes_by_tf.items()
         },
         "derivatives": {},
     }
@@ -134,6 +160,24 @@ class TestResolveOpenSignals:
         updated = fetch_recent_signal_outcomes(conn)[0]
         assert updated["status"] == "take_profit"
         assert updated["realized_return_pct"] > 0  # a short that hit its target nets a profit, net of cost
+
+    def test_resolves_a_4h_signal_using_the_4h_close_not_the_1h_close(self, conn):
+        # Both timeframes qualify (same mocked calibration match for any
+        # timeframe) -- only the 4h close moves here, proving resolution
+        # looks up the outcome's own timeframe's close, not the 1h one.
+        save_scan_result(conn, "INJUSDT", _multi_tf_snapshot("INJUSDT", {"1h": 10.0, "4h": 10.0}), [])
+        log_new_signals(conn, _rows(conn))
+        outcomes = {o["timeframe"]: o for o in fetch_recent_signal_outcomes(conn)}
+        assert set(outcomes) == {"1h", "4h"}
+        take_profit_4h = outcomes["4h"]["take_profit"]
+
+        save_scan_result(conn, "INJUSDT", _multi_tf_snapshot("INJUSDT", {"1h": 10.0, "4h": take_profit_4h - 0.01}), [])
+        resolved = resolve_open_signals(conn, _rows(conn))
+
+        assert resolved == 1
+        updated = {o["timeframe"]: o for o in fetch_recent_signal_outcomes(conn)}
+        assert updated["4h"]["status"] == "take_profit"
+        assert updated["1h"]["status"] == "open"  # unchanged 1h close -- that signal must stay open
 
     def test_resolves_stop_loss_when_price_reaches_stop(self, conn):
         save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])

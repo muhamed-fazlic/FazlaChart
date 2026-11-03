@@ -595,6 +595,40 @@ footer {
   font-size: 13px;
 }
 
+.best-signal-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.best-signal-tab {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.best-signal-tab:hover {
+  border-color: var(--blue);
+  color: var(--text);
+}
+
+.best-signal-tab-active {
+  border-color: var(--blue);
+  background: rgba(88, 166, 255, 0.12);
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.best-signal-empty-tf {
+  font-size: 13px;
+  padding: 4px 0;
+}
+
 .best-signal-card {
   border: 1px solid var(--border);
   border-radius: 6px;
