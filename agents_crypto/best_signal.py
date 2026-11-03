@@ -17,13 +17,33 @@ from typing import Any
 from scanner.btc_context import BTC_SYMBOL, diverges_from_btc
 
 BEST_SIGNAL_HORIZON_CANDLES = 12
-BEST_SIGNAL_MIN_SAMPLE_SIZE = 30  # below this, even a high win rate is too noisy to call a real edge
 
 # Every timeframe the scanner snapshots gets its own independent candidate
 # search and its own calibration lookup (never mixed with another
 # timeframe's stats) -- a symbol can be a 1h short AND a 4h long
 # simultaneously, and each is ranked purely against its own track record.
 TRACKED_TIMEFRAMES: tuple[str, ...] = ("5m", "15m", "1h", "4h")
+
+# Below this many backtest cases, even a high win rate is too noisy to call a
+# real edge -- but "enough" isn't the same number on every timeframe. The
+# backtest always walks the same fixed ~1500-candle window (see
+# ``scanner.calibration.backtest_symbol``), so a slower timeframe spans far
+# more calendar time per case (1500 4h candles is ~250 days vs. ~5 days for
+# 1500 5m candles): its label occurrences are rarer but each one reflects a
+# more distinct, less autocorrelated market situation, while a fast
+# timeframe's cases are noisier and more clustered in time, so the same raw
+# count buys less real statistical confidence. 1h keeps the original bar (30)
+# unchanged -- that's the one timeframe this project already had a live
+# track record against before the multi-timeframe engine shipped.
+BEST_SIGNAL_MIN_SAMPLE_SIZE: dict[str, int] = {
+    "5m": 40,
+    "15m": 35,
+    "1h": 30,
+    "4h": 20,
+}
+# Fallback for any timeframe not explicitly listed above (shouldn't happen
+# for anything in TRACKED_TIMEFRAMES, but keeps lookups total).
+_DEFAULT_MIN_SAMPLE_SIZE = 30
 
 
 def _tag_correlated_exposure(signals: list[dict[str, Any]], btc_trend: str | None) -> None:
@@ -185,11 +205,12 @@ def compute_candidates(
 
             stats = get_cached_calibration_stats(row["symbol"], tf)
             matches = find_stats_for_labels(stats, labels, BEST_SIGNAL_HORIZON_CANDLES)
+            min_n = BEST_SIGNAL_MIN_SAMPLE_SIZE.get(tf, _DEFAULT_MIN_SAMPLE_SIZE)
             significant = [
                 m
                 for m in matches
                 if m.direction in ("long", "short")
-                and m.n >= BEST_SIGNAL_MIN_SAMPLE_SIZE
+                and m.n >= min_n
                 and m.win_rate_ci_low_pct is not None
                 and m.win_rate_ci_low_pct > 50.0
             ]

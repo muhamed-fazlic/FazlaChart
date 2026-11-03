@@ -31,6 +31,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from agents_crypto.best_signal import _DEFAULT_MIN_SAMPLE_SIZE, BEST_SIGNAL_MIN_SAMPLE_SIZE
 from scanner.storage import (
     fetch_active_muted_bucket,
     fetch_all_active_muted_buckets,
@@ -42,16 +43,32 @@ from scanner.storage import (
 
 logger = logging.getLogger(__name__)
 
-# Mirrors agents_crypto.best_signal.BEST_SIGNAL_MIN_SAMPLE_SIZE -- the same
-# "don't trust a win rate below this many samples" bar the rest of the
-# project already uses, applied here to *resolved live* signals instead of
-# backtest cases.
-MIN_RESOLVED_FOR_DRIFT_CHECK = 30
+# Reuses agents_crypto.best_signal.BEST_SIGNAL_MIN_SAMPLE_SIZE -- the same
+# per-timeframe "don't trust a win rate below this many samples" bar the
+# rest of the project already uses, applied here to *resolved live*
+# signals instead of backtest cases. It matters just as much here: a
+# resolved signal takes ``BEST_SIGNAL_HORIZON_CANDLES`` candles to close,
+# so a 4h bucket accumulates live evidence ~48x slower than a 5m one --
+# requiring the same flat count on both would mean a 4h bucket virtually
+# never reaches enough history to ever be checked for drift at all, while
+# a 5m bucket (noisier per-case, but resolving fast) still deserves the
+# higher bar it gets in the backtest-case table.
+
+
+def _min_resolved_for_check(timeframe: str) -> int:
+    return BEST_SIGNAL_MIN_SAMPLE_SIZE.get(timeframe, _DEFAULT_MIN_SAMPLE_SIZE)
+
+
+# Backward-compatible alias for the 1h bar specifically (unchanged from the
+# original flat threshold) -- kept for any caller/test that only ever
+# exercised the 1h bucket and doesn't need the full per-timeframe table.
+MIN_RESOLVED_FOR_DRIFT_CHECK = BEST_SIGNAL_MIN_SAMPLE_SIZE["1h"]
 
 # How many of the most recently resolved signals per bucket to judge by --
 # a rolling window, not all-time history, so a bucket that was bad months
 # ago but has since recovered reads as recovered.
 DRIFT_WINDOW_SIZE = 60
+
 
 # Realized win rate must fall at least this many percentage points short of
 # the average promised (CI-low) win rate to count as "drifted" and trigger
@@ -82,11 +99,11 @@ class BucketDriftStats:
 
 def compute_bucket_drift(conn: Any, timeframe: str, direction: str) -> BucketDriftStats | None:
     """Realized vs. promised win rate for one bucket's rolling recent
-    window of resolved signals. Returns ``None`` if fewer than
-    :data:`MIN_RESOLVED_FOR_DRIFT_CHECK` are available yet -- too little
-    live evidence to judge either way."""
+    window of resolved signals. Returns ``None`` if fewer than this
+    timeframe's minimum (see :func:`_min_resolved_for_check`) are available
+    yet -- too little live evidence to judge either way."""
     resolved = fetch_resolved_outcomes_by_bucket(conn, timeframe, direction, limit=DRIFT_WINDOW_SIZE)
-    if len(resolved) < MIN_RESOLVED_FOR_DRIFT_CHECK:
+    if len(resolved) < _min_resolved_for_check(timeframe):
         return None
 
     wins = sum(1 for r in resolved if (r["realized_return_pct"] or 0.0) > 0.0)
