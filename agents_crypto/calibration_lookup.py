@@ -22,11 +22,12 @@ process rather than just appearing to.
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from threading import Lock
+from threading import Lock, get_ident
 from typing import Any
 
 from scanner.calibration import CalibrationStats, OutOfSampleResult, backtest_symbol, summarize, validate_out_of_sample
@@ -93,9 +94,32 @@ def _load_cache(cache_path: str) -> dict[str, Any]:
 
 
 def _save_cache(cache_path: str, cache: dict[str, Any]) -> None:
+    """Writes atomically (temp file + rename) so a crash or an overlapping
+    writer mid-write can never leave a half-written/corrupt JSON file on
+    disk -- a reader always sees either the old or the new content, never a
+    partial mix of both."""
     path = Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, indent=2))
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp-{os.getpid()}-{get_ident()}")
+    tmp_path.write_text(json.dumps(cache, indent=2))
+    tmp_path.replace(path)
+
+
+# Guards the read-modify-write cycle below: _load_cache + mutate + _save_cache
+# is not safe for concurrent callers on its own -- two threads both reading
+# the same on-disk snapshot, merging in their own entry, and saving would
+# have the second save silently clobber the first's update (and, without the
+# atomic rename above, could even interleave into corrupt JSON). Scoped to
+# the save step only (not the whole function) so cache-hit reads stay fast
+# and unlocked; only writers need to serialize.
+_cache_io_lock = Lock()
+
+
+def _update_cache_entry(cache_path: str, key: str, entry: dict[str, Any]) -> None:
+    with _cache_io_lock:
+        cache = _load_cache(cache_path)
+        cache[key] = entry
+        _save_cache(cache_path, cache)
 
 
 def get_calibration_stats(
@@ -138,11 +162,14 @@ def get_calibration_stats(
     else:
         regime_stats = _run_backtest(symbol, timeframe, horizons)
 
-    cache[key] = {
-        "computed_at": time.time(),
-        "stats": {rk: [asdict(s) for s in rows] for rk, rows in regime_stats.items()},
-    }
-    _save_cache(cache_path, cache)
+    _update_cache_entry(
+        cache_path,
+        key,
+        {
+            "computed_at": time.time(),
+            "stats": {rk: [asdict(s) for s in rows] for rk, rows in regime_stats.items()},
+        },
+    )
     return regime_stats.get(regime_key, [])
 
 
