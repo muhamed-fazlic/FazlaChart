@@ -99,7 +99,7 @@ async def _warm_up_llm_client_stack() -> None:
 
 
 _CALIBRATION_WARMUP_BATCH_SIZE = 2  # matches calibration_lookup's backtest-worker-process cap
-_CALIBRATION_WARMUP_INTERVAL_SECONDS = 20
+_CALIBRATION_WARMUP_INTERVAL_SECONDS = 3
 
 
 @app.on_event("startup")
@@ -183,6 +183,7 @@ async def _health_watchdog_loop() -> None:
 
 
 async def _calibration_warmup_loop() -> None:
+    import asyncio
     import logging
 
     import anyio
@@ -191,6 +192,17 @@ async def _calibration_warmup_loop() -> None:
     from agents_crypto.calibration_lookup import get_cached_calibration_stats, get_calibration_stats
 
     logger = logging.getLogger(__name__)
+
+    async def _warm_one(symbol: str, timeframe: str) -> None:
+        try:
+            await anyio.to_thread.run_sync(
+                lambda: get_calibration_stats(
+                    symbol, timeframe, horizons=(_BEST_SIGNAL_HORIZON_CANDLES,), use_process=True
+                )
+            )
+        except Exception:
+            logger.warning("Calibration warm-up failed for %s/%s", symbol, timeframe, exc_info=True)
+
     while True:
         try:
             conn = _get_conn()
@@ -211,15 +223,14 @@ async def _calibration_warmup_loop() -> None:
                 and tf_snapshot.get("trend") in ("bullish", "bearish")
                 and not get_cached_calibration_stats(r["symbol"], tf)
             ]
-            for symbol, timeframe in stale[:_CALIBRATION_WARMUP_BATCH_SIZE]:
-                try:
-                    await anyio.to_thread.run_sync(
-                        lambda s=symbol, tf=timeframe: get_calibration_stats(
-                            s, tf, horizons=(_BEST_SIGNAL_HORIZON_CANDLES,), use_process=True
-                        )
-                    )
-                except Exception:
-                    logger.warning("Calibration warm-up failed for %s/%s", symbol, timeframe, exc_info=True)
+            # Dispatch the whole batch concurrently instead of awaiting one
+            # pair at a time -- the shared ProcessPoolExecutor already caps
+            # real parallelism at _MAX_BACKTEST_WORKERS, so gathering here
+            # costs nothing extra but keeps that pool actually busy instead
+            # of sitting half-idle waiting on a strictly sequential loop.
+            await asyncio.gather(
+                *(_warm_one(symbol, tf) for symbol, tf in stale[:_CALIBRATION_WARMUP_BATCH_SIZE])
+            )
         except Exception:
             logger.warning("Calibration warm-up cycle failed", exc_info=True)
         await anyio.sleep(_CALIBRATION_WARMUP_INTERVAL_SECONDS)
