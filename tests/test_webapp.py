@@ -690,7 +690,14 @@ def test_forward_tracking_by_bucket_groups_resolved_outcomes_by_timeframe_and_di
     assert bucket["timeframe"] == "1h"
     assert bucket["direction"] == "short"
     assert bucket["resolved_count"] == 2
-    assert bucket["by_status"] == {"take_profit": 1, "stop_loss": 1, "timeout": 0}
+    assert bucket["by_status"] == {
+        "take_profit": 1,
+        "stop_loss": 1,
+        "timeout": 0,
+        "tp1_be": 0,
+        "tp2_be": 0,
+        "full_run": 0,
+    }
     assert bucket["win_rate_pct"] == 50.0
     assert bucket["avg_net_return_pct"] == 0.2
     assert bucket["avg_promised_win_rate_ci_low_pct"] == 60.0

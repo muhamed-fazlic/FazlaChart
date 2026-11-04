@@ -30,12 +30,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agents_crypto.best_signal import BEST_SIGNAL_HORIZON_CANDLES, compute_candidates
+from agents_crypto.risk_calc import TP1_WEIGHT, TP2_WEIGHT, TP3_WEIGHT
 from scanner.calibration import DEFAULT_ROUND_TRIP_COST_PCT
 from scanner.storage import (
     fetch_open_signal_outcome,
     fetch_open_signal_outcomes,
     log_signal_outcome,
     resolve_signal_outcome,
+    update_signal_outcome_progress,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,16 @@ logger = logging.getLogger(__name__)
 # "horizon_candles" into a wall-clock timeout for resolving a signal that
 # never hit its stop or target.
 TIMEFRAME_MINUTES: dict[str, int] = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
+
+# Timeframes managed through three partial targets (TP1/TP2/TP3, see
+# agents_crypto.risk_calc) instead of one single exit -- currently just 4h,
+# the only timeframe above 1h this scanner tracks; a longer-running signal's
+# moves tend to run further, so locking in profit progressively (rather than
+# one all-or-nothing target) captures more of that without giving back a
+# banked gain. Extend this set if/when a 1d or 1w timeframe is added.
+MULTI_TARGET_TIMEFRAMES: frozenset[str] = frozenset({"4h"})
+
+_TP_WEIGHTS = (TP1_WEIGHT, TP2_WEIGHT, TP3_WEIGHT)
 
 # How many of the Top Signal Now panel's ranked candidates to actually track
 # to an outcome, **per timeframe** (see ``agents_crypto.best_signal.TRACKED_TIMEFRAMES``
@@ -105,6 +117,8 @@ def log_new_signals(
             pattern=candidate.get("pattern"),
             quality_score=(candidate.get("quality_score") or {}).get("total"),
             regime_fallback=candidate.get("regime_fallback"),
+            take_profit_extended=entry.get("take_profit_extended"),
+            multi_target=timeframe in MULTI_TARGET_TIMEFRAMES,
         )
         logged += 1
         if on_new_signal is not None:
@@ -121,10 +135,140 @@ def _net_return_pct(direction: str, entry_price: float, exit_price: float) -> fl
     return directed - DEFAULT_ROUND_TRIP_COST_PCT
 
 
+def _weighted_net_return_pct(direction: str, entry_price: float, legs: list[tuple[float, float]]) -> float:
+    """Net return across several partial closes of the same position, each
+    its own ``(weight, exit_price)`` -- weights should sum to ~1.0. Applies
+    the round-trip cost per leg (proportional to that leg's weight), so the
+    total cost drag across all legs still equals one full round trip's
+    worth, just realistically distributed across each partial exit."""
+    total = 0.0
+    for weight, exit_price in legs:
+        raw_pct = (exit_price - entry_price) / entry_price * 100.0
+        directed = raw_pct if direction == "long" else -raw_pct
+        total += weight * (directed - DEFAULT_ROUND_TRIP_COST_PCT)
+    return total
+
+
+def _timeout_status(outcome: dict[str, Any]) -> str | None:
+    minutes_per_candle = TIMEFRAME_MINUTES.get(outcome["timeframe"], 60)
+    horizon_minutes = outcome["horizon_candles"] * minutes_per_candle
+    logged_at = datetime.fromisoformat(outcome["logged_at"])
+    elapsed_minutes = (datetime.now(UTC) - logged_at).total_seconds() / 60.0
+    return "timeout" if elapsed_minutes >= horizon_minutes else None
+
+
+def _resolve_single_target_signal(conn: Any, outcome: dict[str, Any], close: float) -> int:
+    """Original one-target resolution: hit the stop, hit the target, or
+    time out -- unchanged behaviour for timeframes not in
+    MULTI_TARGET_TIMEFRAMES."""
+    direction, stop_loss, take_profit = outcome["direction"], outcome["stop_loss"], outcome["take_profit"]
+    if direction == "long":
+        sl_hit, tp_hit = close <= stop_loss, close >= take_profit
+    else:
+        sl_hit, tp_hit = close >= stop_loss, close <= take_profit
+
+    status: str | None = None
+    if sl_hit:  # conservative: a stop touch always wins a same-cycle tie against a target touch
+        status = "stop_loss"
+    elif tp_hit:
+        status = "take_profit"
+    else:
+        status = _timeout_status(outcome)
+
+    if status is None:
+        return 0
+    net_return = _net_return_pct(direction, outcome["entry_price"], close)
+    resolve_signal_outcome(conn, outcome["id"], status, close, net_return)
+    return 1
+
+
+def _effective_stop_for(targets_hit: int, entry_price: float, stop_loss: float, tp1_price: float) -> float:
+    """Where the stop sits after N targets have been banked: untouched
+    until TP1, breakeven (entry) after TP1, trailed up to the TP1 price
+    itself after TP2 -- so a pullback after TP2 can never give back more
+    than the TP1 leg already banked."""
+    if targets_hit <= 0:
+        return stop_loss
+    if targets_hit == 1:
+        return entry_price
+    return tp1_price
+
+
+def _partial_close_net_return_pct(
+    direction: str, entry_price: float, targets: list[float], targets_hit: int, remainder_exit_price: float
+) -> float:
+    """Weighted return for a multi-target trade ending (via its moved stop
+    or a horizon timeout) after ``targets_hit`` of its three targets were
+    already banked -- the banked legs count at their own target price, and
+    whatever size is still open counts at ``remainder_exit_price``."""
+    legs = [(_TP_WEIGHTS[i], targets[i]) for i in range(targets_hit)]
+    remaining_weight = 1.0 - sum(weight for weight, _ in legs)
+    legs.append((remaining_weight, remainder_exit_price))
+    return _weighted_net_return_pct(direction, entry_price, legs)
+
+
+def _resolve_multi_target_signal(conn: Any, outcome: dict[str, Any], close: float) -> int:
+    """TP1/TP2/TP3 partial-close resolution (see
+    agents_crypto.risk_calc.TP1_WEIGHT/TP2_WEIGHT/TP3_WEIGHT and
+    MULTI_TARGET_TIMEFRAMES above). A target banked this cycle only moves
+    the stop and keeps the trade open (returns 0, not resolved) -- the
+    trade only actually resolves once its (moved) stop is hit, all three
+    targets are banked, or the horizon times out."""
+    direction = outcome["direction"]
+    entry_price = outcome["entry_price"]
+    stop_loss = outcome["stop_loss"]
+    targets_hit = outcome.get("targets_hit") or 0
+    effective_stop = outcome.get("effective_stop_loss")
+    if effective_stop is None:
+        effective_stop = stop_loss
+    targets = [outcome["take_profit_conservative"], outcome["take_profit"], outcome["take_profit_extended"]]
+
+    stop_hit = close <= effective_stop if direction == "long" else close >= effective_stop
+    if stop_hit:
+        status = {0: "stop_loss", 1: "tp1_be", 2: "tp2_be"}[targets_hit]
+        net_return = _partial_close_net_return_pct(direction, entry_price, targets, targets_hit, close)
+        resolve_signal_outcome(conn, outcome["id"], status, close, net_return)
+        return 1
+
+    # Bank every target reached this cycle (possibly more than one, if a
+    # fast move jumped past an intermediate level between scan cycles).
+    new_targets_hit = targets_hit
+    while new_targets_hit < 3:
+        next_target = targets[new_targets_hit]
+        reached = close >= next_target if direction == "long" else close <= next_target
+        if not reached:
+            break
+        new_targets_hit += 1
+
+    if new_targets_hit == 3:
+        legs = list(zip(_TP_WEIGHTS, targets, strict=False))
+        net_return = _weighted_net_return_pct(direction, entry_price, legs)
+        resolve_signal_outcome(conn, outcome["id"], "full_run", targets[-1], net_return)
+        return 1
+
+    if new_targets_hit != targets_hit:
+        new_effective_stop = _effective_stop_for(new_targets_hit, entry_price, stop_loss, targets[0])
+        update_signal_outcome_progress(
+            conn, outcome["id"], targets_hit=new_targets_hit, effective_stop_loss=new_effective_stop
+        )
+        return 0  # stop just moved -- trade stays open, not a resolution
+
+    status = _timeout_status(outcome)
+    if status is None:
+        return 0
+    net_return = _partial_close_net_return_pct(direction, entry_price, targets, targets_hit, close)
+    resolve_signal_outcome(conn, outcome["id"], status, close, net_return)
+    return 1
+
+
 def resolve_open_signals(conn: Any, rows: list[dict[str, Any]]) -> int:
     """Check every open tracked signal against this cycle's latest scan
     data and resolve any that have hit their stop, their target, or run out
-    of horizon time. Returns how many were resolved this cycle."""
+    of horizon time. Returns how many were resolved this cycle.
+
+    Multi-target signals (see MULTI_TARGET_TIMEFRAMES) are handled
+    separately: banking a target without hitting the (moved) stop doesn't
+    resolve the trade, it just updates its progress and keeps it open."""
     rows_by_symbol = {row["symbol"]: row for row in rows}
     resolved = 0
     for outcome in fetch_open_signal_outcomes(conn):
@@ -140,30 +284,10 @@ def resolve_open_signals(conn: Any, rows: list[dict[str, Any]]) -> int:
         if tf_snapshot is None or tf_snapshot.get("close") is None:
             continue  # this cycle's snapshot doesn't carry the outcome's own timeframe yet -- wait for it
         close = tf_snapshot["close"]
-        direction, stop_loss, take_profit = outcome["direction"], outcome["stop_loss"], outcome["take_profit"]
 
-        if direction == "long":
-            sl_hit, tp_hit = close <= stop_loss, close >= take_profit
+        if outcome.get("multi_target"):
+            resolved += _resolve_multi_target_signal(conn, outcome, close)
         else:
-            sl_hit, tp_hit = close >= stop_loss, close <= take_profit
-
-        status: str | None = None
-        if sl_hit:  # conservative: a stop touch always wins a same-cycle tie against a target touch
-            status = "stop_loss"
-        elif tp_hit:
-            status = "take_profit"
-        else:
-            minutes_per_candle = TIMEFRAME_MINUTES.get(outcome["timeframe"], 60)
-            horizon_minutes = outcome["horizon_candles"] * minutes_per_candle
-            logged_at = datetime.fromisoformat(outcome["logged_at"])
-            elapsed_minutes = (datetime.now(UTC) - logged_at).total_seconds() / 60.0
-            if elapsed_minutes >= horizon_minutes:
-                status = "timeout"
-
-        if status is None:
-            continue
-
-        net_return = _net_return_pct(direction, outcome["entry_price"], close)
-        resolve_signal_outcome(conn, outcome["id"], status, close, net_return)
-        resolved += 1
+            resolved += _resolve_single_target_signal(conn, outcome, close)
     return resolved
+

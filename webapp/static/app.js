@@ -88,14 +88,23 @@ function winRateRangeHtml(low, high) {
 function bestSignalEntryHtml(sig) {
   if (!sig.entry) return "";
   const kelly = sig.kelly_sizing;
+  const e = sig.entry;
+  // 4h candidates are managed as multi-target trades (TP1/TP2/TP3, stop to
+  // breakeven after TP1) — show all three so the plan matches how it will
+  // actually be tracked, instead of just the single TP a 1h/15m trade gets.
+  const isMultiTarget = sig.timeframe === "4h" && e.take_profit_extended !== undefined && e.take_profit_extended !== null;
+  const tpHtml = isMultiTarget
+    ? `<span>TP1: ${fmtPrice(e.take_profit_conservative)} (40%) · TP2: ${fmtPrice(e.take_profit)} (35%) · TP3: ${fmtPrice(e.take_profit_extended)} (25%)</span>`
+    : `<span>TP: ${fmtPrice(e.take_profit)}${e.take_profit_conservative !== undefined && e.take_profit_conservative !== null ? ` <span class="muted">(konzervativan: ${fmtPrice(e.take_profit_conservative)})</span>` : ""}</span>`;
   return `
     <div class="best-signal-entry">
-      <span>Entry zona: <b>${fmtPrice(sig.entry.entry_zone_low)}–${fmtPrice(sig.entry.entry_zone_high)}</b></span>
-      <span>SL: ${fmtPrice(sig.entry.stop_loss)}</span>
-      <span>TP: ${fmtPrice(sig.entry.take_profit)}${sig.entry.take_profit_conservative !== undefined && sig.entry.take_profit_conservative !== null ? ` <span class="muted">(konzervativan: ${fmtPrice(sig.entry.take_profit_conservative)})</span>` : ""}</span>
-      <span>R:R ${fmt(sig.entry.risk_reward_ratio, 2)}</span>
+      <span>Entry zona: <b>${fmtPrice(e.entry_zone_low)}–${fmtPrice(e.entry_zone_high)}</b></span>
+      <span>SL: ${fmtPrice(e.stop_loss)}</span>
+      ${tpHtml}
+      <span>R:R ${fmt(e.risk_reward_ratio, 2)}</span>
       ${kelly ? `<span>💰 Kelly: <b>${fmt(kelly.recommended_fraction_pct, 1)}%</b> kapitala</span>` : ""}
     </div>
+    ${isMultiTarget ? `<div class="best-signal-note">🎯 Nakon TP1 stop ide na breakeven, nakon TP2 na cijenu TP1 — trejd se broji pozitivnim i ako se kasnije zatvori na pomjerenom stopu.</div>` : ""}
     ${sig.entry.extension_warning ? `<div class="best-signal-warning">⏳ ${sig.entry.extension_warning}</div>` : ""}
     ${sig.entry.volatility_warning ? `<div class="best-signal-warning">⚠️ ${sig.entry.volatility_warning}</div>` : ""}
     ${kelly && kelly.warning ? `<div class="best-signal-warning">💰 ${kelly.warning}</div>` : ""}`;
@@ -248,7 +257,7 @@ function renderForwardTrackingPanel(data, driftStatus) {
   el.innerHTML =
     `<div class="forward-tracking-title">📡 Praćenje uživo (obećano vs. stvarno)</div>` +
     `<div class="forward-tracking-stats">` +
-    `<span>Zatvoreno: <b>${data.resolved_count}</b> (TP ${byStatus.take_profit || 0} · SL ${byStatus.stop_loss || 0} · timeout ${byStatus.timeout || 0})</span>` +
+    `<span>Zatvoreno: <b>${data.resolved_count}</b> (${statusBreakdownText(byStatus)})</span>` +
     `<span>U toku: <b>${data.open_count}</b></span>` +
     `<span>Stvarni win rate: <b>${fmt(realized, 1)}%</b></span>` +
     `<span>Obećana donja granica (prosjek): <b>${fmt(promised, 1)}%</b></span>` +
@@ -312,11 +321,36 @@ const STATUS_LABELS = {
   take_profit: "TP",
   stop_loss: "SL",
   timeout: "Timeout",
+  tp1_be: "TP1→BE",
+  tp2_be: "TP2→BE",
+  full_run: "Full run",
 };
 
 function statusBadgeHtml(status) {
   const label = STATUS_LABELS[status] || status;
   return `<span class="status-badge status-${status}">${label}</span>`;
+}
+
+// Small "2/3" progress badge shown next to the status badge for still-open
+// multi-target (4h) trades that have already banked at least one target --
+// lets a user see at a glance that a trade is trailing on a moved stop
+// rather than sitting at its original risk.
+function multiTargetProgressHtml(t) {
+  if (!t.multi_target || t.status !== "open" || !t.targets_hit) return "";
+  return ` <span class="muted">(${t.targets_hit}/3 targets)</span>`;
+}
+
+// Shared "(TP x · TP1→BE y · SL z · timeout w)" breakdown string, used by
+// every summary/bucket card. Builds from whatever non-open statuses are
+// present in a fixed, readable order instead of hardcoding each status in
+// every call site — so adding a new status (e.g. a future TP4) only means
+// adding it to STATUS_LABELS and this order list, not every render spot.
+const STATUS_BREAKDOWN_ORDER = ["take_profit", "full_run", "tp2_be", "tp1_be", "stop_loss", "timeout"];
+
+function statusBreakdownText(byStatus) {
+  return STATUS_BREAKDOWN_ORDER.filter((s) => (byStatus[s] || 0) > 0)
+    .map((s) => `${STATUS_LABELS[s]} ${byStatus[s]}`)
+    .join(" · ");
 }
 
 function fmtDateTime(iso) {
@@ -371,6 +405,9 @@ function renderTradesSummary(summary, trades) {
       <div class="trades-summary-card"><span class="label">Ukupno trejdova</span><span class="value">${summary.open_count + summary.resolved_count}</span></div>
       <div class="trades-summary-card"><span class="label">U toku</span><span class="value">${summary.open_count}</span></div>
       <div class="trades-summary-card"><span class="label">Take profit</span><span class="value pos">${byStatus.take_profit || 0}</span></div>
+      <div class="trades-summary-card"><span class="label">Full run (TP1+TP2+TP3)</span><span class="value pos">${byStatus.full_run || 0}</span></div>
+      <div class="trades-summary-card"><span class="label">TP2 → BE</span><span class="value pos">${byStatus.tp2_be || 0}</span></div>
+      <div class="trades-summary-card"><span class="label">TP1 → BE</span><span class="value pos">${byStatus.tp1_be || 0}</span></div>
       <div class="trades-summary-card"><span class="label">Stop loss</span><span class="value neg">${byStatus.stop_loss || 0}</span></div>
       <div class="trades-summary-card"><span class="label">Timeout</span><span class="value">${byStatus.timeout || 0}</span></div>
       <div class="trades-summary-card"><span class="label">Stvarni win rate</span><span class="value">${fmt(summary.realized_win_rate_pct, 1)}%</span></div>
@@ -397,7 +434,7 @@ function renderTradesTable(trades) {
       <td data-label="Pattern">${patternBadgeHtml(t.pattern) || "—"}</td>
       <td data-label="Kvalitet">${tradeQualityBadgeHtml(t.quality_score)}</td>
       <td data-label="Regime">${tradeRegimeBadgeHtml(t.regime, t.regime_fallback)}</td>
-      <td data-label="Status">${statusBadgeHtml(t.status)}</td>
+      <td data-label="Status">${statusBadgeHtml(t.status)}${multiTargetProgressHtml(t)}</td>
       <td data-label="Entry">${fmtPrice(t.entry_price)}</td>
       <td data-label="SL">${fmtPrice(t.stop_loss)}</td>
       <td data-label="TP">${fmtPrice(t.take_profit)}</td>
@@ -429,7 +466,7 @@ function renderBucketBreakdown(buckets) {
     <tr>
       <td><b>${b.timeframe}</b></td>
       <td class="${dirClass}">${dirWord}</td>
-      <td>${b.resolved_count} <span class="muted">(TP ${b.by_status.take_profit || 0} · SL ${b.by_status.stop_loss || 0} · timeout ${b.by_status.timeout || 0})</span></td>
+      <td>${b.resolved_count} <span class="muted">(${statusBreakdownText(b.by_status)})</span></td>
       <td>${fmt(b.win_rate_pct, 1)}%</td>
       <td class="${netClass}">${b.avg_net_return_pct !== null ? fmt(b.avg_net_return_pct, 2) + "%" : "—"}</td>
       <td>${fmt(b.avg_promised_win_rate_ci_low_pct, 1)}%</td>
@@ -458,7 +495,7 @@ function _breakdownRowHtml(leadingCells, stats) {
   return `
     <tr>
       ${leadingCells}
-      <td>${stats.resolved_count} <span class="muted">(TP ${byStatus.take_profit || 0} · SL ${byStatus.stop_loss || 0} · timeout ${byStatus.timeout || 0})</span></td>
+      <td>${stats.resolved_count} <span class="muted">(${statusBreakdownText(byStatus)})</span></td>
       <td>${fmt(stats.win_rate_pct, 1)}%</td>
       <td class="${netClass}">${stats.avg_net_return_pct !== null ? fmt(stats.avg_net_return_pct, 2) + "%" : "—"}</td>
       <td>${fmt(stats.avg_promised_win_rate_ci_low_pct, 1)}%</td>

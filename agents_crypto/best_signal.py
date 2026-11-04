@@ -290,6 +290,7 @@ def compute_candidates(
                         "stop_loss": levels.stop_loss,
                         "take_profit": levels.take_profit,
                         "take_profit_conservative": levels.take_profit_conservative,
+                        "take_profit_extended": levels.take_profit_extended,
                         "risk_reward_ratio": levels.risk_reward_ratio,
                         "volatility_warning": levels.volatility_warning,
                         "extension_warning": levels.extension_warning,

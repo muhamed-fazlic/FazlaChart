@@ -63,7 +63,18 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     -- actually realize a better win rate", not just assumed.
     pattern TEXT,
     quality_score REAL,
-    regime_fallback INTEGER
+    regime_fallback INTEGER,
+    -- Multi-target (TP1/TP2/TP3) partial-close management for timeframes
+    -- whose moves run further/longer (see signal_tracking.MULTI_TARGET_TIMEFRAMES).
+    -- take_profit_conservative/take_profit double as TP1/TP2; this column
+    -- adds TP3. targets_hit (0-3) and effective_stop_loss track live
+    -- progress: 0/original SL, 1/breakeven after TP1, 2/TP1 price after TP2
+    -- -- so a trade that banks TP1 then gets stopped at breakeven is
+    -- recorded as the partial win it is, not lumped in with a straight loss.
+    take_profit_extended REAL,
+    multi_target INTEGER NOT NULL DEFAULT 0,
+    targets_hit INTEGER NOT NULL DEFAULT 0,
+    effective_stop_loss REAL
 );
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_status ON signal_outcomes (status);
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol_open ON signal_outcomes (symbol, timeframe, direction, status);
@@ -127,6 +138,14 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signal_outcomes ADD COLUMN quality_score REAL")
     if "regime_fallback" not in columns:
         conn.execute("ALTER TABLE signal_outcomes ADD COLUMN regime_fallback INTEGER")
+    if "take_profit_extended" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN take_profit_extended REAL")
+    if "multi_target" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN multi_target INTEGER NOT NULL DEFAULT 0")
+    if "targets_hit" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN targets_hit INTEGER NOT NULL DEFAULT 0")
+    if "effective_stop_loss" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN effective_stop_loss REAL")
 
 
 def connect_for_reads(storage_path: str, timeout: float = 10.0) -> sqlite3.Connection:
@@ -298,19 +317,28 @@ def log_signal_outcome(
     pattern: str | None = None,
     quality_score: float | None = None,
     regime_fallback: bool | None = None,
+    take_profit_extended: float | None = None,
+    multi_target: bool = False,
 ) -> None:
     """Record one new live signal to track to its outcome. Callers are
     responsible for not calling this twice for the same still-open trade
     (see :func:`fetch_open_signal_outcome`) — this function itself has no
-    dedup logic, it just inserts."""
+    dedup logic, it just inserts.
+
+    ``multi_target=True`` (set by the caller for timeframes in
+    ``signal_tracking.MULTI_TARGET_TIMEFRAMES``) manages the trade through
+    TP1/TP2/TP3 partial closes instead of one single exit --
+    ``effective_stop_loss`` starts equal to ``stop_loss`` and moves as each
+    target is banked (see ``signal_tracking.resolve_open_signals``)."""
     conn.execute(
         """
         INSERT INTO signal_outcomes (
             symbol, timeframe, direction, label, logged_at, entry_price,
             stop_loss, take_profit, take_profit_conservative,
             promised_win_rate_pct, promised_win_rate_ci_low_pct, promised_n,
-            horizon_candles, status, regime, pattern, quality_score, regime_fallback
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+            horizon_candles, status, regime, pattern, quality_score, regime_fallback,
+            take_profit_extended, multi_target, targets_hit, effective_stop_loss
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, 0, ?)
         """,
         (
             symbol,
@@ -330,7 +358,25 @@ def log_signal_outcome(
             pattern,
             quality_score,
             None if regime_fallback is None else int(regime_fallback),
+            take_profit_extended,
+            int(multi_target),
+            stop_loss,
         ),
+    )
+    conn.commit()
+
+
+def update_signal_outcome_progress(
+    conn: sqlite3.Connection, outcome_id: int, *, targets_hit: int, effective_stop_loss: float
+) -> None:
+    """Persist multi-target partial-close progress without resolving the
+    trade -- called when a TP1/TP2 is banked (see
+    ``signal_tracking.resolve_open_signals``) so the next scan cycle checks
+    the moved stop and the next un-banked target, and the trade stays
+    ``open`` until the final target or the (now moved) stop is hit."""
+    conn.execute(
+        "UPDATE signal_outcomes SET targets_hit = ?, effective_stop_loss = ? WHERE id = ?",
+        (targets_hit, effective_stop_loss, outcome_id),
     )
     conn.commit()
 

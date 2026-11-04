@@ -555,7 +555,7 @@ def _bucket_stats(items: list[dict[str, Any]]) -> dict[str, Any]:
     avg_net = round(sum(net_returns) / len(net_returns), 2) if net_returns else None
     avg_promised = round(sum(promised) / len(promised), 1) if promised else None
     gap = round(win_rate - avg_promised, 1) if win_rate is not None and avg_promised is not None else None
-    by_status = {"take_profit": 0, "stop_loss": 0, "timeout": 0}
+    by_status = {"take_profit": 0, "stop_loss": 0, "timeout": 0, "tp1_be": 0, "tp2_be": 0, "full_run": 0}
     for o in items:
         by_status[o["status"]] = by_status.get(o["status"], 0) + 1
     return {
@@ -608,7 +608,7 @@ def forward_tracking_summary(
 
     open_count = sum(1 for o in outcomes if o["status"] == "open")
     resolved = [o for o in outcomes if o["status"] != "open"]
-    by_status = {"take_profit": 0, "stop_loss": 0, "timeout": 0}
+    by_status = {"take_profit": 0, "stop_loss": 0, "timeout": 0, "tp1_be": 0, "tp2_be": 0, "full_run": 0}
     for o in resolved:
         by_status[o["status"]] = by_status.get(o["status"], 0) + 1
 
@@ -650,9 +650,12 @@ def forward_tracking_trades(
     (timeframe, direction) bucket.
 
     ``status``, if given, filters to one of ``open``, ``take_profit``,
-    ``stop_loss``, or ``timeout``. Unknown values are ignored (no filter
-    applied) rather than erroring, since this is a convenience filter, not
-    a strict API contract.
+    ``stop_loss``, ``timeout``, or -- for multi-target (4h) signals, see
+    ``scanner.signal_tracking.MULTI_TARGET_TIMEFRAMES`` -- ``tp1_be``
+    (TP1 banked, then stopped at breakeven), ``tp2_be`` (TP1+TP2 banked,
+    then stopped at the TP1 price) or ``full_run`` (all three targets hit).
+    Unknown values are ignored (no filter applied) rather than erroring,
+    since this is a convenience filter, not a strict API contract.
 
     ``range``/``since``/``until`` filter to a time window on ``logged_at``
     (when the trade was opened) — see ``_resolve_time_range``."""
@@ -663,7 +666,7 @@ def forward_tracking_trades(
     finally:
         conn.close()
 
-    valid_statuses = {"open", "take_profit", "stop_loss", "timeout"}
+    valid_statuses = {"open", "take_profit", "stop_loss", "timeout", "tp1_be", "tp2_be", "full_run"}
     if status in valid_statuses:
         outcomes = [o for o in outcomes if o["status"] == status]
 

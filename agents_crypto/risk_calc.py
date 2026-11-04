@@ -33,6 +33,25 @@ ELEVATED_VOLATILITY_RISK_PCT = 4.0
 # actually fillable) far more often in practice than the full stretch target.
 CONSERVATIVE_TP_FRACTION = 0.75
 
+# Extended third target: for timeframes whose moves tend to run further and
+# for longer (currently 4h -- see signal_tracking.MULTI_TARGET_TIMEFRAMES),
+# a trade is managed with three partial targets instead of one single exit.
+# TP1 = take_profit_conservative (the existing 0.75x target), TP2 =
+# take_profit (the existing full 1.0x target), TP3 = this extra "let it run"
+# target for genuine trend continuation. Multiplies the *full* tp_distance,
+# same reference point as CONSERVATIVE_TP_FRACTION above.
+EXTENDED_TP_FRACTION = 1.6
+
+# Position-size weights for the three-target management scheme above:
+# front-loaded on purpose -- bank the easy/likely target first to eliminate
+# downside risk on most of the size, then let progressively smaller
+# fractions ride for the less-likely-but-bigger continuation targets. Must
+# sum to 1.0 (checked by tests, not enforced at runtime since these are
+# fixed module constants, not user input).
+TP1_WEIGHT = 0.40
+TP2_WEIGHT = 0.35
+TP3_WEIGHT = 0.25
+
 # "Already extended" detection: entering a short after RSI is already deep
 # in oversold territory (or a long after it's deep in overbought) means
 # chasing a move that is statistically more likely to see a relief bounce
@@ -63,6 +82,10 @@ class RiskLevels:
     volatility_warning: str | None = None
     # Nearer, more-likely-to-actually-fill target (see CONSERVATIVE_TP_FRACTION).
     take_profit_conservative: float | None = None
+    # "Let it run" third target for the 3-target management scheme (see
+    # EXTENDED_TP_FRACTION) -- only meaningful for timeframes that actually
+    # use it; harmless to compute and ignore otherwise.
+    take_profit_extended: float | None = None
     # Set when price looks already extended away from its short-term mean in
     # the trade's direction (see OVEREXTENDED_* constants above).
     extension_warning: str | None = None
@@ -258,6 +281,7 @@ def compute_risk_levels(
         )
 
     take_profit_conservative = round(close + (take_profit - close) * CONSERVATIVE_TP_FRACTION, 8)
+    take_profit_extended = round(close + (take_profit - close) * EXTENDED_TP_FRACTION, 8)
     extension_warning, patient_entry = _extension_check(close, atr, bias, rsi, ema20)
 
     return RiskLevels(
@@ -272,6 +296,7 @@ def compute_risk_levels(
         tp_atr_multiplier=tp_atr_multiplier,
         volatility_warning=volatility_warning,
         take_profit_conservative=take_profit_conservative,
+        take_profit_extended=take_profit_extended,
         extension_warning=extension_warning,
         patient_entry=patient_entry,
     )

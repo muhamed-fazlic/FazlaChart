@@ -177,18 +177,22 @@ class TestResolveOpenSignals:
         # Both timeframes qualify (same mocked calibration match for any
         # timeframe) -- only the 4h close moves here, proving resolution
         # looks up the outcome's own timeframe's close, not the 1h one.
+        # 4h is multi-target (see MULTI_TARGET_TIMEFRAMES) so driving the
+        # close straight past TP3 is what fully resolves it in one step.
         save_scan_result(conn, "INJUSDT", _multi_tf_snapshot("INJUSDT", {"1h": 10.0, "4h": 10.0}), [])
         log_new_signals(conn, _rows(conn))
         outcomes = {o["timeframe"]: o for o in fetch_recent_signal_outcomes(conn)}
         assert set(outcomes) == {"1h", "4h"}
-        take_profit_4h = outcomes["4h"]["take_profit"]
+        take_profit_extended_4h = outcomes["4h"]["take_profit_extended"]
 
-        save_scan_result(conn, "INJUSDT", _multi_tf_snapshot("INJUSDT", {"1h": 10.0, "4h": take_profit_4h - 0.01}), [])
+        save_scan_result(
+            conn, "INJUSDT", _multi_tf_snapshot("INJUSDT", {"1h": 10.0, "4h": take_profit_extended_4h - 0.01}), []
+        )
         resolved = resolve_open_signals(conn, _rows(conn))
 
         assert resolved == 1
         updated = {o["timeframe"]: o for o in fetch_recent_signal_outcomes(conn)}
-        assert updated["4h"]["status"] == "take_profit"
+        assert updated["4h"]["status"] == "full_run"
         assert updated["1h"]["status"] == "open"  # unchanged 1h close -- that signal must stay open
 
     def test_resolves_stop_loss_when_price_reaches_stop(self, conn):
@@ -239,6 +243,136 @@ class TestResolveOpenSignals:
         assert fetch_recent_signal_outcomes(conn)[0]["status"] == "open"
 
 
+class TestMultiTargetResolution:
+    """4h signals are managed through TP1/TP2/TP3 partial closes instead of
+    one single exit (see signal_tracking.MULTI_TARGET_TIMEFRAMES) -- banking
+    a target moves the stop and keeps the trade open; it only resolves once
+    the (moved) stop is hit, all three targets bank, or the horizon times
+    out."""
+
+    def _log_4h_short(self, conn):
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="4h"), [])
+        log_new_signals(conn, _rows(conn))
+        return fetch_recent_signal_outcomes(conn)[0]
+
+    def test_logs_a_4h_signal_as_multi_target_with_an_extended_third_target(self, conn):
+        outcome = self._log_4h_short(conn)
+        assert outcome["multi_target"] == 1
+        assert outcome["targets_hit"] == 0
+        assert outcome["effective_stop_loss"] == outcome["stop_loss"]
+        assert outcome["take_profit_extended"] is not None
+        # TP3 (extended) should be further from entry than TP2 (take_profit)
+        # for a short -- i.e. a lower price.
+        assert outcome["take_profit_extended"] < outcome["take_profit"]
+
+    def test_banking_tp1_moves_the_stop_to_breakeven_and_keeps_the_trade_open(self, conn):
+        outcome = self._log_4h_short(conn)
+        tp1 = outcome["take_profit_conservative"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1 - 0.01, timeframe="4h"), [])
+        resolved = resolve_open_signals(conn, _rows(conn))
+
+        assert resolved == 0  # progress only -- not a final resolution
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "open"
+        assert updated["targets_hit"] == 1
+        assert updated["effective_stop_loss"] == updated["entry_price"]
+
+    def test_stopped_at_breakeven_after_tp1_resolves_as_tp1_be_with_a_net_positive_return(self, conn):
+        outcome = self._log_4h_short(conn)
+        tp1 = outcome["take_profit_conservative"]
+        entry = outcome["entry_price"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1 - 0.01, timeframe="4h"), [])
+        resolve_open_signals(conn, _rows(conn))  # banks TP1, moves stop to breakeven
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", entry, timeframe="4h"), [])
+        resolved = resolve_open_signals(conn, _rows(conn))
+
+        assert resolved == 1
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "tp1_be"
+        # 40% banked a real profit at TP1, 60% closed flat at breakeven --
+        # net should still be positive (not treated as a straight loss).
+        assert updated["realized_return_pct"] > 0
+
+    def test_banking_tp1_then_tp2_trails_the_stop_to_the_tp1_price(self, conn):
+        outcome = self._log_4h_short(conn)
+        tp1, tp2 = outcome["take_profit_conservative"], outcome["take_profit"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1 - 0.01, timeframe="4h"), [])
+        resolve_open_signals(conn, _rows(conn))  # banks TP1
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp2 - 0.01, timeframe="4h"), [])
+        resolved = resolve_open_signals(conn, _rows(conn))
+
+        assert resolved == 0
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "open"
+        assert updated["targets_hit"] == 2
+        assert updated["effective_stop_loss"] == pytest.approx(tp1)
+
+    def test_pullback_to_tp1_level_after_tp2_resolves_as_tp2_be(self, conn):
+        outcome = self._log_4h_short(conn)
+        tp1, tp2 = outcome["take_profit_conservative"], outcome["take_profit"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1 - 0.01, timeframe="4h"), [])
+        resolve_open_signals(conn, _rows(conn))  # banks TP1
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp2 - 0.01, timeframe="4h"), [])
+        resolve_open_signals(conn, _rows(conn))  # banks TP2, trails stop to TP1
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1, timeframe="4h"), [])
+        resolved = resolve_open_signals(conn, _rows(conn))
+
+        assert resolved == 1
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "tp2_be"
+        assert updated["realized_return_pct"] > 0
+
+    def test_a_single_cycle_jump_past_all_three_targets_resolves_as_full_run(self, conn):
+        outcome = self._log_4h_short(conn)
+        tp3 = outcome["take_profit_extended"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp3 - 0.01, timeframe="4h"), [])
+        resolved = resolve_open_signals(conn, _rows(conn))
+
+        assert resolved == 1
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "full_run"
+        assert updated["realized_return_pct"] > 0
+
+    def test_stop_loss_before_any_target_resolves_exactly_like_a_single_target_signal(self, conn):
+        outcome = self._log_4h_short(conn)
+        stop_loss = outcome["stop_loss"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", stop_loss + 0.01, timeframe="4h"), [])
+        resolved = resolve_open_signals(conn, _rows(conn))
+
+        assert resolved == 1
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "stop_loss"
+        assert updated["realized_return_pct"] < 0
+
+    def test_timeout_with_tp1_banked_marks_the_remainder_at_the_current_close(self, conn):
+        outcome = self._log_4h_short(conn)
+        tp1 = outcome["take_profit_conservative"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1 - 0.01, timeframe="4h"), [])
+        resolve_open_signals(conn, _rows(conn))  # banks TP1
+
+        stale_time = (datetime.now(UTC) - timedelta(hours=60)).isoformat()
+        conn.execute("UPDATE signal_outcomes SET logged_at = ?", (stale_time,))
+        conn.commit()
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1, timeframe="4h"), [])  # unchanged
+        resolved = resolve_open_signals(conn, _rows(conn))
+
+        assert resolved == 1
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "timeout"
+        assert updated["realized_return_pct"] > 0  # TP1's banked profit still counts toward the final return
+
+
 class TestNetReturnPct:
     def test_long_profits_when_price_rises(self):
         assert _net_return_pct("long", 100.0, 110.0) == pytest.approx(10.0 - 0.10)
@@ -248,3 +382,4 @@ class TestNetReturnPct:
 
     def test_long_loses_when_price_falls(self):
         assert _net_return_pct("long", 100.0, 95.0) == pytest.approx(-5.0 - 0.10)
+

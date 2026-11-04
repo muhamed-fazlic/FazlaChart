@@ -77,6 +77,22 @@ def test_take_profit_conservative_sits_between_entry_and_take_profit():
     assert levels_short.take_profit < levels_short.take_profit_conservative < levels_short.entry
 
 
+def test_take_profit_extended_sits_beyond_take_profit():
+    # TP3 (the 3-target management scheme's "let it run" target) should ask
+    # for more of the move than TP2 (take_profit), same direction.
+    levels = compute_risk_levels(close=100.0, atr=2.0, bias="long")
+    assert levels.take_profit < levels.take_profit_extended
+
+    levels_short = compute_risk_levels(close=100.0, atr=2.0, bias="short")
+    assert levels_short.take_profit_extended < levels_short.take_profit
+
+
+def test_tp_weights_sum_to_one():
+    from agents_crypto.risk_calc import TP1_WEIGHT, TP2_WEIGHT, TP3_WEIGHT
+
+    assert pytest.approx(1.0) == TP1_WEIGHT + TP2_WEIGHT + TP3_WEIGHT
+
+
 def test_no_extension_warning_without_rsi_or_ema20():
     levels = compute_risk_levels(close=100.0, atr=2.0, bias="short")
     assert levels.extension_warning is None
