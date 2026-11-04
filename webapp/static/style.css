@@ -202,6 +202,41 @@ h1 .subtitle {
   letter-spacing: 0.03em;
 }
 
+.backtest-disclaimer {
+  margin: 10px 20px 0;
+  padding: 10px 16px;
+  border: 1px solid var(--blue);
+  border-radius: 8px;
+  background: rgba(88, 166, 255, 0.1);
+  color: var(--text);
+  font-size: 13px;
+  flex: 0 0 auto;
+}
+
+.backtest-meta {
+  margin: 10px 20px 0;
+  padding: 0 16px;
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+.backtest-equity-curve {
+  margin: 0 20px 10px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  flex: 0 0 auto;
+  font-size: 13px;
+}
+
+.backtest-equity-curve svg {
+  display: block;
+  width: 100%;
+  height: 140px;
+}
+
+
 .trades-filter-bar {
   display: flex;
   gap: 6px;

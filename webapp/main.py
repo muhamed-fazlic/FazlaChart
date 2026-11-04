@@ -16,6 +16,7 @@ calls the Derivatives/Risk agent (live Binance snapshot + local LLM).
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -267,6 +268,15 @@ def _storage_path() -> str:
 
 def _btc_symbol() -> str:
     return os.environ.get("SCANNER_BTC_SYMBOL", "BTCUSDT")
+
+
+def _backtest_report_path() -> str:
+    """Read lazily so tests can point this at a throwaway file via the
+    BACKTEST_REPORT_PATH env var — mirrors ``_storage_path()``'s convention.
+    This file is written on demand by
+    ``python -m scanner.backtesting.portfolio_backtest --report-json ...``;
+    it is NOT regenerated automatically by this webapp process."""
+    return os.environ.get("BACKTEST_REPORT_PATH", "scanner_data/portfolio_backtest_report.json")
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -588,6 +598,32 @@ def drift_status() -> dict[str, Any]:
     finally:
         conn.close()
     return {"muted_buckets": muted, "count": len(muted)}
+
+
+@app.get("/api/backtest/report")
+def backtest_report() -> dict[str, Any]:
+    """Reads the cached retrospective portfolio-backtest report (Phase 8
+    Korak 2 — see PHASE8_PROFITABILITY_RESEARCH_TODO.md) for the "🧪
+    Backtest" tab. This is a **counterfactual simulation** replayed over
+    history, not a live result — deliberately kept separate from
+    ``/api/forward-tracking/*`` (which tracks real signals the live system
+    actually surfaced). The report file is generated on demand by
+    ``python -m scanner.backtesting.portfolio_backtest --report-json ...``
+    (a multi-minute job that fetches klines over the network), never by
+    this request handler, since the VPS has no spare CPU/network budget to
+    run it inline on every page load.
+
+    Returns ``{"available": False}`` rather than a 404/500 if no report has
+    been generated yet, so the frontend can render a friendly empty state."""
+    path = Path(_backtest_report_path())
+    if not path.exists():
+        return {"available": False}
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read backtest report: {exc}") from None
+    report["available"] = True
+    return report
 
 
 @app.get("/api/forward-tracking/summary")

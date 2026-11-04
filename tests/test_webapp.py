@@ -393,6 +393,30 @@ def test_drift_status_reports_no_muted_buckets_by_default(client):
     assert body == {"muted_buckets": [], "count": 0}
 
 
+def test_backtest_report_reports_unavailable_when_no_file_exists(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKTEST_REPORT_PATH", str(tmp_path / "no_such_report.json"))
+    resp = client.get("/api/backtest/report")
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False}
+
+
+def test_backtest_report_returns_cached_file_contents(client, tmp_path, monkeypatch):
+    import json
+
+    report_path = tmp_path / "portfolio_backtest_report.json"
+    report_path.write_text(
+        json.dumps({"generated_at": "2026-01-01T00:00:00+00:00", "metrics": {"n_trades": 42}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BACKTEST_REPORT_PATH", str(report_path))
+
+    resp = client.get("/api/backtest/report")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["metrics"]["n_trades"] == 42
+
+
 def test_best_signal_excludes_a_muted_bucket(client, monkeypatch):
     from scanner.calibration import CalibrationStats
     from scanner.storage import init_db, mute_bucket

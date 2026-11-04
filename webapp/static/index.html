@@ -27,6 +27,7 @@
   <nav class="tab-bar">
     <button type="button" class="tab-btn active" data-tab="scanner">📡 Scanner</button>
     <button type="button" class="tab-btn" data-tab="trades">📊 Analitika trejdova</button>
+    <button type="button" class="tab-btn" data-tab="backtest">🧪 Backtest</button>
   </nav>
 
   <div id="tab-scanner" class="tab-panel active">
@@ -140,6 +141,24 @@
         </tbody>
       </table>
     </main>
+  </div>
+
+  <div id="tab-backtest" class="tab-panel">
+    <section id="backtest-disclaimer" class="backtest-disclaimer">
+      🧪 Ovo je <strong>retrospektivna simulacija</strong> (counterfactual backtest) odigrana unazad kroz historiju —
+      <strong>nije</strong> uživo rezultat. Vidi tab "📊 Analitika trejdova" za stvarno praćene signale.
+      Izvještaj se generiše ručno na zahtjev, ne osvježava se automatski.
+    </section>
+
+    <section id="backtest-meta" class="backtest-meta muted">Učitavam izvještaj…</section>
+
+    <section id="backtest-summary" class="trades-summary muted">Učitavam izvještaj…</section>
+
+    <section id="backtest-equity-curve" class="backtest-equity-curve muted">Učitavam equity krivu…</section>
+
+    <section id="backtest-breakdown-timeframe" class="bucket-breakdown muted">Učitavam raspodjelu po timeframe-u…</section>
+    <section id="backtest-breakdown-direction" class="bucket-breakdown muted">Učitavam raspodjelu po smjeru…</section>
+    <section id="backtest-breakdown-label" class="bucket-breakdown muted">Učitavam raspodjelu po label-u…</section>
   </div>
 
 

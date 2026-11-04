@@ -399,6 +399,71 @@ def _compute_metrics(
     }
 
 
+def _breakdown_by(trades: list[Trade], key: Any) -> list[dict[str, Any]]:
+    """Groups ``trades`` by ``key(trade)`` and reports n / win rate / average
+    R-multiple per group, sorted by group key -- shared helper behind the
+    dashboard report's "by timeframe" / "by direction" / "by label" tables."""
+    groups: dict[str, list[Trade]] = defaultdict(list)
+    for trade in trades:
+        groups[key(trade)].append(trade)
+
+    rows = []
+    for group_key, group_trades in sorted(groups.items()):
+        r_multiples = [t.r_multiple for t in group_trades if t.r_multiple is not None]
+        wins = sum(1 for t in group_trades if t.net_return_pct > 0)
+        rows.append(
+            {
+                "key": group_key,
+                "n": len(group_trades),
+                "win_rate_pct": round(wins / len(group_trades) * 100.0, 1),
+                "avg_r_multiple": round(sum(r_multiples) / len(r_multiples), 3) if r_multiples else None,
+                "net_profit": round(sum(t.pnl for t in group_trades), 2),
+            }
+        )
+    return rows
+
+
+def build_dashboard_report(config: PortfolioBacktestConfig, result: PortfolioBacktestResult) -> dict[str, Any]:
+    """Assembles the full JSON payload the dashboard's "🧪 Backtest" tab
+    reads (see ``webapp/main.py``'s ``/api/backtest/report`` endpoint) --
+    metrics plus breakdowns and a downsampled equity curve, with enough
+    metadata (when it ran, with what config) that a stale/cached report is
+    never mistaken for a live result."""
+    # Downsample the equity curve for the frontend chart -- a multi-hundred
+    # trade run doesn't need a point per trade to show the shape of the curve.
+    max_points = 200
+    curve = result.equity_curve
+    step = max(1, len(curve) // max_points)
+    equity_curve = [{"time": t.isoformat(), "equity": round(e, 2)} for t, e in curve[::step]]
+    if curve and equity_curve and equity_curve[-1]["time"] != curve[-1][0].isoformat():
+        equity_curve.append({"time": curve[-1][0].isoformat(), "equity": round(curve[-1][1], 2)})
+
+    return {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "config": {
+            "symbols": list(config.symbols),
+            "timeframes": list(config.timeframes),
+            "horizon_candles": config.horizon_candles,
+            "kline_limit": config.kline_limit,
+            "warmup_candles": config.warmup_candles,
+            "initial_capital": config.initial_capital,
+            "risk_per_trade_pct": config.risk_per_trade_pct,
+            "max_concurrent_positions": config.max_concurrent_positions,
+            "max_concurrent_per_direction": config.max_concurrent_per_direction,
+            "round_trip_cost_pct": config.round_trip_cost_pct,
+            "extra_slippage_pct": config.extra_slippage_pct,
+        },
+        "metrics": result.metrics,
+        "skipped_symbols": result.skipped_symbols,
+        "breakdown": {
+            "by_timeframe": _breakdown_by(result.trades, lambda t: t.timeframe),
+            "by_direction": _breakdown_by(result.trades, lambda t: t.direction),
+            "by_label": _breakdown_by(result.trades, lambda t: t.label),
+        },
+        "equity_curve": equity_curve,
+    }
+
+
 def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktestResult:
     """Fetches history for every (symbol, timeframe) pair in ``config``,
     builds each pair's own no-look-ahead candidate-event stream, merges them
@@ -539,6 +604,11 @@ def _main() -> None:
     )
     parser.add_argument("--extra-slippage-pct", type=float, default=0.0)
     parser.add_argument("--trades-json", help="Optional path to dump the full trade log as JSON")
+    parser.add_argument(
+        "--report-json",
+        help="Optional path to write the dashboard-ready report (metrics + breakdowns + equity curve) as JSON, "
+        "e.g. scanner_data/portfolio_backtest_report.json for the webapp's 'Backtest' tab to pick up",
+    )
     args = parser.parse_args()
 
     config = PortfolioBacktestConfig(
@@ -583,6 +653,12 @@ def _main() -> None:
                 indent=2,
             )
         print(f"Wrote {len(result.trades)} trades to {args.trades_json}")
+
+    if args.report_json:
+        report = build_dashboard_report(config, result)
+        with open(args.report_json, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        print(f"Wrote dashboard report to {args.report_json}")
 
 
 if __name__ == "__main__":

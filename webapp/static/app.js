@@ -306,8 +306,11 @@ function switchTab(tab) {
   });
   document.getElementById("tab-scanner").classList.toggle("active", tab === "scanner");
   document.getElementById("tab-trades").classList.toggle("active", tab === "trades");
+  document.getElementById("tab-backtest").classList.toggle("active", tab === "backtest");
   if (tab === "trades") {
     loadTradesTab();
+  } else if (tab === "backtest") {
+    loadBacktestTab();
   }
 }
 
@@ -565,6 +568,149 @@ function renderQualityBreakdown(buckets) {
       <thead><tr><th>Quality bucket</th><th>N (zatvoreno)</th><th>Win rate</th><th>Avg net %</th><th>Obećano (CI low)</th><th>Razlika</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+}
+
+// --- Backtest tab: cached retrospective portfolio-simulation report -------
+// Reads the pre-generated report written by
+// `python -m scanner.backtesting.portfolio_backtest --report-json ...`
+// (see webapp/main.py's /api/backtest/report). Deliberately a one-shot load
+// on tab switch, not a polled auto-refresh like the live tabs -- the report
+// is a static snapshot that only changes when someone reruns the backtest
+// by hand, so polling it on the scanner's 5-minute cadence would be noise.
+
+async function loadBacktestTab() {
+  try {
+    const res = await fetch("/api/backtest/report");
+    const report = await res.json();
+    if (!report.available) {
+      renderBacktestUnavailable();
+      return;
+    }
+    renderBacktestMeta(report);
+    renderBacktestSummary(report.metrics);
+    renderBacktestEquityCurve(report.equity_curve, report.config ? report.config.initial_capital : 10000);
+    const breakdown = report.breakdown || {};
+    renderBacktestBreakdownTable("backtest-breakdown-timeframe", "Po timeframe-u", breakdown.by_timeframe, "TF");
+    renderBacktestBreakdownTable("backtest-breakdown-direction", "Po smjeru", breakdown.by_direction, "Smjer");
+    renderBacktestBreakdownTable("backtest-breakdown-label", "Po label-u (setup tipu)", breakdown.by_label, "Label");
+  } catch (err) {
+    console.error("Could not load backtest report:", err);
+    document.getElementById("backtest-meta").textContent = `Greška: ${err.message}`;
+  }
+}
+
+function renderBacktestUnavailable() {
+  document.getElementById("backtest-meta").className = "backtest-meta muted";
+  document.getElementById("backtest-meta").innerHTML =
+    "Još nema generisanog backtest izvještaja. Pokrenite ga ručno na serveru:" +
+    '<pre style="white-space: pre-wrap;">python -m scanner.backtesting.portfolio_backtest --symbols ... --report-json scanner_data/portfolio_backtest_report.json</pre>';
+  document.getElementById("backtest-summary").className = "trades-summary muted";
+  document.getElementById("backtest-summary").textContent = "";
+  document.getElementById("backtest-equity-curve").className = "backtest-equity-curve muted";
+  document.getElementById("backtest-equity-curve").textContent = "";
+  ["backtest-breakdown-timeframe", "backtest-breakdown-direction", "backtest-breakdown-label"].forEach((id) => {
+    document.getElementById(id).className = "bucket-breakdown muted";
+    document.getElementById(id).textContent = "";
+  });
+}
+
+function renderBacktestMeta(report) {
+  const el = document.getElementById("backtest-meta");
+  const cfg = report.config || {};
+  el.className = "backtest-meta";
+  let html = `Generisano: <b>${fmtDateTime(report.generated_at)}</b> &middot; ${(cfg.symbols || []).length} simbola &middot; TF: ${(cfg.timeframes || []).join(", ") || "—"} &middot; warmup: ${cfg.warmup_candles ?? "—"} svijeća &middot; trošak/trejd: ${cfg.round_trip_cost_pct ?? "—"}%`;
+  if (report.skipped_symbols && report.skipped_symbols.length) {
+    html += ` &middot; <span class="neg">preskočeno (vendor greška): ${report.skipped_symbols.join(", ")}</span>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderBacktestSummary(metrics) {
+  const el = document.getElementById("backtest-summary");
+  if (!metrics || !metrics.n_trades) {
+    el.className = "trades-summary muted";
+    el.textContent = (metrics && metrics.note) || "Nema trejdova u ovom backtest izvještaju.";
+    return;
+  }
+  el.className = "trades-summary";
+  el.innerHTML = `
+    <div class="trades-summary-cards">
+      <div class="trades-summary-card"><span class="label">Broj trejdova</span><span class="value">${metrics.n_trades}</span></div>
+      <div class="trades-summary-card"><span class="label">Nezavisne epizode</span><span class="value">${metrics.n_independent_episodes ?? "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Win rate</span><span class="value">${fmt(metrics.win_rate_pct, 1)}%</span></div>
+      <div class="trades-summary-card"><span class="label">Net profit</span><span class="value ${signClass(metrics.net_profit_pct)}">${fmt(metrics.net_profit_pct, 2)}%</span></div>
+      <div class="trades-summary-card"><span class="label">Profit factor</span><span class="value">${metrics.profit_factor ?? "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Expectancy (R)</span><span class="value ${signClass(metrics.expectancy_r_multiple)}">${metrics.expectancy_r_multiple !== null && metrics.expectancy_r_multiple !== undefined ? fmt(metrics.expectancy_r_multiple, 3) : "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Max drawdown</span><span class="value neg">${fmt(metrics.max_drawdown_pct, 2)}%</span></div>
+      <div class="trades-summary-card"><span class="label">Sharpe</span><span class="value ${signClass(metrics.sharpe_ratio)}">${metrics.sharpe_ratio ?? "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Sortino</span><span class="value ${signClass(metrics.sortino_ratio)}">${metrics.sortino_ratio ?? "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">CAGR</span><span class="value ${signClass(metrics.cagr_pct)}">${metrics.cagr_pct !== null && metrics.cagr_pct !== undefined ? fmt(metrics.cagr_pct, 2) + "%" : "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Trejdova / godina</span><span class="value">${metrics.trades_per_year ?? "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Prosj. konkurentnih pozicija</span><span class="value">${metrics.avg_concurrent_positions ?? "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Ukupni troškovi (pp)</span><span class="value neg">${fmt(metrics.total_cost_pct_points, 2)}</span></div>
+    </div>`;
+}
+
+function renderBacktestBreakdownTable(elId, title, rows, keyLabel) {
+  const el = document.getElementById(elId);
+  if (!rows || !rows.length) {
+    el.className = "bucket-breakdown muted";
+    el.innerHTML = `Nema podataka za "${title}".`;
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const body = rows
+    .map(
+      (r) => `
+    <tr>
+      <td><b>${r.key}</b></td>
+      <td>${r.n}</td>
+      <td>${fmt(r.win_rate_pct, 1)}%</td>
+      <td class="${signClass(r.avg_r_multiple)}">${r.avg_r_multiple !== null && r.avg_r_multiple !== undefined ? fmt(r.avg_r_multiple, 3) : "—"}</td>
+      <td class="${signClass(r.net_profit)}">${fmt(r.net_profit, 2)}</td>
+    </tr>`
+    )
+    .join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">${title}</div>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>${keyLabel}</th><th>N</th><th>Win rate</th><th>Avg R</th><th>Net profit</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table>`;
+}
+
+// A minimal hand-rolled inline-SVG sparkline -- the frontend has no
+// charting library (no Chart.js/D3), and one data series on a tab that's
+// rarely open doesn't justify adding a new dependency.
+function renderBacktestEquityCurve(curve, initialCapital) {
+  const el = document.getElementById("backtest-equity-curve");
+  if (!curve || curve.length < 2) {
+    el.className = "backtest-equity-curve muted";
+    el.textContent = "Nedovoljno tačaka za equity krivu.";
+    return;
+  }
+  el.className = "backtest-equity-curve";
+  const width = 600;
+  const height = 140;
+  const padX = 4;
+  const padY = 8;
+  const values = curve.map((p) => p.equity);
+  const baseline = initialCapital ?? values[0];
+  const min = Math.min(...values, baseline);
+  const max = Math.max(...values, baseline);
+  const range = max - min || 1;
+  const stepX = (width - 2 * padX) / (curve.length - 1);
+  const toY = (equity) => height - padY - ((equity - min) / range) * (height - 2 * padY);
+  const points = curve.map((p, i) => `${(padX + i * stepX).toFixed(1)},${toY(p.equity).toFixed(1)}`).join(" ");
+  const last = values[values.length - 1];
+  const strokeVar = last >= baseline ? "var(--green)" : "var(--red)";
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">Equity kriva (${curve.length} tačaka)</div>
+    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      <line x1="${padX}" y1="${toY(baseline).toFixed(1)}" x2="${width - padX}" y2="${toY(baseline).toFixed(1)}"
+            style="stroke: var(--border); stroke-dasharray: 4 3; stroke-width: 1" />
+      <polyline points="${points}" fill="none" style="stroke: ${strokeVar}; stroke-width: 2" />
+    </svg>`;
 }
 
 // Builds the shared range/since/until query params every forward-tracking

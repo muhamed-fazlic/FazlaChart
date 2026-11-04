@@ -348,6 +348,90 @@ class TestMetrics:
         assert metrics["final_equity"] == config.initial_capital
 
 
+class TestDashboardReport:
+    def test_report_shape_and_breakdowns(self):
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            Trade,
+            build_dashboard_report,
+        )
+
+        t1_entry = _T0
+        t1_res = _T0 + timedelta(hours=1)
+        t2_entry = _T0 + timedelta(hours=1)
+        t2_res = _T0 + timedelta(hours=2)
+        trades = [
+            Trade(
+                symbol="BTCUSDT",
+                timeframe="1h",
+                direction="long",
+                label="trend:bullish",
+                entry_time=t1_entry,
+                resolution_time=t1_res,
+                net_return_pct=4.0,
+                r_multiple=2.0,
+                equity_before=10_000.0,
+                pnl=200.0,
+                equity_after=10_200.0,
+                win_rate_ci_low_pct=55.0,
+                n=50,
+            ),
+            Trade(
+                symbol="ETHUSDT",
+                timeframe="4h",
+                direction="short",
+                label="trend:bearish",
+                entry_time=t2_entry,
+                resolution_time=t2_res,
+                net_return_pct=-2.0,
+                r_multiple=-1.0,
+                equity_before=10_200.0,
+                pnl=-102.0,
+                equity_after=10_098.0,
+                win_rate_ci_low_pct=55.0,
+                n=50,
+            ),
+        ]
+        equity_curve = [(t1_res, 10_200.0), (t2_res, 10_098.0)]
+        config = PortfolioBacktestConfig(symbols=("BTCUSDT", "ETHUSDT"), initial_capital=10_000.0)
+        metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples=[1, 1])
+        result = PortfolioBacktestResult(
+            trades=trades, equity_curve=equity_curve, metrics=metrics, skipped_symbols=["BADUSDT"]
+        )
+
+        report = build_dashboard_report(config, result)
+
+        assert "generated_at" in report
+        assert report["config"]["symbols"] == ["BTCUSDT", "ETHUSDT"]
+        assert report["metrics"]["n_trades"] == 2
+        assert report["skipped_symbols"] == ["BADUSDT"]
+
+        by_tf = {row["key"]: row for row in report["breakdown"]["by_timeframe"]}
+        assert by_tf["1h"]["n"] == 1
+        assert by_tf["4h"]["n"] == 1
+        by_direction = {row["key"]: row for row in report["breakdown"]["by_direction"]}
+        assert by_direction["long"]["avg_r_multiple"] == pytest.approx(2.0)
+        assert by_direction["short"]["avg_r_multiple"] == pytest.approx(-1.0)
+
+        assert len(report["equity_curve"]) == 2
+        assert report["equity_curve"][-1]["equity"] == pytest.approx(10_098.0)
+
+    def test_empty_trades_produce_empty_breakdowns_and_curve(self):
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            build_dashboard_report,
+        )
+
+        config = PortfolioBacktestConfig(symbols=("BTCUSDT",))
+        metrics = _compute_metrics([], [], config, concurrency_samples=[])
+        result = PortfolioBacktestResult(trades=[], equity_curve=[], metrics=metrics)
+
+        report = build_dashboard_report(config, result)
+
+        assert report["breakdown"]["by_timeframe"] == []
+        assert report["equity_curve"] == []
+
+
 class TestIndependentEpisodes:
     def test_overlapping_same_direction_trades_count_as_one_episode(self):
         from scanner.backtesting.portfolio_backtest import Trade
