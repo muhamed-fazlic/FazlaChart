@@ -229,6 +229,63 @@ h1 .subtitle {
   font-weight: 600;
 }
 
+.trades-timerange-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 20px 0;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.trades-range-btn {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 5px 12px;
+  font-size: 12px;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
+.trades-range-btn:hover { color: var(--text); }
+
+.trades-range-btn.active {
+  color: var(--bg);
+  background: var(--blue);
+  border-color: var(--blue);
+  font-weight: 600;
+}
+
+.trades-custom-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+}
+
+.trades-custom-range.hidden { display: none; }
+
+.trades-custom-range input[type="datetime-local"] {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+.trades-custom-range button {
+  background: var(--blue);
+  border: none;
+  color: var(--bg);
+  padding: 5px 12px;
+  font-size: 12px;
+  border-radius: 14px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
 .status-badge {
   display: inline-block;
   padding: 2px 8px;
@@ -843,6 +900,8 @@ footer {
 
   .trades-summary-cards { grid-template-columns: repeat(2, 1fr); }
   .trades-filter-bar { padding: 0 8px 10px; }
+  .trades-timerange-bar { padding: 10px 8px 0; }
+  .trades-custom-range { width: 100%; margin-left: 0; margin-top: 6px; }
 
   #trades-table {
     display: block;

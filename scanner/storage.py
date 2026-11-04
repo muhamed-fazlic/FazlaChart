@@ -55,7 +55,15 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     status TEXT NOT NULL DEFAULT 'open',
     resolved_at TEXT,
     exit_price REAL,
-    realized_return_pct REAL
+    realized_return_pct REAL,
+    -- Captured from the candidate at log time (Phases 3-5: Signal Quality
+    -- Score, TRENDING/BREAKOUT/REVERSAL pattern classification, volatility
+    -- regime matching) so resolved trades can be analyzed by these, not
+    -- just by (timeframe, direction) -- e.g. "do high-Quality-Score signals
+    -- actually realize a better win rate", not just assumed.
+    pattern TEXT,
+    quality_score REAL,
+    regime_fallback INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_status ON signal_outcomes (status);
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol_open ON signal_outcomes (symbol, timeframe, direction, status);
@@ -113,6 +121,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(signal_outcomes)")}
     if "regime" not in columns:
         conn.execute("ALTER TABLE signal_outcomes ADD COLUMN regime TEXT")
+    if "pattern" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN pattern TEXT")
+    if "quality_score" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN quality_score REAL")
+    if "regime_fallback" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN regime_fallback INTEGER")
 
 
 def connect_for_reads(storage_path: str, timeout: float = 10.0) -> sqlite3.Connection:
@@ -281,6 +295,9 @@ def log_signal_outcome(
     promised_n: int | None,
     horizon_candles: int,
     regime: str | None = None,
+    pattern: str | None = None,
+    quality_score: float | None = None,
+    regime_fallback: bool | None = None,
 ) -> None:
     """Record one new live signal to track to its outcome. Callers are
     responsible for not calling this twice for the same still-open trade
@@ -292,8 +309,8 @@ def log_signal_outcome(
             symbol, timeframe, direction, label, logged_at, entry_price,
             stop_loss, take_profit, take_profit_conservative,
             promised_win_rate_pct, promised_win_rate_ci_low_pct, promised_n,
-            horizon_candles, status, regime
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            horizon_candles, status, regime, pattern, quality_score, regime_fallback
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
         """,
         (
             symbol,
@@ -310,6 +327,9 @@ def log_signal_outcome(
             promised_n,
             horizon_candles,
             regime,
+            pattern,
+            quality_score,
+            None if regime_fallback is None else int(regime_fallback),
         ),
     )
     conn.commit()
@@ -354,10 +374,28 @@ def resolve_signal_outcome(
     conn.commit()
 
 
-def fetch_recent_signal_outcomes(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, Any]]:
+def fetch_recent_signal_outcomes(
+    conn: sqlite3.Connection,
+    limit: int = 200,
+    since: str | None = None,
+    until: str | None = None,
+) -> list[dict[str, Any]]:
     """Most-recently-logged tracked signals (open and resolved), for a
-    live-vs-promised win-rate comparison endpoint."""
-    cursor = conn.execute("SELECT * FROM signal_outcomes ORDER BY logged_at DESC LIMIT ?", (limit,))
+    live-vs-promised win-rate comparison endpoint. ``since``/``until`` are
+    optional ISO-8601 timestamps that filter on ``logged_at`` (when the
+    trade was opened), used for the dashboard's time-range analytics
+    filter -- e.g. "only trades opened in the last 4 hours"."""
+    clauses = []
+    params: list[Any] = []
+    if since is not None:
+        clauses.append("logged_at >= ?")
+        params.append(since)
+    if until is not None:
+        clauses.append("logged_at <= ?")
+        params.append(until)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    cursor = conn.execute(f"SELECT * FROM signal_outcomes{where} ORDER BY logged_at DESC LIMIT ?", params)
     columns = [description[0] for description in cursor.description]
     return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
 

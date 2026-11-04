@@ -102,6 +102,9 @@ def log_new_signals(
             promised_n=candidate.get("n"),
             horizon_candles=BEST_SIGNAL_HORIZON_CANDLES,
             regime=candidate.get("regime"),
+            pattern=candidate.get("pattern"),
+            quality_score=(candidate.get("quality_score") or {}).get("total"),
+            regime_fallback=candidate.get("regime_fallback"),
         )
         logged += 1
         if on_new_signal is not None:

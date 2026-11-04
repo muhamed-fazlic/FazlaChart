@@ -696,3 +696,124 @@ def test_forward_tracking_by_bucket_groups_resolved_outcomes_by_timeframe_and_di
     assert bucket["avg_promised_win_rate_ci_low_pct"] == 60.0
     assert bucket["gap_pp"] == -10.0
 
+
+def _seed_pattern_regime_quality_trades(conn):
+    """Shared fixture data for the by-pattern/by-regime/by-quality breakdown
+    tests: three resolved trades spanning two patterns, two regimes (one
+    regime-matched, one fallback-blend), and two quality tiers."""
+    from scanner.storage import log_signal_outcome, resolve_signal_outcome
+
+    log_signal_outcome(
+        conn, symbol="AAAUSDT", timeframe="1h", direction="short", label="trend:bearish",
+        entry_price=10.0, stop_loss=10.5, take_profit=9.0, take_profit_conservative=9.25,
+        promised_win_rate_pct=65.0, promised_win_rate_ci_low_pct=60.0, promised_n=200, horizon_candles=12,
+        pattern="trending", quality_score=74.0, regime="normalno", regime_fallback=False,
+    )
+    log_signal_outcome(
+        conn, symbol="BBBUSDT", timeframe="1h", direction="short", label="trend:bearish",
+        entry_price=10.0, stop_loss=10.5, take_profit=9.0, take_profit_conservative=9.25,
+        promised_win_rate_pct=65.0, promised_win_rate_ci_low_pct=60.0, promised_n=200, horizon_candles=12,
+        pattern="trending", quality_score=55.0, regime="volatilno", regime_fallback=True,
+    )
+    log_signal_outcome(
+        conn, symbol="CCCUSDT", timeframe="4h", direction="long", label="trend:bullish",
+        entry_price=10.0, stop_loss=9.5, take_profit=11.0, take_profit_conservative=10.75,
+        promised_win_rate_pct=70.0, promised_win_rate_ci_low_pct=62.0, promised_n=150, horizon_candles=12,
+        pattern="breakout", quality_score=None, regime=None, regime_fallback=None,
+    )
+    resolve_signal_outcome(conn, 1, "take_profit", 9.0, 1.0)
+    resolve_signal_outcome(conn, 2, "stop_loss", 10.5, -0.6)
+    resolve_signal_outcome(conn, 3, "take_profit", 11.0, 1.0)
+
+
+def test_forward_tracking_by_pattern_groups_resolved_outcomes(tmp_path, monkeypatch):
+    db_path = tmp_path / "scanner_test.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    conn = init_db(str(db_path))
+    _seed_pattern_regime_quality_trades(conn)
+    conn.close()
+
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/forward-tracking/by-pattern")
+    assert resp.status_code == 200
+    by_pattern = {row["pattern"]: row for row in resp.json()["patterns"]}
+    assert by_pattern["trending"]["resolved_count"] == 2
+    assert by_pattern["trending"]["win_rate_pct"] == 50.0
+    assert by_pattern["breakout"]["resolved_count"] == 1
+    assert by_pattern["breakout"]["win_rate_pct"] == 100.0
+
+
+def test_forward_tracking_by_regime_groups_by_match_status(tmp_path, monkeypatch):
+    db_path = tmp_path / "scanner_test.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    conn = init_db(str(db_path))
+    _seed_pattern_regime_quality_trades(conn)
+    conn.close()
+
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/forward-tracking/by-regime")
+    assert resp.status_code == 200
+    rows = resp.json()["regimes"]
+    match_statuses = {row["match_status"] for row in rows}
+    assert match_statuses == {"regime-matched", "blend", "unknown"}
+    matched = next(row for row in rows if row["match_status"] == "regime-matched")
+    assert matched["resolved_count"] == 1
+    blend = next(row for row in rows if row["match_status"] == "blend")
+    assert blend["resolved_count"] == 1
+
+
+def test_forward_tracking_by_quality_groups_by_score_tier(tmp_path, monkeypatch):
+    db_path = tmp_path / "scanner_test.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    conn = init_db(str(db_path))
+    _seed_pattern_regime_quality_trades(conn)
+    conn.close()
+
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/forward-tracking/by-quality")
+    assert resp.status_code == 200
+    by_bucket = {row["quality_bucket"]: row for row in resp.json()["quality_buckets"]}
+    assert by_bucket["70-100 (jak)"]["resolved_count"] == 1
+    assert by_bucket["50-69 (osrednji)"]["resolved_count"] == 1
+    assert by_bucket["unknown"]["resolved_count"] == 1
+
+
+def test_forward_tracking_trades_time_range_filters_by_logged_at(tmp_path, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    from scanner.storage import log_signal_outcome
+
+    db_path = tmp_path / "scanner_test.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    conn = init_db(str(db_path))
+    log_signal_outcome(
+        conn, symbol="AAAUSDT", timeframe="1h", direction="short", label="trend:bearish",
+        entry_price=10.0, stop_loss=10.5, take_profit=9.0, take_profit_conservative=9.25,
+        promised_win_rate_pct=65.0, promised_win_rate_ci_low_pct=60.0, promised_n=200, horizon_candles=12,
+    )
+    conn.execute(
+        "UPDATE signal_outcomes SET logged_at = ? WHERE id = 1",
+        ((datetime.now(UTC) - timedelta(days=10)).isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+
+    from webapp.main import app
+
+    client = TestClient(app)
+    resp_recent = client.get("/api/forward-tracking/trades?range=1d")
+    assert resp_recent.status_code == 200
+    assert resp_recent.json()["count"] == 0
+
+    resp_all = client.get("/api/forward-tracking/trades?range=1M")
+    assert resp_all.status_code == 200
+    assert resp_all.json()["count"] == 1
+
+    since = (datetime.now(UTC) - timedelta(days=15)).isoformat()
+    resp_custom = client.get(f"/api/forward-tracking/trades?since={since}")
+    assert resp_custom.status_code == 200
+    assert resp_custom.json()["count"] == 1
+

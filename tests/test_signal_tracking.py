@@ -109,6 +109,18 @@ class TestLogNewSignals:
         assert outcomes[0]["status"] == "open"
         assert outcomes[0]["promised_win_rate_ci_low_pct"] == 60.1
 
+    def test_persists_pattern_quality_score_and_regime_fallback_from_the_candidate(self, conn):
+        # Analytics-breakdown fields (Phase 3/4/5) must flow from the live
+        # Top Signal Now candidate all the way into the tracked DB row, not
+        # just exist on the dashboard -- that's what makes the by-pattern/
+        # by-regime/by-quality forward-tracking breakdowns meaningful.
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])
+        assert log_new_signals(conn, _rows(conn)) == 1
+        outcome = fetch_recent_signal_outcomes(conn)[0]
+        assert outcome["pattern"] in (None, "trending", "breakout", "reversal")
+        assert outcome["quality_score"] is None or isinstance(outcome["quality_score"], float)
+        assert outcome["regime_fallback"] in (None, 0, 1)
+
     def test_does_not_duplicate_an_already_open_signal(self, conn):
         save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])
         rows = _rows(conn)

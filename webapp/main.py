@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -498,6 +499,75 @@ def best_signal(limit: int = 5) -> dict[str, Any]:
     return compute_candidates(rows, limit=limit, muted_buckets=muted_buckets)
 
 
+_TIME_RANGE_PRESETS: dict[str, timedelta] = {
+    "1h": timedelta(hours=1),
+    "4h": timedelta(hours=4),
+    "12h": timedelta(hours=12),
+    "1d": timedelta(days=1),
+    "1w": timedelta(days=7),
+    "1M": timedelta(days=30),
+}
+
+
+def _resolve_time_range(range_: str | None, since: str | None, until: str | None) -> tuple[str | None, str | None]:
+    """Translate the "Analitika trejdova" tab's time-range filter into
+    ``(since, until)`` ISO-8601 timestamps for
+    :func:`scanner.storage.fetch_recent_signal_outcomes`.
+
+    Explicit ``since``/``until`` (ISO timestamps) always win -- they cover
+    the "custom range" picker, letting a user pick a specific past window
+    instead of "now minus N". Otherwise ``range_`` is resolved against one
+    of the preset tokens (``1h``/``4h``/``12h``/``1d``/``1w``/``1M``)
+    relative to now. An unrecognized/missing ``range_`` with no explicit
+    bounds means "no filter, all history" -- never an error, since this is
+    a dashboard convenience filter, not a strict API contract."""
+    if since is not None or until is not None:
+        return since, until
+    if range_ is not None and range_ in _TIME_RANGE_PRESETS:
+        cutoff = datetime.now(UTC) - _TIME_RANGE_PRESETS[range_]
+        return cutoff.isoformat(), None
+    return None, None
+
+
+def _quality_bucket(quality_score: float | None) -> str | None:
+    """Bucket a signal's Quality Score (0-100) into the same tiers shown on
+    the dashboard badge (see ``qualityScoreBadgeHtml`` in app.js), so the
+    trade-analytics breakdown answers the question the score exists for:
+    does a higher score actually realize a better win rate, empirically?"""
+    if quality_score is None:
+        return None
+    if quality_score >= 70:
+        return "70-100 (jak)"
+    if quality_score >= 50:
+        return "50-69 (osrednji)"
+    return "0-49 (slab)"
+
+
+def _bucket_stats(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Shared win-rate/avg-net/gap-vs-promised aggregation used by every
+    "group resolved trades by X" breakdown endpoint, so by-bucket,
+    by-pattern, by-regime, and by-quality-bucket all compute the exact same
+    statistics the exact same way."""
+    net_returns = [o["realized_return_pct"] for o in items if o["realized_return_pct"] is not None]
+    wins = sum(1 for r in net_returns if r > 0)
+    promised = [o["promised_win_rate_ci_low_pct"] for o in items if o["promised_win_rate_ci_low_pct"] is not None]
+    win_rate = round(wins / len(net_returns) * 100, 1) if net_returns else None
+    avg_net = round(sum(net_returns) / len(net_returns), 2) if net_returns else None
+    avg_promised = round(sum(promised) / len(promised), 1) if promised else None
+    gap = round(win_rate - avg_promised, 1) if win_rate is not None and avg_promised is not None else None
+    by_status = {"take_profit": 0, "stop_loss": 0, "timeout": 0}
+    for o in items:
+        by_status[o["status"]] = by_status.get(o["status"], 0) + 1
+    return {
+        "resolved_count": len(items),
+        "by_status": by_status,
+        "win_rate_pct": win_rate,
+        "avg_net_return_pct": avg_net,
+        "avg_promised_win_rate_ci_low_pct": avg_promised,
+        "gap_pp": gap,
+    }
+
+
 @app.get("/api/drift-status")
 def drift_status() -> dict[str, Any]:
     """Which ``(timeframe, direction)`` buckets the live calibration-drift
@@ -514,7 +584,9 @@ def drift_status() -> dict[str, Any]:
 
 
 @app.get("/api/forward-tracking/summary")
-def forward_tracking_summary(limit: int = 200) -> dict[str, Any]:
+def forward_tracking_summary(
+    limit: int = 500, range: str | None = None, since: str | None = None, until: str | None = None
+) -> dict[str, Any]:
     """Closed-loop validation: compares each Top Signal Now candidate's
     *promised* calibration win rate against what it actually, live did once
     resolved (hit its stop, its target, or timed out) — not just its own
@@ -523,10 +595,14 @@ def forward_tracking_summary(limit: int = 200) -> dict[str, Any]:
 
     Resolved-only statistics are reported separately from the still-open
     count: an in-progress signal's eventual outcome is unknown, so counting
-    it as a loss (or a win) either way would quietly bias the comparison."""
+    it as a loss (or a win) either way would quietly bias the comparison.
+
+    ``range``/``since``/``until`` filter to a time window on ``logged_at``
+    (when the trade was opened) — see ``_resolve_time_range``."""
+    since_iso, until_iso = _resolve_time_range(range, since, until)
     conn = _get_conn()
     try:
-        outcomes = fetch_recent_signal_outcomes(conn, limit=limit)
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit, since=since_iso, until=until_iso)
     finally:
         conn.close()
 
@@ -556,21 +632,34 @@ def forward_tracking_summary(limit: int = 200) -> dict[str, Any]:
 
 
 @app.get("/api/forward-tracking/trades")
-def forward_tracking_trades(status: str | None = None, limit: int = 300) -> dict[str, Any]:
+def forward_tracking_trades(
+    status: str | None = None,
+    limit: int = 1000,
+    range: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+) -> dict[str, Any]:
     """Every individual tracked signal (open and resolved), with full
     entry/SL/TP/exit detail — the per-trade data behind the summary counts
     shown by ``/api/forward-tracking/summary``. Powers the "Analitika
     trejdova" tab so a user can see exactly *which* symbol/timeframe/
     direction produced each take-profit, stop-loss, or timeout, not just an
-    aggregate count.
+    aggregate count. Each row also carries ``pattern``, ``quality_score``,
+    ``regime`` and ``regime_fallback`` (Phases 3-5) so a resolved trade's
+    outcome can be read against the features that ranked it, not just its
+    (timeframe, direction) bucket.
 
     ``status``, if given, filters to one of ``open``, ``take_profit``,
     ``stop_loss``, or ``timeout``. Unknown values are ignored (no filter
     applied) rather than erroring, since this is a convenience filter, not
-    a strict API contract."""
+    a strict API contract.
+
+    ``range``/``since``/``until`` filter to a time window on ``logged_at``
+    (when the trade was opened) — see ``_resolve_time_range``."""
+    since_iso, until_iso = _resolve_time_range(range, since, until)
     conn = _get_conn()
     try:
-        outcomes = fetch_recent_signal_outcomes(conn, limit=limit)
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit, since=since_iso, until=until_iso)
     finally:
         conn.close()
 
@@ -582,15 +671,21 @@ def forward_tracking_trades(status: str | None = None, limit: int = 300) -> dict
 
 
 @app.get("/api/forward-tracking/by-bucket")
-def forward_tracking_by_bucket(limit: int = 1000) -> dict[str, Any]:
+def forward_tracking_by_bucket(
+    limit: int = 2000, range: str | None = None, since: str | None = None, until: str | None = None
+) -> dict[str, Any]:
     """Resolved trade outcomes grouped by ``(timeframe, direction)`` bucket
     — lets a user see whether the aggregate win-rate/net-return picture from
     ``/api/forward-tracking/summary`` is spread evenly across buckets or
     driven (positively or negatively) by just one or two of them, which a
-    single combined average can hide."""
+    single combined average can hide.
+
+    ``range``/``since``/``until`` filter to a time window on ``logged_at``
+    (when the trade was opened) — see ``_resolve_time_range``."""
+    since_iso, until_iso = _resolve_time_range(range, since, until)
     conn = _get_conn()
     try:
-        outcomes = fetch_recent_signal_outcomes(conn, limit=limit)
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit, since=since_iso, until=until_iso)
     finally:
         conn.close()
 
@@ -601,30 +696,97 @@ def forward_tracking_by_bucket(limit: int = 1000) -> dict[str, Any]:
 
     rows = []
     for (timeframe, direction), items in buckets.items():
-        net_returns = [o["realized_return_pct"] for o in items if o["realized_return_pct"] is not None]
-        wins = sum(1 for r in net_returns if r > 0)
-        promised = [o["promised_win_rate_ci_low_pct"] for o in items if o["promised_win_rate_ci_low_pct"] is not None]
-        win_rate = round(wins / len(net_returns) * 100, 1) if net_returns else None
-        avg_net = round(sum(net_returns) / len(net_returns), 2) if net_returns else None
-        avg_promised = round(sum(promised) / len(promised), 1) if promised else None
-        gap = round(win_rate - avg_promised, 1) if win_rate is not None and avg_promised is not None else None
-        by_status = {"take_profit": 0, "stop_loss": 0, "timeout": 0}
-        for o in items:
-            by_status[o["status"]] = by_status.get(o["status"], 0) + 1
-        rows.append(
-            {
-                "timeframe": timeframe,
-                "direction": direction,
-                "resolved_count": len(items),
-                "by_status": by_status,
-                "win_rate_pct": win_rate,
-                "avg_net_return_pct": avg_net,
-                "avg_promised_win_rate_ci_low_pct": avg_promised,
-                "gap_pp": gap,
-            }
-        )
+        rows.append({"timeframe": timeframe, "direction": direction, **_bucket_stats(items)})
     rows.sort(key=lambda r: r["resolved_count"], reverse=True)
     return {"buckets": rows}
+
+
+@app.get("/api/forward-tracking/by-pattern")
+def forward_tracking_by_pattern(
+    limit: int = 2000, range: str | None = None, since: str | None = None, until: str | None = None
+) -> dict[str, Any]:
+    """Resolved trade outcomes grouped by TRENDING/BREAKOUT/REVERSAL pattern
+    classification (Phase 4) — empirically answers "does a BREAKOUT-pattern
+    signal actually realize a better win rate than a REVERSAL one", instead
+    of assuming the classification matters just because it exists. Trades
+    logged before the ``pattern`` column existed have ``pattern is None``
+    and are grouped under ``"unknown"``."""
+    since_iso, until_iso = _resolve_time_range(range, since, until)
+    conn = _get_conn()
+    try:
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit, since=since_iso, until=until_iso)
+    finally:
+        conn.close()
+
+    resolved = [o for o in outcomes if o["status"] != "open"]
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for o in resolved:
+        buckets.setdefault(o.get("pattern") or "unknown", []).append(o)
+
+    rows = [{"pattern": pattern, **_bucket_stats(items)} for pattern, items in buckets.items()]
+    rows.sort(key=lambda r: r["resolved_count"], reverse=True)
+    return {"patterns": rows}
+
+
+@app.get("/api/forward-tracking/by-regime")
+def forward_tracking_by_regime(
+    limit: int = 2000, range: str | None = None, since: str | None = None, until: str | None = None
+) -> dict[str, Any]:
+    """Resolved trade outcomes grouped by volatility regime (Phase 5:
+    ``mirno``/``normalno``/``volatilno``) *and* split by whether that
+    signal's win rate was regime-matched or fell back to the all-regime
+    blend — empirically answers the question Phase 5 exists to answer:
+    does regime-matched calibration actually pay off versus the blend, not
+    just in theory."""
+    since_iso, until_iso = _resolve_time_range(range, since, until)
+    conn = _get_conn()
+    try:
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit, since=since_iso, until=until_iso)
+    finally:
+        conn.close()
+
+    resolved = [o for o in outcomes if o["status"] != "open"]
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for o in resolved:
+        regime = o.get("regime") or "unknown"
+        match_status = "unknown"
+        if o.get("regime_fallback") is not None:
+            match_status = "blend" if o["regime_fallback"] else "regime-matched"
+        buckets.setdefault((regime, match_status), []).append(o)
+
+    rows = [
+        {"regime": regime, "match_status": match_status, **_bucket_stats(items)}
+        for (regime, match_status), items in buckets.items()
+    ]
+    rows.sort(key=lambda r: r["resolved_count"], reverse=True)
+    return {"regimes": rows}
+
+
+@app.get("/api/forward-tracking/by-quality")
+def forward_tracking_by_quality(
+    limit: int = 2000, range: str | None = None, since: str | None = None, until: str | None = None
+) -> dict[str, Any]:
+    """Resolved trade outcomes grouped by Signal Quality Score tier
+    (Phase 3) — the single most important empirical check in this whole
+    analytics tab: does a higher Quality Score actually realize a better
+    win rate, or is it just a nicer-looking number? Trades logged before
+    the ``quality_score`` column existed are grouped under ``"unknown"``."""
+    since_iso, until_iso = _resolve_time_range(range, since, until)
+    conn = _get_conn()
+    try:
+        outcomes = fetch_recent_signal_outcomes(conn, limit=limit, since=since_iso, until=until_iso)
+    finally:
+        conn.close()
+
+    resolved = [o for o in outcomes if o["status"] != "open"]
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for o in resolved:
+        bucket = _quality_bucket(o.get("quality_score")) or "unknown"
+        buckets.setdefault(bucket, []).append(o)
+
+    rows = [{"quality_bucket": bucket, **_bucket_stats(items)} for bucket, items in buckets.items()]
+    rows.sort(key=lambda r: r["resolved_count"], reverse=True)
+    return {"quality_buckets": rows}
 
 
 def _regime_matched_calibration(

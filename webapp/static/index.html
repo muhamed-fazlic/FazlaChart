@@ -75,9 +75,33 @@
   </div>
 
   <div id="tab-trades" class="tab-panel">
+    <section class="trades-timerange-bar">
+      <span class="muted">Period:</span>
+      <button type="button" class="trades-range-btn" data-range="1h">1h</button>
+      <button type="button" class="trades-range-btn" data-range="4h">4h</button>
+      <button type="button" class="trades-range-btn" data-range="12h">12h</button>
+      <button type="button" class="trades-range-btn" data-range="1d">1d</button>
+      <button type="button" class="trades-range-btn" data-range="1w">1w</button>
+      <button type="button" class="trades-range-btn" data-range="1M">1M</button>
+      <button type="button" class="trades-range-btn active" data-range="">Sve</button>
+      <button type="button" class="trades-range-btn" data-range="custom">Custom…</button>
+      <span id="trades-custom-range" class="trades-custom-range hidden">
+        <input type="datetime-local" id="trades-custom-since" />
+        <span class="muted">do</span>
+        <input type="datetime-local" id="trades-custom-until" />
+        <button type="button" id="trades-custom-apply">Primijeni</button>
+      </span>
+    </section>
+
     <section id="trades-summary" class="trades-summary muted">Učitavam analitiku trejdova…</section>
 
     <section id="bucket-breakdown" class="bucket-breakdown muted">Učitavam raspodjelu po bucket-ima…</section>
+
+    <section id="pattern-breakdown" class="bucket-breakdown muted">Učitavam raspodjelu po pattern-u…</section>
+
+    <section id="regime-breakdown" class="bucket-breakdown muted">Učitavam raspodjelu po regime-u…</section>
+
+    <section id="quality-breakdown" class="bucket-breakdown muted">Učitavam raspodjelu po Quality Score-u…</section>
 
     <section class="trades-filter-bar">
       <button type="button" class="trades-filter-btn active" data-status="">Svi</button>
@@ -94,6 +118,9 @@
             <th>Symbol</th>
             <th>TF</th>
             <th>Smjer</th>
+            <th>Pattern</th>
+            <th>Kvalitet</th>
+            <th>Regime</th>
             <th>Status</th>
             <th>Entry</th>
             <th>SL</th>
@@ -106,11 +133,12 @@
           </tr>
         </thead>
         <tbody id="trades-body">
-          <tr><td colspan="12" class="muted">Učitavam trejdove…</td></tr>
+          <tr><td colspan="15" class="muted">Učitavam trejdove…</td></tr>
         </tbody>
       </table>
     </main>
   </div>
+
 
   <div id="detail-modal" class="modal hidden">
     <div class="modal-content">

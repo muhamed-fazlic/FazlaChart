@@ -15,6 +15,22 @@ function fmt(value, digits = 2) {
   return Number(value).toFixed(digits);
 }
 
+// Prices on this dashboard range from BTC (tens of thousands) down to
+// sub-cent altcoins (e.g. 0.02465) — a fixed decimal count either wastes
+// space on expensive coins or silently truncates the only digits that
+// matter on cheap ones (0.0248 hides exactly the 0.02483 vs 0.02489
+// difference a trader needs to see). Scale precision to roughly 5
+// significant figures instead of a fixed decimal count.
+function fmtPrice(value) {
+  if (value === null || value === undefined) return "—";
+  const num = Number(value);
+  if (!isFinite(num)) return "—";
+  if (num === 0) return "0";
+  const magnitude = Math.floor(Math.log10(Math.abs(num)));
+  const digits = Math.max(2, Math.min(10, 4 - magnitude));
+  return num.toFixed(digits);
+}
+
 function signClass(value) {
   if (value === null || value === undefined) return "";
   return value > 0 ? "pos" : value < 0 ? "neg" : "";
@@ -74,9 +90,9 @@ function bestSignalEntryHtml(sig) {
   const kelly = sig.kelly_sizing;
   return `
     <div class="best-signal-entry">
-      <span>Entry zona: <b>${fmt(sig.entry.entry_zone_low, 4)}–${fmt(sig.entry.entry_zone_high, 4)}</b></span>
-      <span>SL: ${fmt(sig.entry.stop_loss, 4)}</span>
-      <span>TP: ${fmt(sig.entry.take_profit, 4)}${sig.entry.take_profit_conservative !== undefined && sig.entry.take_profit_conservative !== null ? ` <span class="muted">(konzervativan: ${fmt(sig.entry.take_profit_conservative, 4)})</span>` : ""}</span>
+      <span>Entry zona: <b>${fmtPrice(sig.entry.entry_zone_low)}–${fmtPrice(sig.entry.entry_zone_high)}</b></span>
+      <span>SL: ${fmtPrice(sig.entry.stop_loss)}</span>
+      <span>TP: ${fmtPrice(sig.entry.take_profit)}${sig.entry.take_profit_conservative !== undefined && sig.entry.take_profit_conservative !== null ? ` <span class="muted">(konzervativan: ${fmtPrice(sig.entry.take_profit_conservative)})</span>` : ""}</span>
       <span>R:R ${fmt(sig.entry.risk_reward_ratio, 2)}</span>
       ${kelly ? `<span>💰 Kelly: <b>${fmt(kelly.recommended_fraction_pct, 1)}%</b> kapitala</span>` : ""}
     </div>
@@ -266,6 +282,9 @@ async function loadForwardTracking() {
 // --- Tab switching (Scanner vs. Analitika trejdova) -----------------------
 
 let currentTradesStatusFilter = "";
+let currentTradesRange = "";
+let currentTradesSince = null;
+let currentTradesUntil = null;
 
 function switchTab(tab) {
   document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -307,6 +326,28 @@ function fmtDateTime(iso) {
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+// Trade-table rows come straight from the signal_outcomes SQLite row shape
+// (plain `pattern` string, plain `quality_score` number, plain `regime` +
+// `regime_fallback` columns) -- distinct from the best-signal candidate
+// shape the Top Signal Now badges above are built for (nested
+// `quality_score.total`, `current_market_regime`), so these small adapters
+// translate a trade row into the same badge markup instead of duplicating it.
+function tradeQualityBadgeHtml(qualityScore) {
+  if (qualityScore === null || qualityScore === undefined) return "—";
+  const cls = qualityScore >= 70 ? "pos" : qualityScore >= 50 ? "" : "neg";
+  return `<span class="quality-score-badge ${cls}">${fmt(qualityScore, 0)}</span>`;
+}
+
+const REGIME_LABELS = { low: "mirno", normal: "normalno", high: "volatilno" };
+
+function tradeRegimeBadgeHtml(regime, regimeFallback) {
+  if (!regime) return "—";
+  const label = REGIME_LABELS[regime] || regime;
+  const matched = regimeFallback === 0 || regimeFallback === false;
+  return `<span class="muted regime-badge">📊 ${label}${matched ? "" : " (blend)"}</span>`;
+}
+
+
 function renderTradesSummary(summary, trades) {
   const el = document.getElementById("trades-summary");
   if (!summary) {
@@ -341,7 +382,7 @@ function renderTradesSummary(summary, trades) {
 function renderTradesTable(trades) {
   const body = document.getElementById("trades-body");
   if (!trades.length) {
-    body.innerHTML = `<tr><td colspan="12" class="muted">Nema trejdova za ovaj filter.</td></tr>`;
+    body.innerHTML = `<tr><td colspan="15" class="muted">Nema trejdova za ovaj filter.</td></tr>`;
     return;
   }
   body.innerHTML = trades
@@ -353,11 +394,14 @@ function renderTradesTable(trades) {
       <td data-label="Symbol"><b>${t.symbol}</b></td>
       <td data-label="TF">${t.timeframe}</td>
       <td data-label="Smjer" class="${dirClass}">${dirWord}</td>
+      <td data-label="Pattern">${patternBadgeHtml(t.pattern) || "—"}</td>
+      <td data-label="Kvalitet">${tradeQualityBadgeHtml(t.quality_score)}</td>
+      <td data-label="Regime">${tradeRegimeBadgeHtml(t.regime, t.regime_fallback)}</td>
       <td data-label="Status">${statusBadgeHtml(t.status)}</td>
-      <td data-label="Entry">${fmt(t.entry_price, 4)}</td>
-      <td data-label="SL">${fmt(t.stop_loss, 4)}</td>
-      <td data-label="TP">${fmt(t.take_profit, 4)}</td>
-      <td data-label="Exit">${t.exit_price !== null && t.exit_price !== undefined ? fmt(t.exit_price, 4) : "—"}</td>
+      <td data-label="Entry">${fmtPrice(t.entry_price)}</td>
+      <td data-label="SL">${fmtPrice(t.stop_loss)}</td>
+      <td data-label="TP">${fmtPrice(t.take_profit)}</td>
+      <td data-label="Exit">${t.exit_price !== null && t.exit_price !== undefined ? fmtPrice(t.exit_price) : "—"}</td>
       <td data-label="Net %" class="${signClass(t.realized_return_pct)}">${t.realized_return_pct !== null && t.realized_return_pct !== undefined ? fmt(t.realized_return_pct, 2) + "%" : "—"}</td>
       <td data-label="Obećano (CI low)">${fmt(t.promised_win_rate_ci_low_pct, 1)}%</td>
       <td data-label="Otvoren">${fmtDateTime(t.logged_at)}</td>
@@ -403,26 +447,128 @@ function renderBucketBreakdown(buckets) {
     </table>`;
 }
 
+// Shared row renderer for the pattern/regime/quality breakdowns below --
+// they all compute the exact same win-rate/avg-net/gap statistics
+// server-side (see webapp/main.py::_bucket_stats), just grouped by a
+// different key, so the row markup only differs in its leading cell(s).
+function _breakdownRowHtml(leadingCells, stats) {
+  const gapClass = stats.gap_pp === null ? "" : stats.gap_pp >= 0 ? "pos" : "neg";
+  const netClass = signClass(stats.avg_net_return_pct);
+  const byStatus = stats.by_status || {};
+  return `
+    <tr>
+      ${leadingCells}
+      <td>${stats.resolved_count} <span class="muted">(TP ${byStatus.take_profit || 0} · SL ${byStatus.stop_loss || 0} · timeout ${byStatus.timeout || 0})</span></td>
+      <td>${fmt(stats.win_rate_pct, 1)}%</td>
+      <td class="${netClass}">${stats.avg_net_return_pct !== null ? fmt(stats.avg_net_return_pct, 2) + "%" : "—"}</td>
+      <td>${fmt(stats.avg_promised_win_rate_ci_low_pct, 1)}%</td>
+      <td class="${gapClass}">${stats.gap_pp !== null ? (stats.gap_pp >= 0 ? "+" : "") + fmt(stats.gap_pp, 1) + "pp" : "—"}</td>
+    </tr>`;
+}
+
+function renderPatternBreakdown(patterns) {
+  const el = document.getElementById("pattern-breakdown");
+  if (!patterns.length) {
+    el.className = "bucket-breakdown muted";
+    el.innerHTML = "Nema zatvorenih trejdova za raspodjelu po pattern-u.";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = patterns.map((p) => _breakdownRowHtml(`<td>${patternBadgeHtml(p.pattern) || p.pattern}</td>`, p)).join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">Po pattern-u — da li BREAKOUT/TRENDING/REVERSAL stvarno radi bolje?</div>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Pattern</th><th>N (zatvoreno)</th><th>Win rate</th><th>Avg net %</th><th>Obećano (CI low)</th><th>Razlika</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+const REGIME_MATCH_LABELS = { "regime-matched": "uparen", blend: "blend", unknown: "—" };
+
+function renderRegimeBreakdown(regimes) {
+  const el = document.getElementById("regime-breakdown");
+  if (!regimes.length) {
+    el.className = "bucket-breakdown muted";
+    el.innerHTML = "Nema zatvorenih trejdova za raspodjelu po regime-u.";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = regimes
+    .map((r) => {
+      const label = REGIME_LABELS[r.regime] || r.regime;
+      const matchLabel = REGIME_MATCH_LABELS[r.match_status] || r.match_status;
+      return _breakdownRowHtml(`<td>📊 ${label}</td><td>${matchLabel}</td>`, r);
+    })
+    .join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">Po volatility regime-u — da li regime-matched kalibracija stvarno pomaže?</div>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Regime</th><th>Status</th><th>N (zatvoreno)</th><th>Win rate</th><th>Avg net %</th><th>Obećano (CI low)</th><th>Razlika</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderQualityBreakdown(buckets) {
+  const el = document.getElementById("quality-breakdown");
+  if (!buckets.length) {
+    el.className = "bucket-breakdown muted";
+    el.innerHTML = "Nema zatvorenih trejdova za raspodjelu po Quality Score-u.";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = buckets.map((q) => _breakdownRowHtml(`<td>${q.quality_bucket}</td>`, q)).join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">Po Signal Quality Score-u — da li viši skor stvarno znači bolji win rate?</div>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Quality bucket</th><th>N (zatvoreno)</th><th>Win rate</th><th>Avg net %</th><th>Obećano (CI low)</th><th>Razlika</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+// Builds the shared range/since/until query params every forward-tracking
+// endpoint accepts -- an explicit custom since/until always wins over a
+// preset range token (see webapp/main.py::_resolve_time_range).
+function tradesRangeQueryParams() {
+  const params = new URLSearchParams();
+  if (currentTradesSince || currentTradesUntil) {
+    if (currentTradesSince) params.set("since", currentTradesSince);
+    if (currentTradesUntil) params.set("until", currentTradesUntil);
+  } else if (currentTradesRange) {
+    params.set("range", currentTradesRange);
+  }
+  return params;
+}
+
 async function loadTradesTab(status) {
   if (status !== undefined) currentTradesStatusFilter = status;
   try {
-    const tradesUrl = currentTradesStatusFilter
-      ? `/api/forward-tracking/trades?status=${encodeURIComponent(currentTradesStatusFilter)}`
-      : "/api/forward-tracking/trades";
-    const [summaryRes, tradesRes, bucketRes] = await Promise.all([
-      fetch("/api/forward-tracking/summary"),
-      fetch(tradesUrl),
-      fetch("/api/forward-tracking/by-bucket"),
+    const rangeParams = tradesRangeQueryParams();
+    const tradesParams = new URLSearchParams(rangeParams);
+    if (currentTradesStatusFilter) tradesParams.set("status", currentTradesStatusFilter);
+
+    const [summaryRes, tradesRes, bucketRes, patternRes, regimeRes, qualityRes] = await Promise.all([
+      fetch(`/api/forward-tracking/summary?${rangeParams}`),
+      fetch(`/api/forward-tracking/trades?${tradesParams}`),
+      fetch(`/api/forward-tracking/by-bucket?${rangeParams}`),
+      fetch(`/api/forward-tracking/by-pattern?${rangeParams}`),
+      fetch(`/api/forward-tracking/by-regime?${rangeParams}`),
+      fetch(`/api/forward-tracking/by-quality?${rangeParams}`),
     ]);
     const summary = await summaryRes.json();
     const tradesData = await tradesRes.json();
     const bucketData = await bucketRes.json();
+    const patternData = await patternRes.json();
+    const regimeData = await regimeRes.json();
+    const qualityData = await qualityRes.json();
     renderTradesSummary(summary, tradesData.trades || []);
     renderTradesTable(tradesData.trades || []);
     renderBucketBreakdown(bucketData.buckets || []);
+    renderPatternBreakdown(patternData.patterns || []);
+    renderRegimeBreakdown(regimeData.regimes || []);
+    renderQualityBreakdown(qualityData.quality_buckets || []);
   } catch (err) {
     console.error("Could not load trades analytics:", err);
-    document.getElementById("trades-body").innerHTML = `<tr><td colspan="12" class="muted">Greška: ${err.message}</td></tr>`;
+    document.getElementById("trades-body").innerHTML = `<tr><td colspan="15" class="muted">Greška: ${err.message}</td></tr>`;
   }
 }
 
@@ -431,6 +577,35 @@ document.querySelectorAll(".trades-filter-btn").forEach((btn) => {
     document.querySelectorAll(".trades-filter-btn").forEach((b) => b.classList.toggle("active", b === btn));
     loadTradesTab(btn.dataset.status);
   });
+});
+
+// --- Analitika trejdova: time-range filter (presets + custom) -------------
+
+document.querySelectorAll(".trades-range-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const customBar = document.getElementById("trades-custom-range");
+    if (btn.dataset.range === "custom") {
+      customBar.classList.toggle("hidden");
+      return;
+    }
+    customBar.classList.add("hidden");
+    document.querySelectorAll(".trades-range-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    currentTradesRange = btn.dataset.range;
+    currentTradesSince = null;
+    currentTradesUntil = null;
+    loadTradesTab();
+  });
+});
+
+document.getElementById("trades-custom-apply").addEventListener("click", () => {
+  const sinceInput = document.getElementById("trades-custom-since").value;
+  const untilInput = document.getElementById("trades-custom-until").value;
+  if (!sinceInput && !untilInput) return;
+  currentTradesSince = sinceInput ? new Date(sinceInput).toISOString() : null;
+  currentTradesUntil = untilInput ? new Date(untilInput).toISOString() : null;
+  currentTradesRange = "";
+  document.querySelectorAll(".trades-range-btn").forEach((b) => b.classList.toggle("active", b.dataset.range === "custom"));
+  loadTradesTab();
 });
 
 function renderTable(symbols, anomaliesOnly) {
@@ -448,13 +623,13 @@ function renderTable(symbols, anomaliesOnly) {
     <tr data-idx="${idx}" data-symbol="${s.symbol}">
       <td data-label="Symbol"><b>${s.symbol}</b></td>
       <td data-label="Trend" class="${trendClass(s.trend)}">${s.trend}</td>
-      <td data-label="Close">${fmt(s.close, 4)}</td>
+      <td data-label="Close">${fmtPrice(s.close)}</td>
       <td data-label="RSI">${fmt(s.rsi, 1)}</td>
-      <td data-label="EMA20 / EMA50">${fmt(s.ema20, 4)} / ${fmt(s.ema50, 4)}</td>
+      <td data-label="EMA20 / EMA50">${fmtPrice(s.ema20)} / ${fmtPrice(s.ema50)}</td>
       <td data-label="Vol Δ%" class="${signClass(s.volume_change_pct)}">${fmt(s.volume_change_pct, 1)}%</td>
       <td data-label="Funding">${fmt((s.funding_rate || 0) * 100, 4)}%</td>
       <td data-label="OI Δ60m%" class="${signClass(s.open_interest_change_pct_60m)}">${fmt(s.open_interest_change_pct_60m, 2)}%</td>
-      <td data-label="Support / Resistance">${fmt(s.support, 4)} / ${fmt(s.resistance, 4)}</td>
+      <td data-label="Support / Resistance">${fmtPrice(s.support)} / ${fmtPrice(s.resistance)}</td>
       <td data-label="Anomalies">${s.anomalies.map((a) => `<span class="anomaly-badge">${a}</span>`).join("") || "—"}</td>
       <td data-label="Win rate" class="winrate-cell muted" data-wr-symbol="${s.symbol}">…</td>
       <td data-label="Age" class="muted">${fmtAge(s.age_seconds)}</td>
@@ -575,10 +750,10 @@ function renderTimeframeCard(tf, data) {
   const anomalies = (data.anomalies || []).map((a) => `<span class="anomaly-badge">${a}</span>`).join("") || `<span class="muted">—</span>`;
   const fib = data.fibonacci || {};
   const retracement = Object.entries(fib.retracement || {})
-    .map(([ratio, level]) => `<span>${ratio}: <b>${fmt(level, 4)}</b></span>`)
+    .map(([ratio, level]) => `<span>${ratio}: <b>${fmtPrice(level)}</b></span>`)
     .join(" &nbsp; ");
   const extension = Object.entries(fib.extension || {})
-    .map(([ratio, level]) => `<span>${ratio}: <b>${fmt(level, 4)}</b></span>`)
+    .map(([ratio, level]) => `<span>${ratio}: <b>${fmtPrice(level)}</b></span>`)
     .join(" &nbsp; ");
 
   return `
@@ -586,21 +761,21 @@ function renderTimeframeCard(tf, data) {
       <div class="tf-card-header">
         <b>${tf}</b>
         <span class="${trendClass(data.trend)}">${data.trend}</span>
-        <span class="muted">close: ${fmt(data.close, 4)}</span>
+        <span class="muted">close: ${fmtPrice(data.close)}</span>
       </div>
       <table class="tf-table">
         <tr><td>RSI</td><td>${fmt(data.rsi, 1)}</td><td>EMA cross</td><td>${data.ema_cross || "—"}</td></tr>
-        <tr><td>EMA9 / 20 / 21 / 50 / 200</td><td colspan="3">${fmt(data.ema9, 4)} / ${fmt(data.ema20, 4)} / ${fmt(data.ema21, 4)} / ${fmt(data.ema50, 4)} / ${fmt(data.ema200, 4)}</td></tr>
+        <tr><td>EMA9 / 20 / 21 / 50 / 200</td><td colspan="3">${fmtPrice(data.ema9)} / ${fmtPrice(data.ema20)} / ${fmtPrice(data.ema21)} / ${fmtPrice(data.ema50)} / ${fmtPrice(data.ema200)}</td></tr>
         <tr><td>MACD / signal / hist</td><td colspan="3">${fmt(data.macd, 5)} / ${fmt(data.macd_signal, 5)} / ${fmt(data.macd_hist, 5)}</td></tr>
-        <tr><td>ATR</td><td>${fmt(data.atr, 4)}</td><td>Bollinger lower/upper</td><td>${fmt(data.bollinger_lower, 4)} / ${fmt(data.bollinger_upper, 4)}</td></tr>
+        <tr><td>ATR</td><td>${fmtPrice(data.atr)}</td><td>Bollinger lower/upper</td><td>${fmtPrice(data.bollinger_lower)} / ${fmtPrice(data.bollinger_upper)}</td></tr>
         <tr><td>Volume</td><td>${fmt(data.volume, 1)}</td><td>Rel. volume / Δ%</td><td>${fmt(data.relative_volume, 2)}x / ${fmtPct(data.volume_change_pct, 1)}</td></tr>
-        <tr><td>Support / Resistance</td><td colspan="3">${fmt(data.support, 4)} / ${fmt(data.resistance, 4)}</td></tr>
+        <tr><td>Support / Resistance</td><td colspan="3">${fmtPrice(data.support)} / ${fmtPrice(data.resistance)}</td></tr>
         <tr><td>Drawdown / Momentum fading</td><td colspan="3">${fmtPct(data.drawdown_pct, 1)} / ${data.momentum_fading === null || data.momentum_fading === undefined ? "—" : data.momentum_fading}</td></tr>
       </table>
       <div class="anomaly-badges">${anomalies}</div>
       ${
         fib.swing_high
-          ? `<details class="fib-toggle"><summary class="muted">Fibonacci (swing ${fib.swing_direction || "—"}: ${fmt(fib.swing_low, 4)} - ${fmt(fib.swing_high, 4)})</summary>
+          ? `<details class="fib-toggle"><summary class="muted">Fibonacci (swing ${fib.swing_direction || "—"}: ${fmtPrice(fib.swing_low)} - ${fmtPrice(fib.swing_high)})</summary>
               <div class="fib-levels"><b>Retracement:</b> ${retracement || "—"}</div>
               <div class="fib-levels"><b>Extension:</b> ${extension || "—"}</div>
             </details>`
@@ -614,13 +789,13 @@ function renderDerivativesAndPivots(snapshot) {
   const p = snapshot.pivot_points || {};
   const derivativesHtml = `
     <table class="tf-table">
-      <tr><td>Funding rate</td><td>${fmtPct((d.funding_rate || 0) * 100, 4)}</td><td>Mark / Index price</td><td>${fmt(d.mark_price, 4)} / ${fmt(d.index_price, 4)}</td></tr>
+      <tr><td>Funding rate</td><td>${fmtPct((d.funding_rate || 0) * 100, 4)}</td><td>Mark / Index price</td><td>${fmtPrice(d.mark_price)} / ${fmtPrice(d.index_price)}</td></tr>
       <tr><td>Open interest</td><td>${fmt(d.open_interest, 1)}</td><td>OI Δ 5m / 15m / 60m</td><td>${fmtPct(d.open_interest_change_pct_5m, 2)} / ${fmtPct(d.open_interest_change_pct_15m, 2)} / ${fmtPct(d.open_interest_change_pct_60m, 2)}</td></tr>
     </table>`;
   const pivotHtml = Object.keys(p).length
     ? `<table class="tf-table">
-        <tr><td>P</td><td>${fmt(p.pivot, 4)}</td><td>R1 / S1</td><td>${fmt(p.r1, 4)} / ${fmt(p.s1, 4)}</td></tr>
-        <tr><td>R2 / S2</td><td>${fmt(p.r2, 4)} / ${fmt(p.s2, 4)}</td><td>R3 / S3</td><td>${fmt(p.r3, 4)} / ${fmt(p.s3, 4)}</td></tr>
+        <tr><td>P</td><td>${fmtPrice(p.pivot)}</td><td>R1 / S1</td><td>${fmtPrice(p.r1)} / ${fmtPrice(p.s1)}</td></tr>
+        <tr><td>R2 / S2</td><td>${fmtPrice(p.r2)} / ${fmtPrice(p.s2)}</td><td>R3 / S3</td><td>${fmtPrice(p.r3)} / ${fmtPrice(p.s3)}</td></tr>
       </table>`
     : `<p class="muted">No pivot points yet (needs a completed daily candle).</p>`;
   return `${derivativesHtml}<h4 class="muted" style="margin-top: 10px;">Daily pivot points</h4>${pivotHtml}`;
@@ -646,7 +821,7 @@ function renderHeatmap(data) {
       const isCurrent = current >= b.price_low && current <= b.price_high;
       const width = Math.max(2, (b.pct_of_total / maxPct) * 100);
       return `<div class="heatmap-bar-row${isPoc ? " is-poc" : ""}${isCurrent ? " is-current" : ""}">
-        <span>${fmt(b.price_low, 4)}–${fmt(b.price_high, 4)}</span>
+        <span>${fmtPrice(b.price_low)}–${fmtPrice(b.price_high)}</span>
         <span class="heatmap-bar-track"><span class="heatmap-bar-fill" style="width:${width}%"></span></span>
         <span>${fmt(b.pct_of_total, 1)}%</span>
       </div>`;
@@ -654,12 +829,12 @@ function renderHeatmap(data) {
     .join("");
 
   const stopZones = (data.likely_stop_zones || [])
-    .map((z) => `<li>${fmt(z.price, 4)} — ${z.reason}</li>`)
+    .map((z) => `<li>${fmtPrice(z.price)} — ${z.reason}</li>`)
     .join("");
 
   const walls = data.orderbook_walls;
   const wallItem = (w) =>
-    `<li class="${w.side === "bid" ? "pos" : "neg"}">${fmt(w.price, 4)} (${w.distance_pct > 0 ? "+" : ""}${fmt(w.distance_pct, 2)}%) — ${w.side === "bid" ? "bid" : "ask"} zid, ${fmt(w.notional_usdt / 1000, 1)}k USDT</li>`;
+    `<li class="${w.side === "bid" ? "pos" : "neg"}">${fmtPrice(w.price)} (${w.distance_pct > 0 ? "+" : ""}${fmt(w.distance_pct, 2)}%) — ${w.side === "bid" ? "bid" : "ask"} zid, ${fmt(w.notional_usdt / 1000, 1)}k USDT</li>`;
   const wallRows = walls
     ? [...walls.bid_walls, ...walls.ask_walls]
         .sort((a, b) => b.notional_usdt - a.notional_usdt)
@@ -677,8 +852,8 @@ function renderHeatmap(data) {
 
   return `
     <div class="muted" style="font-size: 11px; margin-bottom: 4px;">
-      Current: <b>${fmt(current, 4)}</b> · POC (najprometnija zona): <b>${fmt(data.poc_price, 4)}</b> ·
-      Value area: ${fmt(data.value_area_low, 4)} – ${fmt(data.value_area_high, 4)}
+      Current: <b>${fmtPrice(current)}</b> · POC (najprometnija zona): <b>${fmtPrice(data.poc_price)}</b> ·
+      Value area: ${fmtPrice(data.value_area_low)} – ${fmtPrice(data.value_area_high)}
     </div>
     ${rows}
     <ul class="heatmap-stop-zones">${stopZones}</ul>
@@ -822,18 +997,18 @@ function renderAssessment(data) {
         : "";
       const conservativeTp =
         lv.take_profit_conservative !== undefined && lv.take_profit_conservative !== null
-          ? ` <span class="muted">(konzervativan: ${fmt(lv.take_profit_conservative, 4)})</span>`
+          ? ` <span class="muted">(konzervativan: ${fmtPrice(lv.take_profit_conservative)})</span>`
           : "";
       const patientEntry =
         lv.patient_entry !== undefined && lv.patient_entry !== null
-          ? ` <span class="muted">(strpljiv: ${fmt(lv.patient_entry, 4)})</span>`
+          ? ` <span class="muted">(strpljiv: ${fmtPrice(lv.patient_entry)})</span>`
           : "";
       return `<tr>
         <td><b>${tf}</b></td>
         <td class="${biasCls}">${lv.bias === "long" ? "LONG" : "SHORT"}</td>
-        <td>${fmt(lv.entry, 4)}${patientEntry}</td>
-        <td class="neg">${fmt(lv.stop_loss, 4)} <span class="muted">(${fmt(lv.risk_pct, 2)}%)</span></td>
-        <td class="pos">${fmt(lv.take_profit, 4)} <span class="muted">(${fmt(lv.reward_pct, 2)}%)</span>${conservativeTp}</td>
+        <td>${fmtPrice(lv.entry)}${patientEntry}</td>
+        <td class="neg">${fmtPrice(lv.stop_loss)} <span class="muted">(${fmt(lv.risk_pct, 2)}%)</span></td>
+        <td class="pos">${fmtPrice(lv.take_profit)} <span class="muted">(${fmt(lv.reward_pct, 2)}%)</span>${conservativeTp}</td>
         <td>${fmt(lv.risk_reward_ratio, 2)}</td>
       </tr>${extensionWarnRow}${warnRow}${chopWarnRow}${wallWarnRow}${kellyRow}`;
     })
@@ -1005,13 +1180,13 @@ function renderSingleSymbolRow(s) {
     <tr data-idx="0" data-symbol="${s.symbol}">
       <td data-label="Symbol"><b>${s.symbol}</b> ${trackedNote}</td>
       <td data-label="Trend" class="${trendClass(s.trend)}">${s.trend}</td>
-      <td data-label="Close">${fmt(s.close, 4)}</td>
+      <td data-label="Close">${fmtPrice(s.close)}</td>
       <td data-label="RSI">${fmt(s.rsi, 1)}</td>
-      <td data-label="EMA20 / EMA50">${fmt(s.ema20, 4)} / ${fmt(s.ema50, 4)}</td>
+      <td data-label="EMA20 / EMA50">${fmtPrice(s.ema20)} / ${fmtPrice(s.ema50)}</td>
       <td data-label="Vol Δ%" class="${signClass(s.volume_change_pct)}">${fmt(s.volume_change_pct, 1)}%</td>
       <td data-label="Funding">${fmt((s.funding_rate || 0) * 100, 4)}%</td>
       <td data-label="OI Δ60m%" class="${signClass(s.open_interest_change_pct_60m)}">${fmt(s.open_interest_change_pct_60m, 2)}%</td>
-      <td data-label="Support / Resistance">${fmt(s.support, 4)} / ${fmt(s.resistance, 4)}</td>
+      <td data-label="Support / Resistance">${fmtPrice(s.support)} / ${fmtPrice(s.resistance)}</td>
       <td data-label="Anomalies">${(s.anomalies || []).map((a) => `<span class="anomaly-badge">${a}</span>`).join("") || "—"}</td>
       <td data-label="Win rate" class="${wrClass}" title="${wrTitle.replace(/"/g, "&quot;")}">${wrHtml}</td>
       <td data-label="Age" class="muted">${fmtAge(s.age_seconds)}</td>
