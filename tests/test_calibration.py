@@ -12,8 +12,8 @@ import pytest
 
 from scanner.calibration import (
     LABEL_DIRECTION,
-    LabeledCase,
     OOS_MIN_TEST_N,
+    LabeledCase,
     _walk_forward_exit,
     summarize,
     train_test_split_cases,
@@ -47,6 +47,8 @@ def test_every_label_the_anomaly_module_can_emit_has_a_declared_direction():
         "oi_rising_price_flat_funding_spiking",
         "failed_breakout",
         "volatility_squeeze_expansion",
+        "squeeze_breakout_long",
+        "squeeze_breakout_short",
         "ema9_21_bullish_cross",
         "ema9_21_bearish_cross",
         "bullish_pullback_confluence",

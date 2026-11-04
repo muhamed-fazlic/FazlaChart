@@ -200,8 +200,9 @@ def compute_candidates(
             if not tf_snapshot:
                 continue  # this cycle's snapshot didn't include this timeframe for this symbol
             trend = tf_snapshot.get("trend")
-            if trend not in ("bullish", "bearish"):
-                continue
+            anomalies_for_tf = tf_snapshot.get("anomalies", [])
+            if trend not in ("bullish", "bearish") and not anomalies_for_tf:
+                continue  # neutral trend with no anomaly-based setup either -- nothing directional could possibly match
             considered += 1
             # Anomalies here come from this timeframe's own (unprefixed)
             # list, not the flattened/cross-timeframe ``row["anomalies"]``
@@ -211,7 +212,7 @@ def compute_candidates(
             # unprefixed label format the historical backtest in
             # scanner.calibration actually trained on, so anomaly-based
             # labels can match calibration stats at all.
-            labels = _active_labels(trend, tf_snapshot.get("anomalies", []))
+            labels = _active_labels(trend, anomalies_for_tf)
 
             stats = get_cached_calibration_stats(row["symbol"], tf)
             matches = find_stats_for_labels(stats, labels, BEST_SIGNAL_HORIZON_CANDLES)

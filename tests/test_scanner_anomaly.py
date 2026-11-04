@@ -14,6 +14,8 @@ from tradingagents.dataflows.vendors.binance.anomaly import (
     failed_breakout,
     oi_rising_price_flat_funding_spiking,
     price_up_volume_not_confirming,
+    squeeze_breakout_direction,
+    volatility_squeeze_expansion,
 )
 from tradingagents.dataflows.vendors.binance.indicators import add_indicators, klines_to_dataframe
 
@@ -71,6 +73,62 @@ def test_failed_breakout_false_on_clean_breakout_that_holds():
     closes = [100.0] * 10 + [105.0]
     df = klines_to_dataframe(_make_klines(closes))
     assert failed_breakout(df, resistance=102.0) is False
+
+
+def test_squeeze_breakout_direction_is_long_when_close_clears_the_squeeze_range_high():
+    quiet = [100.0 + (0.05 if i % 2 == 0 else -0.05) for i in range(40)]
+    closes = quiet + [108.0]
+    highs = [c + 0.1 for c in quiet] + [108.2]
+    lows = [c - 0.1 for c in quiet] + [103.0]
+    df = add_indicators(klines_to_dataframe(_make_klines(closes, highs=highs)))
+    df["low"] = lows  # _make_klines derives low from close/open, not an independent list -- override directly
+    assert volatility_squeeze_expansion(df) is True
+    assert squeeze_breakout_direction(df) == "long"
+
+
+def test_squeeze_breakout_direction_is_short_when_close_breaks_the_squeeze_range_low():
+    quiet = [100.0 + (0.05 if i % 2 == 0 else -0.05) for i in range(40)]
+    closes = quiet + [92.0]
+    highs = [c + 0.1 for c in quiet] + [97.0]
+    lows = [c - 0.1 for c in quiet] + [91.8]
+    df = add_indicators(klines_to_dataframe(_make_klines(closes, highs=highs)))
+    df["low"] = lows
+    assert volatility_squeeze_expansion(df) is True
+    assert squeeze_breakout_direction(df) == "short"
+
+
+def test_squeeze_breakout_direction_is_none_without_a_squeeze_at_all():
+    quiet = [100.0 + (0.05 if i % 2 == 0 else -0.05) for i in range(40)]
+    df = add_indicators(klines_to_dataframe(_make_klines(quiet + [100.06])))
+    assert volatility_squeeze_expansion(df) is False
+    assert squeeze_breakout_direction(df) is None
+
+
+def test_squeeze_breakout_direction_is_none_when_squeeze_expands_but_close_stays_inside_prior_range():
+    """A squeeze can start expanding without yet committing to a side -- the
+    breakout candle's close must actually clear the preceding range's own
+    high/low, not just register as a bigger-than-usual candle."""
+    quiet = [100.0 + (0.05 if i % 2 == 0 else -0.05) for i in range(40)]
+    closes = quiet + [103.0]
+    highs = [110.0] * 40 + [103.2]
+    lows = [90.0] * 40 + [102.8]
+    df = add_indicators(klines_to_dataframe(_make_klines(closes, highs=highs)))
+    df["low"] = lows
+    assert volatility_squeeze_expansion(df) is True
+    assert squeeze_breakout_direction(df) is None
+
+
+def test_detect_anomalies_includes_directional_squeeze_breakout_flag():
+    quiet = [100.0 + (0.05 if i % 2 == 0 else -0.05) for i in range(40)]
+    closes = quiet + [108.0]
+    highs = [c + 0.1 for c in quiet] + [108.2]
+    lows = [c - 0.1 for c in quiet] + [103.0]
+    df = add_indicators(klines_to_dataframe(_make_klines(closes, highs=highs)))
+    df["low"] = lows
+    anomalies = detect_anomalies(df, resistance=999.0, funding_rate=0.0, oi_change_pct_60m=None)
+    assert "volatility_squeeze_expansion" in anomalies
+    assert "squeeze_breakout_long" in anomalies
+    assert "squeeze_breakout_short" not in anomalies
 
 
 def test_detect_anomalies_aggregates_all_checks():

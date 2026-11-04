@@ -49,6 +49,8 @@ LABEL_DIRECTION: dict[str, str | None] = {
     "anomaly:oi_rising_price_flat_funding_spiking": "short",
     "anomaly:failed_breakout": "short",
     "anomaly:volatility_squeeze_expansion": None,
+    "anomaly:squeeze_breakout_long": "long",
+    "anomaly:squeeze_breakout_short": "short",
     "anomaly:ema9_21_bullish_cross": "long",
     "anomaly:ema9_21_bearish_cross": "short",
     "anomaly:bullish_pullback_confluence": "long",

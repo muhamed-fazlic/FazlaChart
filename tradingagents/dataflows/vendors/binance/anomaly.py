@@ -64,6 +64,30 @@ def volatility_squeeze_expansion(df: pd.DataFrame, lookback: int = 20, expansion
     return bool(recent_avg > 0 and current / recent_avg >= expansion_ratio)
 
 
+def squeeze_breakout_direction(df: pd.DataFrame, lookback: int = 20, expansion_ratio: float = 1.8) -> str | None:
+    """Which way price already broke, the moment a squeeze (see
+    :func:`volatility_squeeze_expansion`) starts expanding. By itself, a
+    squeeze expanding says nothing about direction -- it can break either
+    way -- which is exactly why this is a separate, deliberately rarer check
+    rather than a single non-directional flag: it only fires once the
+    breakout candle's own close has already cleared the high or low of the
+    compressed range that preceded it (the range of ``lookback`` candles
+    *before* this expansion candle, so the candle currently breaking out
+    doesn't get to vote on its own range). Still inside that range, or the
+    squeeze isn't currently expanding at all -> None (no directional claim,
+    on purpose -- see ``LABEL_DIRECTION`` in ``scanner.calibration``)."""
+    if not volatility_squeeze_expansion(df, lookback, expansion_ratio):
+        return None
+    pre_window = df.iloc[-(lookback + 1):-1]
+    recent_high, recent_low = pre_window["high"].max(), pre_window["low"].min()
+    close = df["close"].iloc[-1]
+    if close > recent_high:
+        return "long"
+    if close < recent_low:
+        return "short"
+    return None
+
+
 def ema9_21_bullish_cross(df: pd.DataFrame) -> bool:
     """EMA9 just crossed above EMA21 on the latest closed candle — the
     actionable short-term-momentum-turning-up moment (see
@@ -146,6 +170,11 @@ def detect_anomalies(
         flags.append("failed_breakout")
     if volatility_squeeze_expansion(df):
         flags.append("volatility_squeeze_expansion")
+    squeeze_direction = squeeze_breakout_direction(df)
+    if squeeze_direction == "long":
+        flags.append("squeeze_breakout_long")
+    elif squeeze_direction == "short":
+        flags.append("squeeze_breakout_short")
     if ema9_21_bullish_cross(df):
         flags.append("ema9_21_bullish_cross")
     if ema9_21_bearish_cross(df):

@@ -66,6 +66,52 @@ def _multi_tf_row(symbol: str, trend_by_tf: dict[str, str], scanned_at: str = "2
     }
 
 
+def test_neutral_trend_with_directional_setup_anomaly_still_surfaces_a_candidate():
+    """The trend filter must not silently drop a neutral-trend candle that
+    carries a directional anomaly (e.g. a squeeze breakout) -- only a
+    neutral candle with *no* anomalies at all has nothing to possibly match."""
+    row = {
+        "symbol": "AAAUSDT",
+        "scanned_at": "2026-01-01T00:00:00+00:00",
+        "reference_timeframe": "1h",
+        "close_price": 100.0,
+        "trend": "neutral",
+        "anomalies": [],
+        "snapshot": {
+            "timeframes": {
+                "1h": {"trend": "neutral", "close": 100.0, "anomalies": ["squeeze_breakout_long"]},
+            }
+        },
+    }
+    setup_stats = CalibrationStats(
+        label="anomaly:squeeze_breakout_long",
+        direction="long",
+        horizon_candles=12,
+        n=200,
+        win_rate_pct=64.0,
+        avg_net_return_pct=0.7,
+        avg_win_return_pct=1.4,
+        avg_loss_return_pct=-0.8,
+        win_rate_ci_low_pct=58.0,
+        win_rate_ci_high_pct=70.0,
+    )
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[setup_stats]):
+        result = compute_candidates([row], limit=5)
+
+    symbols = {s["symbol"] for s in result["signals"]}
+    assert "AAAUSDT" in symbols
+    surfaced = next(s for s in result["signals"] if s["symbol"] == "AAAUSDT")
+    assert surfaced["direction"] == "long"
+    assert surfaced["label"] == "anomaly:squeeze_breakout_long"
+
+
+def test_neutral_trend_with_no_anomalies_never_surfaces():
+    row = _row("AAAUSDT", "neutral")
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_LONG]):
+        result = compute_candidates([row], limit=5)
+    assert result["signals"] == []
+
+
 def test_two_bearish_altcoins_aligned_with_bearish_btc_are_flagged_correlated():
     rows = [_row("BTCUSDT", "bearish"), _row("AAAUSDT", "bearish"), _row("BBBUSDT", "bearish")]
     with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
