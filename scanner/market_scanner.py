@@ -10,15 +10,18 @@ import logging
 import time
 from typing import Any
 
+from agents_crypto.best_signal import compute_candidates
 from scanner.anomaly import collect_all_anomalies
 from scanner.btc_context import build_btc_context
+from scanner.candidate_archive import record_candidates
 from scanner.config import ScannerConfig
 from scanner.drift_detector import active_muted_bucket_set, evaluate_and_apply_drift_mutes
-from scanner.signal_tracking import log_new_signals, resolve_open_signals
+from scanner.signal_tracking import DEFAULT_TRACKING_LIMIT, log_new_signals, resolve_open_signals
 from scanner.storage import (
     fetch_known_symbols,
     fetch_latest_scan_per_symbol,
     init_db,
+    prune_old_candidate_archive,
     prune_old_scans,
     save_scan_result,
 )
@@ -104,18 +107,32 @@ class MarketScanner:
         a genuinely new tracked trade rather than being treated as still
         open, and a bucket that just got muted this cycle is respected
         immediately rather than one cycle late. Never lets a tracking bug
-        take down the scan cycle itself."""
+        take down the scan cycle itself.
+
+        Also archives every candidate that cleared the significance gate
+        this cycle -- selected or not (see :mod:`scanner.candidate_archive`,
+        Phase 8 Korak 1) -- computed once (``include_rejected=True``) and
+        reused for both logging and archiving, instead of running the same
+        calibration lookups twice per cycle."""
         try:
             rows = fetch_latest_scan_per_symbol(self.conn)
             resolved = resolve_open_signals(self.conn, rows)
             mute_changes = evaluate_and_apply_drift_mutes(self.conn, on_mute=self._on_bucket_muted, on_unmute=self._on_bucket_unmuted)
             muted_buckets = active_muted_bucket_set(self.conn)
-            logged = log_new_signals(self.conn, rows, on_new_signal=self._on_new_signal, muted_buckets=muted_buckets)
-            if resolved or logged or mute_changes["muted"] or mute_changes["unmuted"]:
+            candidates_result = compute_candidates(
+                rows, limit=DEFAULT_TRACKING_LIMIT, muted_buckets=muted_buckets, include_rejected=True
+            )
+            logged = log_new_signals(
+                self.conn, rows, on_new_signal=self._on_new_signal, muted_buckets=muted_buckets,
+                precomputed_result=candidates_result,
+            )
+            archived = record_candidates(self.conn, candidates_result)
+            if resolved or logged or archived or mute_changes["muted"] or mute_changes["unmuted"]:
                 logger.info(
-                    "Signal tracking: resolved %d, logged %d new, muted %s, unmuted %s",
+                    "Signal tracking: resolved %d, logged %d new, archived %d candidates, muted %s, unmuted %s",
                     resolved,
                     logged,
+                    archived,
                     mute_changes["muted"],
                     mute_changes["unmuted"],
                 )
@@ -148,10 +165,11 @@ class MarketScanner:
         )
 
     def _maybe_prune_old_scans(self) -> None:
-        """Delete `scans` rows older than `scan_retention_days`, at most
-        once every `retention_check_interval_seconds` -- keeps the database
-        from growing without bound over months of 24/7 operation. Never lets
-        a pruning bug take down the scan cycle itself."""
+        """Delete `scans` and `candidate_archive` rows older than their
+        respective retention settings, at most once every
+        `retention_check_interval_seconds` -- keeps the database from
+        growing without bound over months of 24/7 operation. Never lets a
+        pruning bug take down the scan cycle itself."""
         now = time.monotonic()
         if now - self._last_prune_at < self.config.retention_check_interval_seconds:
             return
@@ -162,6 +180,14 @@ class MarketScanner:
                 logger.info("Pruned %d scan rows older than %d days", deleted, self.config.scan_retention_days)
         except Exception:
             logger.exception("Scan retention pruning failed; continuing")
+        try:
+            deleted = prune_old_candidate_archive(self.conn, retain_days=self.config.candidate_archive_retention_days)
+            if deleted:
+                logger.info(
+                    "Pruned %d candidate_archive rows older than %d days", deleted, self.config.candidate_archive_retention_days
+                )
+        except Exception:
+            logger.exception("Candidate archive retention pruning failed; continuing")
 
     def run_forever(self) -> None:
         """Loop ``run_once`` every ``poll_interval_seconds``, logging and

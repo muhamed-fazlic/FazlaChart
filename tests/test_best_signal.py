@@ -364,3 +364,71 @@ class TestMultiTimeframe:
 
         assert "anomaly:failed_breakout" in seen_labels["labels"]
         assert "anomaly:1h:failed_breakout" not in seen_labels["labels"]
+
+
+class TestIncludeRejected:
+    """``include_rejected=True`` (Phase 8 Korak 1's candidate_archive feed) --
+    must surface everything that cleared the significance gate, tagged with
+    why it was or wasn't selected, while leaving the default (``False``)
+    behaviour and payload completely unchanged."""
+
+    def test_defaults_to_false_and_adds_nothing_to_the_payload_shape(self):
+        row = _row("AAAUSDT", "bearish")
+        with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+            result = compute_candidates([row], limit=5)
+        assert result["all_eligible_by_timeframe"] == {tf: [] for tf in ("5m", "15m", "1h", "4h")}
+
+    def test_empty_rows_still_returns_the_all_eligible_key(self):
+        result = compute_candidates([], limit=5, include_rejected=True)
+        assert result["all_eligible_by_timeframe"] == {tf: [] for tf in ("5m", "15m", "1h", "4h")}
+
+    def test_candidate_beyond_the_limit_is_tagged_rejected_with_a_rank(self):
+        rows = [
+            _row("AAAUSDT", "bearish"),
+            _row("BBBUSDT", "bearish"),
+            _row("CCCUSDT", "bearish"),
+        ]
+        with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+            result = compute_candidates(rows, limit=2, include_rejected=True)
+
+        all_1h = result["all_eligible_by_timeframe"]["1h"]
+        assert len(all_1h) == 3  # all three eligible candidates are archived, not just the top 2
+        assert sum(1 for c in all_1h if c["selected"]) == 2
+        rejected = [c for c in all_1h if not c["selected"]]
+        assert len(rejected) == 1
+        assert rejected[0]["rejection_reason"] == "rank_exceeds_limit"
+        assert rejected[0]["rank"] == 3
+        assert not rejected[0]["muted"]
+        # The two selected ones must be exactly what signals_by_timeframe shows.
+        selected_symbols = {c["symbol"] for c in all_1h if c["selected"]}
+        assert selected_symbols == {s["symbol"] for s in result["signals_by_timeframe"]["1h"]}
+
+    def test_muted_candidate_is_archived_but_tagged_rejected_as_muted(self):
+        row = _row("AAAUSDT", "bearish")
+        with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+            result = compute_candidates([row], limit=5, muted_buckets={("1h", "short")}, include_rejected=True)
+
+        # Still excluded from the live-facing fields, exactly as before.
+        assert result["signals"] == []
+        assert result["signals_by_timeframe"]["1h"] == []
+
+        all_1h = result["all_eligible_by_timeframe"]["1h"]
+        assert len(all_1h) == 1
+        assert all_1h[0]["symbol"] == "AAAUSDT"
+        assert all_1h[0]["muted"] is True
+        assert all_1h[0]["selected"] is False
+        assert all_1h[0]["rejection_reason"] == "muted_bucket"
+
+    def test_cache_coverage_excludes_muted_candidates_regardless_of_include_rejected(self):
+        """A muted candidate must not inflate `cache_coverage`'s numerator --
+        this must read identically whether or not `include_rejected` was
+        passed, since it's a user-facing count of genuinely-surfaced
+        candidates, not an internal bookkeeping detail."""
+        row = _row("AAAUSDT", "bearish")
+        with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
+            without = compute_candidates([row], limit=5, muted_buckets={("1h", "short")})
+            with_rejected = compute_candidates(
+                [row], limit=5, muted_buckets={("1h", "short")}, include_rejected=True
+            )
+        assert without["cache_coverage"] == with_rejected["cache_coverage"] == "0/1"
+

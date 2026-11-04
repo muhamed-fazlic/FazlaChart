@@ -132,6 +132,7 @@ def compute_candidates(
     rows: list[dict[str, Any]],
     limit: int = 5,
     muted_buckets: set[tuple[str, str]] | None = None,
+    include_rejected: bool = False,
 ) -> dict[str, Any]:
     """Rank every currently-tracked directional (symbol, timeframe) pair by
     the conservative (95%-CI lower-bound) win rate of its active calibration
@@ -188,6 +189,22 @@ def compute_candidates(
     - ``signals_by_timeframe``: the same candidates grouped by timeframe,
       each list independently capped at ``limit`` and sorted the same way —
       what the dashboard's per-timeframe Top N panel renders.
+
+    ``include_rejected``, if ``True``, additionally computes and returns
+    ``all_eligible_by_timeframe``: every candidate that cleared the
+    statistical significance gate above (min sample size + CI-low win rate
+    > 50%), per timeframe, *including* ones a muted bucket or the ``limit``
+    cap would otherwise hide — each tagged with its ``rank`` (1-based,
+    within its own timeframe, by the same conservative ordering),
+    ``selected`` (whether it's one of the ``signals``/``signals_by_timeframe``
+    the dashboard actually shows), and ``rejection_reason`` (``None`` if
+    selected, else ``"muted_bucket"`` or ``"rank_exceeds_limit"``). This is
+    deliberately opt-in and costs nothing extra when left ``False`` (the
+    dashboard's own hot read path never passes it) — it exists for
+    :mod:`scanner.candidate_archive`, which needs the full decision context
+    (not just the winners) to later let Korak 2's portfolio backtest replay
+    "what did the system consider and reject, and why", not just "what did
+    it choose".
     """
     if not rows:
         return {
@@ -197,6 +214,7 @@ def compute_candidates(
             "candidates_considered": 0,
             "cache_coverage": None,
             "muted_buckets": sorted(muted_buckets or set()),
+            "all_eligible_by_timeframe": {tf: [] for tf in TRACKED_TIMEFRAMES},
         }
 
     muted_buckets = muted_buckets or set()
@@ -256,8 +274,12 @@ def compute_candidates(
             # estimate — rewards both a high win rate AND enough samples to
             # be confident in it.
             best = max(significant, key=lambda m: m.win_rate_ci_low_pct)
-            if (tf, best.direction) in muted_buckets:
-                continue  # live track record says this bucket isn't holding up -- see muted_buckets docstring above
+            # A muted bucket's candidate is still built below (so
+            # ``include_rejected`` callers can archive exactly what was
+            # excluded and why -- see that parameter's docstring) but is
+            # tagged ``muted`` and filtered out of everything the dashboard
+            # and live tracker actually see, same as before.
+            muted = (tf, best.direction) in muted_buckets
 
             close, atr = tf_snapshot.get("close"), tf_snapshot.get("atr")
             entry = None
@@ -343,6 +365,7 @@ def compute_candidates(
                     },
                     "scanned_at": row["scanned_at"],
                     "age_seconds": round(_age_seconds(row["scanned_at"]), 1),
+                    "muted": muted,
                 }
             )
 
@@ -352,9 +375,13 @@ def compute_candidates(
     # Group by timeframe first, rank + cap each group independently at
     # `limit`, then flatten back into one globally-ranked list -- so a
     # timeframe with fewer qualifying candidates never gets crowded out by
-    # another timeframe having more.
+    # another timeframe having more. Muted candidates never reach the
+    # dashboard/live tracker at all -- they only continue to exist (tagged)
+    # in `candidates` itself for `all_eligible_by_timeframe` below.
     by_timeframe: dict[str, list[dict[str, Any]]] = {tf: [] for tf in TRACKED_TIMEFRAMES}
     for c in candidates:
+        if c["muted"]:
+            continue
         by_timeframe[c["timeframe"]].append(c)
 
     signals_by_timeframe: dict[str, list[dict[str, Any]]] = {}
@@ -368,11 +395,32 @@ def compute_candidates(
     btc_row = next((r for r in rows if r["symbol"] == BTC_SYMBOL), None)
     _tag_correlated_exposure(flattened, btc_row["trend"] if btc_row else None)
 
+    all_eligible_by_timeframe: dict[str, list[dict[str, Any]]] = {tf: [] for tf in TRACKED_TIMEFRAMES}
+    if include_rejected:
+        full_by_timeframe: dict[str, list[dict[str, Any]]] = {tf: [] for tf in TRACKED_TIMEFRAMES}
+        for c in candidates:
+            full_by_timeframe[c["timeframe"]].append(c)
+        for tf in TRACKED_TIMEFRAMES:
+            ranked_all = sorted(full_by_timeframe[tf], key=_rank_key, reverse=True)
+            for position, c in enumerate(ranked_all, start=1):
+                c["rank"] = position
+                c["selected"] = (not c["muted"]) and position <= max(1, limit)
+                c["rejection_reason"] = (
+                    None if c["selected"] else ("muted_bucket" if c["muted"] else "rank_exceeds_limit")
+                )
+            all_eligible_by_timeframe[tf] = ranked_all
+
     return {
         "signals": flattened,
         "signals_by_timeframe": signals_by_timeframe,
         "generated_at": generated_at,
         "candidates_considered": considered,
-        "cache_coverage": f"{len(candidates)}/{considered}",
+        # Matches pre-``include_rejected`` behaviour exactly: muted
+        # candidates were never counted here before (they used to be
+        # skipped before ever being appended to `candidates`), so excluding
+        # them again here keeps this field meaning the same thing it always
+        # has, even though `candidates` itself may now also hold muted ones.
+        "cache_coverage": f"{sum(1 for c in candidates if not c['muted'])}/{considered}",
         "muted_buckets": sorted(muted_buckets),
+        "all_eligible_by_timeframe": all_eligible_by_timeframe,
     }

@@ -70,3 +70,9 @@ class ScannerConfig:
     # track record and stays tiny regardless.
     scan_retention_days: int = 60
     retention_check_interval_seconds: int = 86400
+
+    # How long `candidate_archive` rows are kept (Phase 8 Korak 1) -- longer
+    # than `scan_retention_days` since this is the actual research dataset a
+    # future portfolio-level counterfactual backtest (Korak 2) replays
+    # against, not disposable live-dashboard scratch state.
+    candidate_archive_retention_days: int = 90

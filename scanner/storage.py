@@ -123,6 +123,47 @@ CREATE TABLE IF NOT EXISTS muted_buckets (
     n_resolved INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_muted_buckets_active ON muted_buckets (timeframe, direction, unmuted_at);
+
+-- Phase 8 Korak 1: every (symbol, timeframe, direction) candidate that
+-- cleared the same statistical significance gate as a live Top Signal Now
+-- entry (min sample size + 95%-CI lower-bound win rate > 50%, see
+-- agents_crypto.best_signal.compute_candidates), one row per scan cycle,
+-- regardless of whether it was actually selected into the live top-N shown
+-- on the dashboard / tracked in `signal_outcomes`. `signal_outcomes` only
+-- ever recorded the winners; this is the full decision trail -- what did
+-- the system consider and reject, and why -- that Korak 2's portfolio-level
+-- counterfactual backtest needs to answer "would taking MORE of what we
+-- rejected have actually been profitable", not just "how did what we chose
+-- do". See scanner.candidate_archive and PHASE8_PROFITABILITY_RESEARCH_TODO.md.
+CREATE TABLE IF NOT EXISTS candidate_archive (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scanned_at TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    selected INTEGER NOT NULL,
+    muted INTEGER NOT NULL,
+    rejection_reason TEXT,
+    label TEXT,
+    pattern TEXT,
+    n INTEGER,
+    win_rate_pct REAL,
+    win_rate_ci_low_pct REAL,
+    avg_net_return_pct REAL,
+    regime TEXT,
+    regime_fallback INTEGER,
+    quality_score REAL,
+    entry_price REAL,
+    stop_loss REAL,
+    take_profit REAL,
+    risk_reward_ratio REAL,
+    candidate_json TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    UNIQUE (scanned_at, symbol, timeframe, direction)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_archive_time ON candidate_archive (scanned_at);
+CREATE INDEX IF NOT EXISTS idx_candidate_archive_symbol ON candidate_archive (symbol, timeframe, scanned_at);
 """
 
 
@@ -344,6 +385,55 @@ def prune_old_scans(conn: sqlite3.Connection, retain_days: int = 60) -> int:
     if deleted:
         conn.execute("VACUUM")
     return deleted
+
+
+def prune_old_candidate_archive(conn: sqlite3.Connection, retain_days: int = 90) -> int:
+    """Delete `candidate_archive` rows older than ``retain_days``. Kept
+    separate from -- and with a longer default retention than --
+    ``prune_old_scans``, since this table is the actual research dataset
+    Korak 2's counterfactual backtest will replay against, not disposable
+    live-dashboard scratch state like `scans` is. Returns the number of rows
+    deleted."""
+    cutoff = (datetime.now(UTC) - timedelta(days=retain_days)).isoformat()
+    cursor = conn.execute("DELETE FROM candidate_archive WHERE scanned_at < ?", (cutoff,))
+    deleted = cursor.rowcount
+    conn.commit()
+    if deleted:
+        conn.execute("VACUUM")
+    return deleted
+
+
+def fetch_candidate_archive(
+    conn: sqlite3.Connection,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    since: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Archived candidates, most-recent-first, optionally filtered by
+    symbol/timeframe/a ``scanned_at >= since`` cutoff -- the read path a
+    future Korak 2 replay (or any ad-hoc analysis) uses to pull back what
+    the system considered and rejected, not just what it chose."""
+    clauses, params = [], []
+    if symbol is not None:
+        clauses.append("symbol = ?")
+        params.append(symbol)
+    if timeframe is not None:
+        clauses.append("timeframe = ?")
+        params.append(timeframe)
+    if since is not None:
+        clauses.append("scanned_at >= ?")
+        params.append(since)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    cursor = conn.execute(
+        f"SELECT * FROM candidate_archive{where} ORDER BY scanned_at DESC LIMIT ?",
+        (*params, limit),
+    )
+    columns = [description[0] for description in cursor.description]
+    rows = [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+    for row in rows:
+        row["candidate"] = json.loads(row.pop("candidate_json"))
+    return rows
 
 
 def log_signal_outcome(

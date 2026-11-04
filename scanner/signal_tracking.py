@@ -153,6 +153,7 @@ def log_new_signals(
     limit: int = DEFAULT_TRACKING_LIMIT,
     on_new_signal: Callable[[dict[str, Any]], None] | None = None,
     muted_buckets: set[tuple[str, str]] | None = None,
+    precomputed_result: dict[str, Any] | None = None,
 ) -> int:
     """Log any newly-qualifying Top Signal Now candidate that isn't already
     being tracked. Returns how many new rows were logged this cycle.
@@ -169,8 +170,18 @@ def log_new_signals(
     live calibration-drift detector has muted (see
     :mod:`scanner.drift_detector`) is never newly tracked either — keeping
     this tracker's own input in sync with what the dashboard shows.
+
+    ``precomputed_result``, if given, is used in place of calling
+    ``compute_candidates`` again -- lets a caller that also needs the full
+    candidate set (e.g. the scanner cycle also archiving every eligible
+    candidate via :mod:`scanner.candidate_archive`) compute it exactly
+    once per cycle instead of twice, since every calibration lookup it
+    triggers is real (if cheap, now that it's memoized -- see
+    ``agents_crypto.calibration_lookup``) work.
     """
-    result = compute_candidates(rows, limit=limit, muted_buckets=muted_buckets)
+    result = precomputed_result if precomputed_result is not None else compute_candidates(
+        rows, limit=limit, muted_buckets=muted_buckets
+    )
     rows_by_symbol = {row["symbol"]: row for row in rows}
     btc_row = rows_by_symbol.get(BTC_SYMBOL)
     logged = 0
