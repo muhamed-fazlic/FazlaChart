@@ -15,6 +15,7 @@ from scanner.calibration import (
     OOS_MIN_TEST_N,
     LabeledCase,
     _walk_forward_exit,
+    load_extended_history,
     summarize,
     train_test_split_cases,
     validate_out_of_sample,
@@ -270,3 +271,104 @@ class TestOutOfSampleValidation:
 
     def test_empty_cases_returns_empty_list(self):
         assert validate_out_of_sample([]) == []
+
+
+def _kline(open_time_ms: int, close: float = 100.0) -> dict:
+    """Minimal synthetic kline dict matching the shape client.get_klines returns."""
+    return {
+        "open_time": open_time_ms,
+        "open": str(close),
+        "high": str(close),
+        "low": str(close),
+        "close": str(close),
+        "volume": "1.0",
+        "close_time": open_time_ms + 59_999,
+        "quote_volume": "100.0",
+        "trades": 1,
+        "taker_buy_base_volume": "0.5",
+        "taker_buy_quote_volume": "50.0",
+        "ignore": "0",
+    }
+
+
+class TestLoadExtendedHistory:
+    """`load_extended_history` pages backwards past Binance's single-request
+    1500-candle cap via `end_time`; these tests mock `client.get_klines`
+    directly so no network call is ever made."""
+
+    _HOUR_MS = 3_600_000
+
+    def test_single_batch_when_total_candles_fits_in_one_request(self, monkeypatch):
+        import scanner.calibration as calibration_module
+
+        klines = [_kline(i * self._HOUR_MS) for i in range(10)]
+
+        def fake_get_klines(symbol, timeframe, limit, end_time=None):
+            assert end_time is None  # first (and only) batch never passes end_time
+            assert limit == 10
+            return klines
+
+        monkeypatch.setattr(calibration_module.client, "get_klines", fake_get_klines)
+        df = load_extended_history("BTCUSDT", "1h", total_candles=10, batch_limit=1500)
+        assert len(df) == 10
+        assert list(df["open_time"]) == sorted(df["open_time"])
+
+    def test_pages_backwards_across_multiple_batches(self, monkeypatch):
+        import scanner.calibration as calibration_module
+
+        # 25 total candles with a batch_limit of 10 -> 3 requests (10, 10, 5),
+        # each one older than the last, paginated via end_time.
+        all_klines = [_kline(i * self._HOUR_MS) for i in range(25)]
+        calls: list[dict] = []
+
+        def fake_get_klines(symbol, timeframe, limit, end_time=None):
+            calls.append({"limit": limit, "end_time": end_time})
+            if end_time is None:
+                batch = all_klines[-limit:]
+            else:
+                # Return the `limit` candles whose open_time is <= end_time.
+                eligible = [k for k in all_klines if k["open_time"] <= end_time]
+                batch = eligible[-limit:]
+            return batch
+
+        monkeypatch.setattr(calibration_module.client, "get_klines", fake_get_klines)
+        df = load_extended_history("BTCUSDT", "1h", total_candles=25, batch_limit=10)
+
+        assert len(calls) == 3
+        assert len(df) == 25
+        # Must be sorted ascending (oldest first) with no gaps/duplicates.
+        open_times = list(df["open_time"])
+        assert open_times == sorted(open_times)
+        assert len(set(open_times)) == 25
+
+    def test_stops_early_when_vendor_runs_out_of_history(self, monkeypatch):
+        import scanner.calibration as calibration_module
+
+        # Only 15 candles actually exist, but total_candles asks for 50.
+        all_klines = [_kline(i * self._HOUR_MS) for i in range(15)]
+
+        def fake_get_klines(symbol, timeframe, limit, end_time=None):
+            if end_time is None:
+                return all_klines[-min(limit, len(all_klines)) :]
+            eligible = [k for k in all_klines if k["open_time"] <= end_time]
+            return eligible[-min(limit, len(eligible)) :]
+
+        monkeypatch.setattr(calibration_module.client, "get_klines", fake_get_klines)
+        df = load_extended_history("BTCUSDT", "1h", total_candles=50, batch_limit=10)
+        assert len(df) == 15  # didn't loop forever waiting for candles that don't exist
+
+    def test_indicators_computed_once_over_full_assembled_series(self, monkeypatch):
+        import scanner.calibration as calibration_module
+
+        klines = [_kline(i * self._HOUR_MS, close=100.0 + i) for i in range(60)]
+
+        def fake_get_klines(symbol, timeframe, limit, end_time=None):
+            return klines[-limit:] if end_time is None else [k for k in klines if k["open_time"] <= end_time][-limit:]
+
+        monkeypatch.setattr(calibration_module.client, "get_klines", fake_get_klines)
+        df = load_extended_history("BTCUSDT", "1h", total_candles=60, batch_limit=30)
+        # An EMA column should exist and be fully populated (no NaNs from a
+        # broken/discontinuous series caused by per-batch indicator computation).
+        assert "close_20_ema" in df.columns
+        assert df["close_20_ema"].notna().sum() > 0
+

@@ -18,6 +18,7 @@ what the scanner actually flags in production.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import pandas as pd
 
@@ -238,6 +239,51 @@ def _load_history(symbol: str, timeframe: str, limit: int = 1500) -> pd.DataFram
     return add_indicators(klines_to_dataframe(klines))
 
 
+def load_extended_history(symbol: str, timeframe: str, total_candles: int, batch_limit: int = 1500) -> pd.DataFrame:
+    """Like :func:`_load_history`, but pages backwards past Binance's
+    single-request 1500-candle cap (via ``endTime``) to assemble up to
+    ``total_candles`` of continuous history, then computes indicators once
+    over the full assembled series (EMA/ATR/etc. need an unbroken series —
+    computing them per-batch and concatenating afterwards would corrupt
+    every indicator near each batch boundary).
+
+    Exists for :mod:`scanner.backtesting.portfolio_backtest`'s "warm-up"
+    calibration window (see its module docstring): a single 1500-candle
+    fetch forces a counterfactual replay to bootstrap its own stats from
+    nothing at the start of the window, unlike live production which always
+    already has ~1500 candles of *prior* calibration before a decision is
+    ever shown. Fetching roughly double the window and only treating the
+    second half as "tradable" (first half as calibration-only) gives a much
+    fairer comparison.
+    """
+    batches: list[list[dict[str, Any]]] = []
+    end_time: int | None = None
+    remaining = total_candles
+    while remaining > 0:
+        requested = min(batch_limit, remaining)
+        batch = client.get_klines(symbol, timeframe, limit=requested, end_time=end_time)
+        batches.append(batch)
+        remaining -= len(batch)
+        oldest_open_time = batch[0]["open_time"]
+        if end_time is not None and oldest_open_time >= end_time:
+            break  # vendor returned no new (older) candles -- avoid an infinite loop
+        end_time = oldest_open_time - 1
+        if len(batch) < requested:
+            break  # reached the start of this symbol/timeframe's available history
+    # Batches are fetched newest-chunk-first; concatenate oldest-chunk-first,
+    # then de-duplicate any overlap at batch boundaries by open_time.
+    all_klines = [row for batch in reversed(batches) for row in batch]
+    seen: set[Any] = set()
+    deduped = []
+    for row in all_klines:
+        if row["open_time"] in seen:
+            continue
+        seen.add(row["open_time"])
+        deduped.append(row)
+    deduped.sort(key=lambda row: row["open_time"])
+    return add_indicators(klines_to_dataframe(deduped))
+
+
 def _forward_return_pct(df: pd.DataFrame, i: int, horizon: int) -> float | None:
     if i + horizon >= len(df):
         return None
@@ -307,10 +353,18 @@ def backtest_symbol(
     horizons: tuple[int, ...] = (4, 12, 24),
     min_history: int = 60,
     limit: int = 1500,
+    history: pd.DataFrame | None = None,
 ) -> list[LabeledCase]:
     """Walk every candle in ``symbol``'s history, label it the way the live
     scanner would (trend + anomalies, point-in-time), and record the outcome
     at each horizon.
+
+    ``history``, if given, is used instead of fetching ``limit`` candles via
+    :func:`_load_history` -- lets a caller supply a longer, pre-assembled
+    series (e.g. :func:`load_extended_history`) without this function
+    needing to know anything about pagination. Must already have indicators
+    applied (i.e. be the output of ``add_indicators``), same as
+    ``_load_history``'s return value.
 
     For directional labels ("long"/"short"), the outcome is **path-dependent**:
     it reconstructs the same ATR-based SL/TP a live user would actually be
@@ -327,7 +381,7 @@ def backtest_symbol(
     point-to-point magnitude, since there's no SL/TP side to simulate.
     One candle yields one case per label it carries, per horizon.
     """
-    df = _load_history(symbol, timeframe, limit)
+    df = history if history is not None else _load_history(symbol, timeframe, limit)
     atr_pct = (df["atr"] / df["close"] * 100.0).replace([float("inf"), float("-inf")], pd.NA)
     max_horizon = max(horizons)
     cases: list[LabeledCase] = []

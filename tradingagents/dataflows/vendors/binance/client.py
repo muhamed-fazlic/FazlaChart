@@ -105,11 +105,22 @@ def get_klines(
     symbol: Annotated[str, "futures symbol, e.g. BTCUSDT"],
     interval: Annotated[str, "kline interval, e.g. 15m, 1h, 4h"],
     limit: Annotated[int, "number of candles, max 1500"] = 300,
+    end_time: Annotated[int | None, "fetch candles ending at or before this ms timestamp (Binance endTime)"] = None,
 ) -> list[dict[str, Any]]:
-    """Return OHLCV candles as a list of dicts (oldest first)."""
+    """Return OHLCV candles as a list of dicts (oldest first).
+
+    ``end_time`` (Binance's ``endTime`` param, epoch milliseconds) lets a
+    caller page backwards past the single-request 1500-candle cap by
+    repeatedly requesting the ``limit`` candles ending just before the
+    oldest candle already fetched — see
+    ``scanner.calibration.load_extended_history``.
+    """
     if interval not in VALID_INTERVALS:
         raise ValueError(f"Unsupported interval {interval!r}; expected one of {VALID_INTERVALS}")
-    raw = _get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    params: dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+    if end_time is not None:
+        params["endTime"] = end_time
+    raw = _get("/fapi/v1/klines", params)
     if not raw:
         raise NoMarketDataError(symbol, detail=f"no klines returned for interval {interval}")
     return [dict(zip(_KLINE_COLUMNS, row, strict=False)) for row in raw]

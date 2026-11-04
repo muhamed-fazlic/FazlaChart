@@ -109,6 +109,50 @@ class TestNoLookAhead:
         assert events == []
 
 
+class TestWarmup:
+    def test_decision_start_time_suppresses_pre_cutoff_events_but_still_feeds_stats(self):
+        # Same 5-candle, 100%-win setup as test_candidate_only_sees_already_resolved_cases,
+        # which (with min_n=4) would otherwise fire exactly once, at hour 4.
+        cases = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(5)]
+        events = _build_candidate_events(
+            "BTCUSDT",
+            "1h",
+            cases,
+            min_n=4,
+            cost_pct=0.0,
+            extra_slippage_pct=0.0,
+            horizon_candles=1,
+            decision_start_time=_T0 + timedelta(hours=4),
+        )
+        # The only candle that would have fired is AT the cutoff (<=), so it
+        # must now be suppressed as "warm-up only", not emitted as a trade.
+        assert events == []
+
+    def test_decision_start_time_allows_events_after_cutoff(self):
+        cases = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(6)]
+        events = _build_candidate_events(
+            "BTCUSDT",
+            "1h",
+            cases,
+            min_n=4,
+            cost_pct=0.0,
+            extra_slippage_pct=0.0,
+            horizon_candles=1,
+            decision_start_time=_T0 + timedelta(hours=3),
+        )
+        # Hour 4 is after the cutoff and has 4 prior resolved cases (hours
+        # 0-3) feeding the accumulator -- it should fire normally.
+        assert any(e.entry_time == _T0 + timedelta(hours=4) for e in events)
+
+    def test_none_decision_start_time_behaves_like_before(self):
+        cases = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(5)]
+        events = _build_candidate_events(
+            "BTCUSDT", "1h", cases, min_n=4, cost_pct=0.0, extra_slippage_pct=0.0, horizon_candles=1
+        )
+        assert len(events) == 1
+        assert events[0].entry_time == _T0 + timedelta(hours=4)
+
+
 class TestRegimeFallback:
     def test_regime_bucket_used_even_below_min_n_no_fallback_to_blend(self):
         # One prior "high" regime case (a loss, so if it were used alone it
@@ -153,6 +197,7 @@ class TestPortfolioAdmission:
             "max_concurrent_per_direction": 1,
             "round_trip_cost_pct": 0.0,
             "extra_slippage_pct": 0.0,
+            "warmup_candles": 0,
         }
         base.update(overrides)
         return PortfolioBacktestConfig(**base)
@@ -203,6 +248,34 @@ class TestPortfolioAdmission:
                 if t is not trade and t.entry_time <= trade.entry_time < t.resolution_time
             ]
             assert len(overlapping) == 0
+
+    def test_warmup_candles_fetches_extended_history_and_passes_decision_start_time(self, monkeypatch):
+        import pandas as pd
+
+        from scanner.backtesting import portfolio_backtest as module
+
+        # 10 warm-up candles + 5 "tradable" candles = 15 total; the boundary
+        # between them is what decision_start_time should be computed from.
+        open_times = pd.date_range(_T0, periods=15, freq="1h", tz="UTC")
+        fake_history = pd.DataFrame({"open_time": open_times})
+
+        captured: dict[str, object] = {}
+
+        def fake_load_extended_history(symbol, timeframe, total_candles):
+            captured["total_candles"] = total_candles
+            return fake_history
+
+        def fake_backtest_symbol(symbol, timeframe, horizons, history):
+            captured["history_passed"] = history is fake_history
+            return []
+
+        monkeypatch.setattr(module, "load_extended_history", fake_load_extended_history)
+        monkeypatch.setattr(module, "backtest_symbol", fake_backtest_symbol)
+        config = self._config(kline_limit=5, warmup_candles=10)
+        run_portfolio_backtest(config)
+
+        assert captured["total_candles"] == 15
+        assert captured["history_passed"] is True
 
     def test_vendor_error_is_skipped_not_raised(self, monkeypatch):
         from scanner.backtesting import portfolio_backtest as module

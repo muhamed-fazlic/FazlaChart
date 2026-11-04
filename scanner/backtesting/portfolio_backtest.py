@@ -86,6 +86,7 @@ from scanner.calibration import (
     LABEL_DIRECTION,
     LabeledCase,
     backtest_symbol,
+    load_extended_history,
     wilson_score_interval,
 )
 from scanner.signal_tracking import TIMEFRAME_MINUTES
@@ -140,6 +141,13 @@ class PortfolioBacktestConfig:
     timeframes: tuple[str, ...] = TRACKED_TIMEFRAMES
     horizon_candles: int = BEST_SIGNAL_HORIZON_CANDLES
     kline_limit: int = 1500
+    # Extra candles fetched *before* kline_limit's tradable window purely to
+    # seed the stats accumulator, so the first tradable candle already has
+    # realistic calibration history behind it (mirrors live production,
+    # which always already has ~1500 candles of prior calibration before a
+    # decision is ever shown to a user). Set to 0 to reproduce the old
+    # (cold-start-biased) v1 behaviour.
+    warmup_candles: int = 1500
     initial_capital: float = 10_000.0
     # Fixed-fractional position sizing: each trade risks this % of equity
     # *at the time it was opened* (not current equity at close), same
@@ -183,11 +191,18 @@ def _build_candidate_events(
     cost_pct: float,
     extra_slippage_pct: float,
     horizon_candles: int,
+    decision_start_time: datetime | None = None,
 ) -> list[CandidateEvent]:
     """Replay one (symbol, timeframe)'s own case history, in isolation,
     through a resolution-time-gated stats accumulator, and emit one
     CandidateEvent per candle where a significant directional label fired —
-    exactly the "would this have been surfaced live" decision."""
+    exactly the "would this have been surfaced live" decision.
+
+    ``decision_start_time``, if given, marks the end of a "warm-up" prefix:
+    candles at or before this time still feed the stats accumulator (so the
+    first tradable candle already has realistic calibration history behind
+    it, mirroring live production's ever-present ~1500-candle calibration
+    cache) but are never themselves emitted as CandidateEvents."""
     minutes_per_candle = TIMEFRAME_MINUTES.get(timeframe, 60)
     horizon_delta = timedelta(minutes=minutes_per_candle * horizon_candles)
 
@@ -219,6 +234,9 @@ def _build_candidate_events(
             if resolved_case.regime is not None:
                 regime_stats[(resolved_case.label, resolved_case.regime)].append(net_return)
             pointer += 1
+
+        if decision_start_time is not None and entry_dt <= decision_start_time:
+            continue  # warm-up candle: fed the accumulator above, but not tradable
 
         significant: list[CandidateEvent] = []
         for case in by_entry_time[entry_dt]:
@@ -393,9 +411,19 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
     for symbol in config.symbols:
         for timeframe in config.timeframes:
             try:
-                cases = backtest_symbol(
-                    symbol, timeframe, horizons=(config.horizon_candles,), limit=config.kline_limit
-                )
+                if config.warmup_candles > 0:
+                    history = load_extended_history(symbol, timeframe, config.warmup_candles + config.kline_limit)
+                    # The last config.kline_limit candles are "tradable"; everything
+                    # before that is warm-up-only (feeds the stats accumulator, see
+                    # _build_candidate_events, but never emits a CandidateEvent).
+                    boundary_idx = max(0, len(history) - config.kline_limit)
+                    decision_start_time = history["open_time"].iloc[boundary_idx] if boundary_idx < len(history) else None
+                    cases = backtest_symbol(symbol, timeframe, horizons=(config.horizon_candles,), history=history)
+                else:
+                    decision_start_time = None
+                    cases = backtest_symbol(
+                        symbol, timeframe, horizons=(config.horizon_candles,), limit=config.kline_limit
+                    )
             except VendorError:
                 skipped.append(f"{symbol}:{timeframe}")
                 continue
@@ -409,6 +437,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
                     config.round_trip_cost_pct,
                     config.extra_slippage_pct,
                     config.horizon_candles,
+                    decision_start_time,
                 )
             )
 
@@ -501,6 +530,13 @@ def _main() -> None:
     parser.add_argument("--max-concurrent-positions", type=int, default=5)
     parser.add_argument("--max-concurrent-per-direction", type=int, default=3)
     parser.add_argument("--kline-limit", type=int, default=1500)
+    parser.add_argument(
+        "--warmup-candles",
+        type=int,
+        default=1500,
+        help="Extra candles fetched before the tradable window, to seed calibration stats and avoid cold-start "
+        "bias (0 reproduces the old v1 behaviour)",
+    )
     parser.add_argument("--extra-slippage-pct", type=float, default=0.0)
     parser.add_argument("--trades-json", help="Optional path to dump the full trade log as JSON")
     args = parser.parse_args()
@@ -513,6 +549,7 @@ def _main() -> None:
         max_concurrent_positions=args.max_concurrent_positions,
         max_concurrent_per_direction=args.max_concurrent_per_direction,
         kline_limit=args.kline_limit,
+        warmup_candles=args.warmup_candles,
         extra_slippage_pct=args.extra_slippage_pct,
     )
     result = run_portfolio_backtest(config)
