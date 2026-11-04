@@ -30,7 +30,13 @@ from pathlib import Path
 from threading import Lock, get_ident
 from typing import Any
 
-from scanner.calibration import CalibrationStats, OutOfSampleResult, backtest_symbol, summarize, validate_out_of_sample
+from scanner.calibration import (
+    CalibrationStats,
+    OutOfSampleResult,
+    backtest_symbol,
+    summarize,
+    validate_out_of_sample,
+)
 
 DEFAULT_CACHE_PATH = "scanner_data/calibration_cache.json"
 DEFAULT_TTL_SECONDS = 6 * 3600  # 6 hours: labels/backtests don't meaningfully drift faster than this
@@ -329,3 +335,35 @@ def get_cached_calibration_stats(
         return []
     regime_rows = entry["stats"].get(regime_key, [])
     return [CalibrationStats(**row) for row in regime_rows]
+
+
+def find_cached_regime_matched_stats(
+    symbol: str,
+    timeframe: str,
+    labels: list[str],
+    horizon_candles: int,
+    current_regime: str | None,
+    cache_path: str = DEFAULT_CACHE_PATH,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> tuple[list[CalibrationStats], bool]:
+    """Same intent as :func:`find_regime_matched_stats` -- prefer stats scoped
+    to ``current_regime``, falling back to the all-regime blend when there
+    isn't enough regime-specific history yet -- but built on
+    :func:`get_cached_calibration_stats` instead of :func:`get_calibration_stats`,
+    so it NEVER triggers a fresh backtest. For the live multi-symbol ranking
+    path (``agents_crypto.best_signal.compute_candidates``), which must stay
+    fast across the whole tracked universe every cycle, not spawn a
+    backtest per symbol just to find out its regime bucket is still cold.
+
+    Returns ``(matches, used_fallback)``, same as :func:`find_regime_matched_stats`.
+    """
+    if current_regime is not None:
+        regime_stats = get_cached_calibration_stats(
+            symbol, timeframe, regime=current_regime, cache_path=cache_path, ttl_seconds=ttl_seconds
+        )
+        regime_matches = find_stats_for_labels(regime_stats, labels, horizon_candles)
+        if regime_matches:
+            return regime_matches, False
+
+    all_stats = get_cached_calibration_stats(symbol, timeframe, cache_path=cache_path, ttl_seconds=ttl_seconds)
+    return find_stats_for_labels(all_stats, labels, horizon_candles), True

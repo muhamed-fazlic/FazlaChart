@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
+from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
 from tradingagents.dataflows.vendors.binance import client
 from tradingagents.dataflows.vendors.binance.anomaly import detect_anomalies
 from tradingagents.dataflows.vendors.binance.indicators import (
     add_indicators,
     classify_trend,
+    current_volatility_regime,
     drawdown_pct,
     ema_cross,
     fibonacci_levels,
@@ -24,7 +26,6 @@ from tradingagents.dataflows.vendors.binance.indicators import (
     support_resistance,
     volume_change_pct,
 )
-from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
 from tradingagents.dataflows.vendors.binance.liquidity_heatmap import compute_liquidity_heatmap
 from tradingagents.dataflows.vendors.binance.orderbook_depth import compute_orderbook_walls
 from tradingagents.dataflows.vendors.binance.pivots import pivot_points_from_ohlc
@@ -69,6 +70,13 @@ def build_timeframe_snapshot(
         "atr": round(float(last["atr"]), 8),
         "bollinger_upper": round(float(last["boll_ub"]), 8),
         "bollinger_lower": round(float(last["boll_lb"]), 8),
+        # Where this candle's volatility sits relative to its own trailing
+        # history ("low"/"normal"/"high"/None) -- lets downstream ranking
+        # (best_signal.compute_candidates) match a label's calibration stats
+        # against "conditions like right now" instead of an all-time blend,
+        # for free off the same dataframe already built here (no extra
+        # network round-trip, unlike scanner.calibration.fetch_current_regime).
+        "volatility_regime": current_volatility_regime(df),
         "volume": float(last["volume"]),
         "relative_volume": round(relative_volume(df), 3),
         "volume_change_pct": round(volume_change_pct(df), 2),

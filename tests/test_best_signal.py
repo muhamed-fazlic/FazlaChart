@@ -119,6 +119,88 @@ def test_candidate_carries_its_pattern_classification():
     assert result["signals"][0]["pattern"] == "trending"
 
 
+_STRONG_LONG_HIGH_REGIME = CalibrationStats(
+    label="trend:bullish",
+    direction="long",
+    horizon_candles=12,
+    n=200,
+    win_rate_pct=70.0,
+    avg_net_return_pct=1.1,
+    avg_win_return_pct=1.8,
+    avg_loss_return_pct=-0.7,
+    win_rate_ci_low_pct=64.0,
+    win_rate_ci_high_pct=76.0,
+    regime="high",
+)
+
+
+def test_candidate_prefers_current_volatility_regime_scoped_stats_when_available():
+    """When the symbol's current volatility regime (carried on the
+    timeframe snapshot) has its own backtest history for the active label,
+    that regime-scoped win rate is used instead of the all-regime blend,
+    and the candidate records that it was regime-matched, not a fallback."""
+    row = _row("AAAUSDT", "bullish")
+    row["snapshot"]["timeframes"]["1h"]["volatility_regime"] = "high"
+
+    def _stats(_symbol, _timeframe, regime=None, **_kwargs):
+        if regime == "high":
+            return [_STRONG_LONG_HIGH_REGIME]
+        return [_STRONG_LONG]  # the "all" blend -- must not be what gets picked
+
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", side_effect=_stats):
+        result = compute_candidates([row], limit=5)
+
+    assert len(result["signals"]) == 1
+    sig = result["signals"][0]
+    assert sig["win_rate_pct"] == 70.0  # the regime-scoped stat, not the blended 65.0
+    assert sig["current_market_regime"] == "high"
+    assert sig["regime_fallback"] is False
+    assert sig["regime"] == "high"
+
+
+def test_candidate_falls_back_to_all_regime_blend_when_regime_has_no_history_yet():
+    """A thin/new regime bucket (no matching stats at all) must fall back to
+    the all-regime blend rather than the candidate silently disappearing --
+    same "degrade gracefully, never invent" rule the single-symbol analyze
+    endpoint already follows (see webapp.main._regime_matched_calibration)."""
+    row = _row("AAAUSDT", "bullish")
+    row["snapshot"]["timeframes"]["1h"]["volatility_regime"] = "low"
+
+    def _stats(_symbol, _timeframe, regime=None, **_kwargs):
+        if regime == "low":
+            return []  # nothing backtested yet for this regime bucket
+        return [_STRONG_LONG]
+
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", side_effect=_stats):
+        result = compute_candidates([row], limit=5)
+
+    assert len(result["signals"]) == 1
+    sig = result["signals"][0]
+    assert sig["win_rate_pct"] == 65.0
+    assert sig["current_market_regime"] == "low"
+    assert sig["regime_fallback"] is True
+
+
+def test_candidate_with_unknown_regime_skips_regime_lookup_and_uses_blend_directly():
+    """No ``volatility_regime`` on the snapshot (e.g. too little trailing
+    history to classify yet) must behave exactly like the pre-regime code
+    path -- a single all-regime lookup, no wasted regime-scoped call."""
+    row = _row("AAAUSDT", "bullish")  # no volatility_regime key at all
+
+    calls = []
+
+    def _stats(_symbol, _timeframe, regime=None, **_kwargs):
+        calls.append(regime)
+        return [_STRONG_LONG]
+
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", side_effect=_stats):
+        result = compute_candidates([row], limit=5)
+
+    assert len(result["signals"]) == 1
+    assert calls == [None]  # only the blend lookup happened, never a regime-scoped one
+    assert result["signals"][0]["regime_fallback"] is True
+
+
 def test_two_bearish_altcoins_aligned_with_bearish_btc_are_flagged_correlated():
     rows = [_row("BTCUSDT", "bearish"), _row("AAAUSDT", "bearish"), _row("BBBUSDT", "bearish")]
     with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
@@ -197,7 +279,7 @@ def test_no_muted_buckets_behaves_exactly_as_before():
 def test_different_directions_are_never_grouped_together():
     rows = [_row("BTCUSDT", "neutral"), _row("AAAUSDT", "bearish"), _row("BBBUSDT", "bullish")]
 
-    def _stats(symbol, _timeframe):
+    def _stats(symbol, _timeframe, **_kwargs):
         return [_STRONG_SHORT] if symbol == "AAAUSDT" else [_STRONG_LONG]
 
     with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", side_effect=_stats):
@@ -214,7 +296,7 @@ class TestMultiTimeframe:
     def test_one_symbol_qualifying_on_two_timeframes_surfaces_both(self):
         rows = [_multi_tf_row("AAAUSDT", {"1h": "bearish", "4h": "bullish"})]
 
-        def _stats(_symbol, timeframe):
+        def _stats(_symbol, timeframe, **_kwargs):
             return [_STRONG_SHORT] if timeframe == "1h" else [_STRONG_LONG]
 
         with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", side_effect=_stats):

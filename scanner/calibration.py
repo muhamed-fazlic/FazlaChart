@@ -28,7 +28,9 @@ from tradingagents.dataflows.vendors.binance.anomaly import detect_anomalies
 from tradingagents.dataflows.vendors.binance.indicators import (
     add_indicators,
     classify_trend,
+    current_volatility_regime,
     klines_to_dataframe,
+    regime_for_window,
     support_resistance,
 )
 
@@ -279,45 +281,6 @@ def _walk_forward_exit(
     return None, None, "timeout"
 
 
-# Volatility-regime bucket thresholds: a label's win rate earned during a
-# calm market can look very different from the same label during a wild one
-# (wider stops get hit more, moves overshoot targets faster, etc). Bucketing
-# by where current ATR% sits relative to its own trailing history lets the
-# calibration answer "how has this label performed in conditions LIKE RIGHT
-# NOW", not just an all-time blended average.
-_REGIME_LOW_PCTL = 1.0 / 3.0
-_REGIME_HIGH_PCTL = 2.0 / 3.0
-
-
-def _regime_for_window(atr_pct_series: pd.Series, lookback: int = 100) -> str | None:
-    """Classify the most recent value of ``atr_pct_series`` as "low"/"normal"/
-    "high" relative to its own trailing ``lookback`` window — point-in-time,
-    using only values up to and including the last one (no lookahead)."""
-    if len(atr_pct_series) < max(20, lookback // 2):
-        return None  # not enough trailing history yet to judge a regime
-    window = atr_pct_series.iloc[-lookback:]
-    current = window.iloc[-1]
-    if pd.isna(current) or window.isna().all():
-        return None
-    percentile_rank = (window < current).mean()
-    if percentile_rank <= _REGIME_LOW_PCTL:
-        return "low"
-    if percentile_rank >= _REGIME_HIGH_PCTL:
-        return "high"
-    return "normal"
-
-
-def current_volatility_regime(df: pd.DataFrame, lookback: int = 100) -> str | None:
-    """Public entry point: the live volatility regime for the most recent
-    candle in ``df`` (already indicator-enriched via :func:`add_indicators`),
-    so a live snapshot can be matched against regime-scoped calibration
-    stats computed the same way by :func:`backtest_symbol`."""
-    if "atr" not in df.columns or len(df) < 2:
-        return None
-    atr_pct = (df["atr"] / df["close"] * 100.0).replace([float("inf"), float("-inf")], pd.NA)
-    return _regime_for_window(atr_pct.dropna(), lookback)
-
-
 def fetch_current_regime(symbol: str, timeframe: str, limit: int = 150) -> str | None:
     """Convenience wrapper: fetch just enough recent history to classify
     ``symbol``'s *current* volatility regime (cheap compared to the full
@@ -369,7 +332,7 @@ def backtest_symbol(
         labels = [f"trend:{trend}"] + [f"anomaly:{a}" for a in anomalies]
         entry_time = str(window["open_time"].iloc[-1])
         entry_close = float(window["close"].iloc[-1])
-        regime = _regime_for_window(atr_pct.iloc[: i + 1].dropna())
+        regime = regime_for_window(atr_pct.iloc[: i + 1].dropna())
         entry_atr = float(df["atr"].iloc[i])
 
         # Path-dependent exit depends only on direction (long vs short), not

@@ -8,10 +8,11 @@ from unittest.mock import patch
 import pytest
 
 from agents_crypto.calibration_lookup import (
+    find_cached_regime_matched_stats,
     find_oos_for_labels,
     find_stats_for_labels,
-    get_calibration_stats,
     get_cached_calibration_stats,
+    get_calibration_stats,
     get_oos_validation,
 )
 from scanner.calibration import CalibrationStats, OutOfSampleResult
@@ -138,6 +139,84 @@ def test_get_cached_calibration_stats_ignores_expired_entry(tmp_path):
     # ttl_seconds=0 means the entry is already stale by the time this reads it.
     stats = get_cached_calibration_stats("BTCUSDT", "1h", cache_path=cache_path, ttl_seconds=0)
     assert stats == []
+
+
+_FAKE_STATS_HIGH_REGIME = [
+    CalibrationStats(
+        label="trend:bearish",
+        direction="short",
+        horizon_candles=12,
+        n=55,
+        win_rate_pct=71.0,
+        avg_net_return_pct=1.4,
+        avg_win_return_pct=2.1,
+        avg_loss_return_pct=-1.0,
+        regime="high",
+    ),
+]
+
+
+def test_find_cached_regime_matched_stats_prefers_the_current_regime_bucket(tmp_path):
+    """When the symbol's current volatility regime has its own backtest
+    history for the active label, that regime-scoped bucket wins over the
+    all-regime blend, and no fallback is reported."""
+    cache_path = str(tmp_path / "cal.json")
+
+    def _fake_summarize(_cases, regime_filter=None):
+        return _FAKE_STATS_HIGH_REGIME if regime_filter == "high" else _FAKE_STATS
+
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.summarize", side_effect=_fake_summarize),
+    ):
+        get_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)  # warms every regime bucket
+
+    matches, used_fallback = find_cached_regime_matched_stats(
+        "BTCUSDT", "1h", ["trend:bearish"], 12, current_regime="high", cache_path=cache_path
+    )
+    assert used_fallback is False
+    assert len(matches) == 1
+    assert matches[0].win_rate_pct == 71.0
+    assert matches[0].regime == "high"
+
+
+def test_find_cached_regime_matched_stats_falls_back_when_regime_bucket_is_empty(tmp_path):
+    """A regime with no matching label yet (thin/new bucket) must fall back
+    to the all-regime blend instead of returning nothing."""
+    cache_path = str(tmp_path / "cal.json")
+
+    def _fake_summarize(_cases, regime_filter=None):
+        return [] if regime_filter == "low" else _FAKE_STATS
+
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.summarize", side_effect=_fake_summarize),
+    ):
+        get_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)
+
+    matches, used_fallback = find_cached_regime_matched_stats(
+        "BTCUSDT", "1h", ["trend:bearish"], 12, current_regime="low", cache_path=cache_path
+    )
+    assert used_fallback is True
+    assert len(matches) == 1
+    assert matches[0].win_rate_pct == 37.0  # the all-regime blend from _FAKE_STATS
+
+
+def test_find_cached_regime_matched_stats_with_unknown_regime_goes_straight_to_blend(tmp_path):
+    """``current_regime=None`` (can't classify yet) must skip the
+    regime-scoped lookup entirely and use the blend directly."""
+    cache_path = str(tmp_path / "cal.json")
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.summarize", return_value=_FAKE_STATS),
+    ):
+        get_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)
+
+    matches, used_fallback = find_cached_regime_matched_stats(
+        "BTCUSDT", "1h", ["trend:bearish"], 12, current_regime=None, cache_path=cache_path
+    )
+    assert used_fallback is True
+    assert len(matches) == 1
 
 
 _FAKE_OOS = [

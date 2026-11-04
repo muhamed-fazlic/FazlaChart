@@ -211,6 +211,50 @@ def fibonacci_levels(df: pd.DataFrame, lookback: int = 50) -> dict[str, Any]:
     }
 
 
+# Volatility-regime bucket thresholds: a label's win rate earned during a
+# calm market can look very different from the same label during a wild one
+# (wider stops get hit more, moves overshoot targets faster, etc). Bucketing
+# by where current ATR% sits relative to its own trailing history lets the
+# calibration answer "how has this label performed in conditions LIKE RIGHT
+# NOW", not just an all-time blended average. Lives here (not in
+# scanner.calibration, which imports it) so the live snapshot builder below
+# can classify the regime for free off the same already-indicator-enriched
+# dataframe, with no risk of a tradingagents -> scanner -> tradingagents
+# import cycle.
+_REGIME_LOW_PCTL = 1.0 / 3.0
+_REGIME_HIGH_PCTL = 2.0 / 3.0
+
+
+def regime_for_window(atr_pct_series: pd.Series, lookback: int = 100) -> str | None:
+    """Classify the most recent value of ``atr_pct_series`` as "low"/"normal"/
+    "high" relative to its own trailing ``lookback`` window — point-in-time,
+    using only values up to and including the last one (no lookahead)."""
+    if len(atr_pct_series) < max(20, lookback // 2):
+        return None  # not enough trailing history yet to judge a regime
+    window = atr_pct_series.iloc[-lookback:]
+    current = window.iloc[-1]
+    if pd.isna(current) or window.isna().all():
+        return None
+    percentile_rank = (window < current).mean()
+    if percentile_rank <= _REGIME_LOW_PCTL:
+        return "low"
+    if percentile_rank >= _REGIME_HIGH_PCTL:
+        return "high"
+    return "normal"
+
+
+def current_volatility_regime(df: pd.DataFrame, lookback: int = 100) -> str | None:
+    """The live volatility regime ("low"/"normal"/"high"/None) for the most
+    recent candle in ``df`` (already indicator-enriched via
+    :func:`add_indicators`), so a live snapshot can be matched against
+    regime-scoped calibration stats computed the same way by
+    ``scanner.calibration.backtest_symbol``."""
+    if "atr" not in df.columns or len(df) < 2:
+        return None
+    atr_pct = (df["atr"] / df["close"] * 100.0).replace([float("inf"), float("-inf")], pd.NA)
+    return regime_for_window(atr_pct.dropna(), lookback)
+
+
 def drawdown_pct(df: pd.DataFrame, lookback: int = 50) -> float:
     """Percent pullback from the most recent local high (Lokalni Vrh) to the
     lowest point reached since (Trenutno Dno), within ``lookback`` candles

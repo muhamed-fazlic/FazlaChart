@@ -145,6 +145,19 @@ def compute_candidates(
     purely against its own (symbol, timeframe) track record, never a
     different timeframe's.
 
+    Each label's stats are additionally scoped to the symbol's *current*
+    volatility regime ("low"/"normal"/"high", carried on each timeframe's
+    snapshot as ``volatility_regime`` — see
+    ``tradingagents.dataflows.vendors.binance.indicators.current_volatility_regime``)
+    whenever there's enough regime-specific backtest history for that label,
+    falling back to the all-regime blend otherwise (see
+    :func:`agents_crypto.calibration_lookup.find_cached_regime_matched_stats`)
+    — a candidate's ``regime_fallback`` field tells you which one happened.
+    "Market Regime Detection": a label's edge during a calm, grinding trend
+    and the same label during a wild, whipsawing market are not the same bet,
+    so the ranking should answer "how has this done in conditions LIKE RIGHT
+    NOW", not just an all-time average.
+
     ``rows`` is the output of :func:`scanner.storage.fetch_latest_scan_per_symbol`
     (or an equivalent list of per-symbol scan dicts) — its full ``snapshot``
     (every timeframe's trend/anomalies/indicators, not just the flattened
@@ -187,7 +200,7 @@ def compute_candidates(
         }
 
     muted_buckets = muted_buckets or set()
-    from agents_crypto.calibration_lookup import find_stats_for_labels, get_cached_calibration_stats
+    from agents_crypto.calibration_lookup import find_cached_regime_matched_stats
     from agents_crypto.risk_calc import compute_kelly_fraction, compute_risk_levels
     from agents_crypto.signal_pattern import classify_pattern
     from agents_crypto.signal_quality import compute_quality_score
@@ -215,8 +228,19 @@ def compute_candidates(
             # labels can match calibration stats at all.
             labels = _active_labels(trend, anomalies_for_tf)
 
-            stats = get_cached_calibration_stats(row["symbol"], tf)
-            matches = find_stats_for_labels(stats, labels, BEST_SIGNAL_HORIZON_CANDLES)
+            # Match against the symbol's *current* volatility regime
+            # ("low"/"normal"/"high", from this same cycle's snapshot --
+            # see tradingagents...indicators.current_volatility_regime) when
+            # there's enough regime-specific backtest history for the active
+            # label(s), falling back to the all-regime blend otherwise --
+            # same "how has this label done in conditions LIKE RIGHT NOW"
+            # philosophy as the single-symbol analyze endpoint
+            # (webapp.main._regime_matched_calibration), but regime-free
+            # here since it's already in the snapshot at zero extra cost.
+            current_regime = tf_snapshot.get("volatility_regime")
+            matches, regime_fallback = find_cached_regime_matched_stats(
+                row["symbol"], tf, labels, BEST_SIGNAL_HORIZON_CANDLES, current_regime
+            )
             min_n = BEST_SIGNAL_MIN_SAMPLE_SIZE.get(tf, _DEFAULT_MIN_SAMPLE_SIZE)
             significant = [
                 m
@@ -299,6 +323,8 @@ def compute_candidates(
                     "win_rate_ci_high_pct": best.win_rate_ci_high_pct,
                     "avg_net_return_pct": best.avg_net_return_pct,
                     "regime": best.regime,
+                    "current_market_regime": current_regime,
+                    "regime_fallback": regime_fallback,
                     "entry": entry,
                     "kelly_sizing": {
                         "recommended_fraction_pct": round(kelly.recommended_fraction * 100, 2),

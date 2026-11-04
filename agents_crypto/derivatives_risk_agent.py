@@ -21,10 +21,10 @@ from agents_crypto.sentiment import get_crypto_sentiment_snapshot
 from scanner.btc_context import build_btc_context, diverges_from_btc
 from scanner.calibration import current_volatility_regime
 from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
+from tradingagents.dataflows.vendors.binance import client as binance_client
+from tradingagents.dataflows.vendors.binance.indicators import add_indicators, klines_to_dataframe
 from tradingagents.dataflows.vendors.binance.liquidity_heatmap import compute_liquidity_heatmap
 from tradingagents.dataflows.vendors.binance.orderbook_depth import compute_orderbook_walls
-from tradingagents.dataflows.vendors.binance.indicators import add_indicators, klines_to_dataframe
-from tradingagents.dataflows.vendors.binance import client as binance_client
 from tradingagents.dataflows.vendors.binance.snapshot import build_symbol_snapshot
 from tradingagents.llm_clients.factory import create_llm_client
 

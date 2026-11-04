@@ -105,6 +105,16 @@ function qualityScoreBadgeHtml(qs) {
   return `<span class="quality-score-badge ${cls}" title="${tooltip}">⚡ Kvalitet: <b>${fmt(qs.total, 0)}</b>/100</span>`;
 }
 
+function regimeBadgeHtml(sig) {
+  if (!sig.current_market_regime) return "";
+  const label = { low: "mirno", normal: "normalno", high: "volatilno" }[sig.current_market_regime] || sig.current_market_regime;
+  const matched = sig.regime_fallback === false;
+  const title = matched
+    ? `Statistika uparena s trenutnim volatility režimom (${label}) -- win rate odgovara uslovima kakvi su TRENUTNO, ne cjelokupnom prosjeku.`
+    : `Nema dovoljno historije baš za "${label}" režim -- koristi se blend svih režima kao fallback.`;
+  return `<span class="muted regime-badge" title="${title}">📊 ${label}${matched ? "" : " (blend)"}</span>`;
+}
+
 function bestSignalCardHtml(sig, rank) {
   const dirClass = sig.direction === "long" ? "trend-bullish" : "trend-bearish";
   const dirWord = sig.direction === "long" ? "LONG" : "SHORT";
@@ -122,7 +132,7 @@ function bestSignalCardHtml(sig, rank) {
         <span>Win rate: <b>${fmt(sig.win_rate_pct, 1)}%</b> ${winRateRangeHtml(sig.win_rate_ci_low_pct, sig.win_rate_ci_high_pct)}</span>
         <span class="muted">n=${sig.n}</span>
         <span class="${signClass(sig.avg_net_return_pct)}">avg net: ${fmt(sig.avg_net_return_pct, 2)}%</span>
-        ${sig.regime ? `<span class="muted">regime: ${sig.regime}</span>` : ""}
+        ${regimeBadgeHtml(sig)}
       </div>
       <div class="muted best-signal-label">${sig.label}</div>
       ${sig.correlation ? `<div class="best-signal-warning">🔗 ${sig.correlation.note}</div>` : ""}

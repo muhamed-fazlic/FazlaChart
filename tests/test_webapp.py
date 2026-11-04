@@ -94,7 +94,6 @@ def test_health_reports_storage_path(client):
 
 
 def test_health_reports_stale_when_last_scan_is_old(tmp_path, monkeypatch):
-    import sqlite3
     from datetime import UTC, datetime, timedelta
 
     db_path = tmp_path / "scanner_test_stale.db"
