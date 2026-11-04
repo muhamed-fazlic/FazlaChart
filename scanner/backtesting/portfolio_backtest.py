@@ -81,6 +81,11 @@ from agents_crypto.best_signal import (
     BEST_SIGNAL_MIN_SAMPLE_SIZE,
     TRACKED_TIMEFRAMES,
 )
+from scanner.backtesting.historical_universe import (
+    UniverseWindow,
+    is_symbol_in_universe_at,
+    load_universe_cache,
+)
 from scanner.calibration import (
     DEFAULT_ROUND_TRIP_COST_PCT,
     LABEL_DIRECTION,
@@ -164,6 +169,16 @@ class PortfolioBacktestConfig:
     max_concurrent_per_direction: int = 3
     round_trip_cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT
     extra_slippage_pct: float = 0.0
+    # Phase 8 Korak 4 (survivorship-bias fix): when set, any candidate event
+    # whose symbol was NOT in the point-in-time top-N universe at its own
+    # entry_time is dropped before the portfolio simulation runs -- i.e. a
+    # trade is only counted if that symbol would actually have been
+    # selectable back then, not just because it is in today's --symbols
+    # list. See scanner.backtesting.historical_universe.
+    point_in_time_windows: tuple[UniverseWindow, ...] | None = None
+    # Display-only metadata (which cache file produced point_in_time_windows,
+    # if any) so the dashboard report can show it without re-deriving it.
+    point_in_time_universe_cache_path: str | None = None
 
 
 @dataclass
@@ -172,6 +187,10 @@ class PortfolioBacktestResult:
     equity_curve: list[tuple[datetime, float]]
     metrics: dict[str, Any]
     skipped_symbols: list[str] = field(default_factory=list)
+    # How many otherwise-significant candidate events were dropped because
+    # their symbol was not in the point-in-time universe at entry_time (0 if
+    # config.point_in_time_windows was None, i.e. the filter was off).
+    point_in_time_filtered_count: int = 0
 
 
 def _parse_time(iso_timestamp: str) -> datetime:
@@ -525,6 +544,15 @@ def build_dashboard_report(
         },
         "equity_curve": equity_curve,
         "statistical_validation": _build_statistical_validation(result, n_trials, trial_sharpe_ratios),
+        "point_in_time_universe": (
+            {
+                "enabled": True,
+                "cache_path": config.point_in_time_universe_cache_path,
+                "trades_excluded": result.point_in_time_filtered_count,
+            }
+            if config.point_in_time_windows is not None
+            else {"enabled": False}
+        ),
     }
 
 
@@ -571,6 +599,14 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
             )
 
     all_events.sort(key=lambda e: e.entry_time)
+
+    point_in_time_filtered_count = 0
+    if config.point_in_time_windows is not None:
+        kept_events = [
+            e for e in all_events if is_symbol_in_universe_at(config.point_in_time_windows, e.symbol, e.entry_time)
+        ]
+        point_in_time_filtered_count = len(all_events) - len(kept_events)
+        all_events = kept_events
 
     equity = config.initial_capital
     open_positions: list[dict[str, Any]] = []
@@ -644,7 +680,11 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
 
     metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples)
     return PortfolioBacktestResult(
-        trades=trades, equity_curve=equity_curve, metrics=metrics, skipped_symbols=skipped
+        trades=trades,
+        equity_curve=equity_curve,
+        metrics=metrics,
+        skipped_symbols=skipped,
+        point_in_time_filtered_count=point_in_time_filtered_count,
     )
 
 
@@ -667,6 +707,13 @@ def _main() -> None:
         "bias (0 reproduces the old v1 behaviour)",
     )
     parser.add_argument("--extra-slippage-pct", type=float, default=0.0)
+    parser.add_argument(
+        "--point-in-time-universe-cache",
+        help="Phase 8 Korak 4: path to a cache produced by "
+        "'python -m scanner.backtesting.historical_universe'. When given, any trade whose symbol was not in "
+        "the point-in-time top-N universe at its own entry time is excluded, fixing survivorship bias from "
+        "using today's top-N symbol list across the whole backtest period.",
+    )
     parser.add_argument("--trades-json", help="Optional path to dump the full trade log as JSON")
     parser.add_argument(
         "--report-json",
@@ -687,6 +734,10 @@ def _main() -> None:
     )
     args = parser.parse_args()
 
+    point_in_time_windows: tuple[UniverseWindow, ...] | None = None
+    if args.point_in_time_universe_cache:
+        point_in_time_windows = tuple(load_universe_cache(args.point_in_time_universe_cache))
+
     config = PortfolioBacktestConfig(
         symbols=tuple(args.symbols),
         timeframes=tuple(args.timeframes),
@@ -697,12 +748,16 @@ def _main() -> None:
         kline_limit=args.kline_limit,
         warmup_candles=args.warmup_candles,
         extra_slippage_pct=args.extra_slippage_pct,
+        point_in_time_windows=point_in_time_windows,
+        point_in_time_universe_cache_path=args.point_in_time_universe_cache,
     )
     result = run_portfolio_backtest(config)
 
     print(json.dumps(result.metrics, indent=2))
     if result.skipped_symbols:
         print(f"\nSkipped (vendor error): {', '.join(result.skipped_symbols)}")
+    if config.point_in_time_windows is not None:
+        print(f"Point-in-time universe filter excluded {result.point_in_time_filtered_count} candidate trade(s)")
 
     if args.trades_json:
         with open(args.trades_json, "w", encoding="utf-8") as fh:
@@ -736,6 +791,12 @@ def _main() -> None:
         if args.experiment_family:
             conn = init_experiment_registry(args.experiment_registry_path)
             n_trials = count_prior_trials(conn, args.experiment_family) + 1
+            notes = f"CLI run: {len(config.symbols)} symbols, --report-json {args.report_json}"
+            if config.point_in_time_windows is not None:
+                notes += (
+                    f" (point-in-time universe filter active, excluded "
+                    f"{result.point_in_time_filtered_count} candidate trade(s))"
+                )
             record_experiment(
                 conn,
                 strategy_family=args.experiment_family,
@@ -750,7 +811,7 @@ def _main() -> None:
                 sharpe_ratio=result.metrics.get("sharpe_ratio"),
                 net_profit_pct=result.metrics.get("net_profit_pct"),
                 result=result.metrics,
-                notes=f"CLI run: {len(config.symbols)} symbols, --report-json {args.report_json}",
+                notes=notes,
             )
             print(f"Recorded trial #{n_trials} of experiment family '{args.experiment_family}'")
 

@@ -713,6 +713,12 @@ function renderBacktestMeta(report) {
   if (report.skipped_symbols && report.skipped_symbols.length) {
     html += ` &middot; <span class="neg">preskočeno (vendor greška): ${report.skipped_symbols.join(", ")}</span>`;
   }
+  const pit = report.point_in_time_universe;
+  if (pit && pit.enabled) {
+    html += ` &middot; <span class="pos">point-in-time univerzum: aktivan</span> (isključeno ${pit.trades_excluded ?? 0} trejdova koji ne bi bili u top-N na dan ulaska)`;
+  } else {
+    html += ` &middot; <span class="muted">point-in-time univerzum: nije korišten (simboli birani unazad na osnovu današnje likvidnosti — survivorship bias nije ispravljen)</span>`;
+  }
   el.innerHTML = html;
 }
 

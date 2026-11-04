@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from scanner.backtesting.historical_universe import UniverseWindow
 from scanner.backtesting.portfolio_backtest import (
     PortfolioBacktestConfig,
     _build_candidate_events,
@@ -290,6 +291,66 @@ class TestPortfolioAdmission:
         assert result.trades == []
 
 
+class TestPointInTimeUniverseFilter:
+    """Phase 8 Korak 4: a trade must only count if its symbol was actually
+    in the point-in-time universe at its own entry_time."""
+
+    def _config(self, **overrides) -> PortfolioBacktestConfig:
+        base = {
+            "symbols": ("BTCUSDT", "ETHUSDT"),
+            "timeframes": ("1h",),
+            "initial_capital": 10_000.0,
+            "risk_per_trade_pct": 1.0,
+            "max_concurrent_positions": 5,
+            "max_concurrent_per_direction": 5,
+            "round_trip_cost_pct": 0.0,
+            "extra_slippage_pct": 0.0,
+            "warmup_candles": 0,
+            "horizon_candles": 1,
+        }
+        base.update(overrides)
+        return PortfolioBacktestConfig(**base)
+
+    def test_no_windows_configured_keeps_every_symbol(self, monkeypatch):
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        result = run_portfolio_backtest(self._config())
+
+        assert result.point_in_time_filtered_count == 0
+        assert {t.symbol for t in result.trades} == {"BTCUSDT", "ETHUSDT"}
+
+    def test_excludes_symbol_not_in_universe_at_entry_time(self, monkeypatch):
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        window = UniverseWindow(
+            start=_T0 - timedelta(days=1), end=_T0 + timedelta(days=10), symbols=frozenset({"BTCUSDT"})
+        )
+        result = run_portfolio_backtest(self._config(point_in_time_windows=(window,)))
+
+        assert result.trades, "expected at least one trade to be admitted"
+        assert {t.symbol for t in result.trades} == {"BTCUSDT"}
+        assert result.point_in_time_filtered_count > 0
+
+    def test_timestamp_outside_every_window_excludes_everything(self, monkeypatch):
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        # A window far in the future -- none of the trades (all near _T0)
+        # fall inside it, so every candidate should be dropped.
+        window = UniverseWindow(
+            start=_T0 + timedelta(days=365), end=_T0 + timedelta(days=400), symbols=frozenset({"BTCUSDT", "ETHUSDT"})
+        )
+        result = run_portfolio_backtest(self._config(point_in_time_windows=(window,)))
+
+        assert result.trades == []
+        assert result.point_in_time_filtered_count > 0
+
+
 class TestMetrics:
     def test_known_trades_produce_expected_net_profit_and_win_rate(self):
         from scanner.backtesting.portfolio_backtest import Trade
@@ -420,6 +481,32 @@ class TestDashboardReport:
         assert report["statistical_validation"]["n_observations"] == 2
         assert report["statistical_validation"]["n_trials"] == 1
         assert report["statistical_validation"]["deflated_sharpe_benchmark"] == 0.0
+
+        assert report["point_in_time_universe"] == {"enabled": False}
+
+    def test_report_shows_point_in_time_universe_when_enabled(self):
+        from scanner.backtesting.historical_universe import UniverseWindow
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            build_dashboard_report,
+        )
+
+        window = UniverseWindow(start=_T0, end=_T0 + timedelta(days=1), symbols=frozenset({"BTCUSDT"}))
+        config = PortfolioBacktestConfig(
+            symbols=("BTCUSDT",),
+            point_in_time_windows=(window,),
+            point_in_time_universe_cache_path="scanner_data/point_in_time_universe.json",
+        )
+        metrics = _compute_metrics([], [], config, concurrency_samples=[])
+        result = PortfolioBacktestResult(trades=[], equity_curve=[], metrics=metrics, point_in_time_filtered_count=3)
+
+        report = build_dashboard_report(config, result)
+
+        assert report["point_in_time_universe"] == {
+            "enabled": True,
+            "cache_path": "scanner_data/point_in_time_universe.json",
+            "trades_excluded": 3,
+        }
 
     def test_empty_trades_produce_empty_breakdowns_and_curve(self):
         from scanner.backtesting.portfolio_backtest import (
