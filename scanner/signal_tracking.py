@@ -24,6 +24,7 @@ millisecond-perfect fills.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -31,12 +32,14 @@ from typing import Any
 
 from agents_crypto.best_signal import BEST_SIGNAL_HORIZON_CANDLES, compute_candidates
 from agents_crypto.risk_calc import TP1_WEIGHT, TP2_WEIGHT, TP3_WEIGHT
+from scanner.btc_context import BTC_SYMBOL
 from scanner.calibration import DEFAULT_ROUND_TRIP_COST_PCT
 from scanner.storage import (
     fetch_open_signal_outcome,
     fetch_open_signal_outcomes,
     log_signal_outcome,
     resolve_signal_outcome,
+    touch_signal_outcome_excursion,
     update_signal_outcome_progress,
 )
 
@@ -58,6 +61,26 @@ MULTI_TARGET_TIMEFRAMES: frozenset[str] = frozenset(
     tf for tf, minutes in TIMEFRAME_MINUTES.items() if minutes > 59
 )
 
+# How many candles the *live tracker* waits before declaring an unresolved
+# trade a timeout -- deliberately separate from BEST_SIGNAL_HORIZON_CANDLES
+# (which stays the backtest/calibration labeling horizon and must not
+# change just because this does, or every promised win rate would silently
+# mean something different). A multi-target (1h/4h) trade already has its
+# stop moved to breakeven after TP1 (see _effective_stop_for below), so
+# letting it run longer for TP2/TP3 adds no extra downside risk; a
+# single-target (5m/15m) trade has no such protection yet, so it keeps a
+# shorter leash -- still longer than the 12-candle backtest horizon, but far
+# short of 72, partly because funding-rate costs for a held futures
+# position are not modeled anywhere in this project yet (see
+# PHASE8_PROFITABILITY_RESEARCH_TODO.md Korak 5).
+TIMEOUT_CANDLES_MULTI_TARGET = 72
+TIMEOUT_CANDLES_SINGLE_TARGET = 24
+
+
+def _timeout_candles_for(timeframe: str) -> int:
+    return TIMEOUT_CANDLES_MULTI_TARGET if timeframe in MULTI_TARGET_TIMEFRAMES else TIMEOUT_CANDLES_SINGLE_TARGET
+
+
 _TP_WEIGHTS = (TP1_WEIGHT, TP2_WEIGHT, TP3_WEIGHT)
 
 # How many of the Top Signal Now panel's ranked candidates to actually track
@@ -68,6 +91,60 @@ _TP_WEIGHTS = (TP1_WEIGHT, TP2_WEIGHT, TP3_WEIGHT)
 # not a subtly different (and much larger, now that there are 4 independent
 # timeframes instead of 1) recomputation.
 DEFAULT_TRACKING_LIMIT = 5
+
+
+def _build_entry_snapshot_json(
+    row: dict[str, Any] | None, tf_snapshot: dict[str, Any] | None, candidate: dict[str, Any], btc_row: dict[str, Any] | None
+) -> str:
+    """Freeze the indicator/derivatives/quality/correlation picture at the
+    moment a signal is logged, as a flat JSON blob -- the live ``scans``
+    rows this is computed from are pruned after 60 days
+    (``storage.prune_old_scans``), so without this, a resolved trade
+    older than that has no way to be analyzed against what the market
+    actually looked like at entry (e.g. "do wins conditioned on high RSI
+    look different from wins conditioned on low RSI"). Deliberately a
+    loose, additive dict (not its own schema) so new fields can be added
+    over time without a migration -- anything here is for later read-only
+    analysis, never fed back into a live trading decision.
+
+    ``row``/``tf_snapshot`` can be ``None`` (e.g. if the symbol momentarily
+    dropped out of this cycle's rows between ranking and logging) --
+    returns whatever partial context is still available rather than
+    failing the whole log attempt."""
+    derivatives = (row or {}).get("snapshot", {}).get("derivatives", {}) if row else {}
+    snapshot: dict[str, Any] = {
+        "rsi": (tf_snapshot or {}).get("rsi"),
+        "ema9": (tf_snapshot or {}).get("ema9"),
+        "ema20": (tf_snapshot or {}).get("ema20"),
+        "ema50": (tf_snapshot or {}).get("ema50"),
+        "ema200": (tf_snapshot or {}).get("ema200"),
+        "macd": (tf_snapshot or {}).get("macd"),
+        "macd_signal": (tf_snapshot or {}).get("macd_signal"),
+        "macd_hist": (tf_snapshot or {}).get("macd_hist"),
+        "atr": (tf_snapshot or {}).get("atr"),
+        "bollinger_upper": (tf_snapshot or {}).get("bollinger_upper"),
+        "bollinger_lower": (tf_snapshot or {}).get("bollinger_lower"),
+        "volatility_regime": (tf_snapshot or {}).get("volatility_regime"),
+        "relative_volume": (tf_snapshot or {}).get("relative_volume"),
+        "volume_change_pct": (tf_snapshot or {}).get("volume_change_pct"),
+        "support": (tf_snapshot or {}).get("support"),
+        "resistance": (tf_snapshot or {}).get("resistance"),
+        "drawdown_pct": (tf_snapshot or {}).get("drawdown_pct"),
+        "momentum_fading": (tf_snapshot or {}).get("momentum_fading"),
+        "anomalies": (tf_snapshot or {}).get("anomalies"),
+        "funding_rate": derivatives.get("funding_rate"),
+        "open_interest": derivatives.get("open_interest"),
+        "open_interest_change_pct_5m": derivatives.get("open_interest_change_pct_5m"),
+        "open_interest_change_pct_15m": derivatives.get("open_interest_change_pct_15m"),
+        "open_interest_change_pct_60m": derivatives.get("open_interest_change_pct_60m"),
+        "quality_score_breakdown": candidate.get("quality_score"),
+        "diverges_from_btc": candidate.get("diverges_from_btc"),
+        "correlation": candidate.get("correlation"),
+        "current_market_regime": candidate.get("current_market_regime"),
+        "btc_trend": (btc_row or {}).get("trend"),
+        "btc_close": (btc_row or {}).get("close_price"),
+    }
+    return json.dumps(snapshot)
 
 
 def log_new_signals(
@@ -94,6 +171,8 @@ def log_new_signals(
     this tracker's own input in sync with what the dashboard shows.
     """
     result = compute_candidates(rows, limit=limit, muted_buckets=muted_buckets)
+    rows_by_symbol = {row["symbol"]: row for row in rows}
+    btc_row = rows_by_symbol.get(BTC_SYMBOL)
     logged = 0
     for candidate in result["signals"]:
         entry = candidate.get("entry")
@@ -102,6 +181,8 @@ def log_new_signals(
         symbol, timeframe, direction = candidate["symbol"], candidate["timeframe"], candidate["direction"]
         if fetch_open_signal_outcome(conn, symbol, timeframe, direction) is not None:
             continue  # already tracking this exact opportunity
+        row = rows_by_symbol.get(symbol)
+        tf_snapshot = (row or {}).get("snapshot", {}).get("timeframes", {}).get(timeframe)
         log_signal_outcome(
             conn,
             symbol=symbol,
@@ -122,6 +203,8 @@ def log_new_signals(
             regime_fallback=candidate.get("regime_fallback"),
             take_profit_extended=entry.get("take_profit_extended"),
             multi_target=timeframe in MULTI_TARGET_TIMEFRAMES,
+            entry_snapshot_json=_build_entry_snapshot_json(row, tf_snapshot, candidate, btc_row),
+            timeout_candles=_timeout_candles_for(timeframe),
         )
         logged += 1
         if on_new_signal is not None:
@@ -153,11 +236,46 @@ def _weighted_net_return_pct(direction: str, entry_price: float, legs: list[tupl
 
 
 def _timeout_status(outcome: dict[str, Any]) -> str | None:
+    # timeout_candles is the live tracker's own patience (see
+    # _timeout_candles_for); outcomes logged before that column existed
+    # fall back to recomputing it from the timeframe, never to the
+    # unrelated horizon_candles/backtest-labeling value.
+    timeout_candles = outcome.get("timeout_candles") or _timeout_candles_for(outcome["timeframe"])
     minutes_per_candle = TIMEFRAME_MINUTES.get(outcome["timeframe"], 60)
-    horizon_minutes = outcome["horizon_candles"] * minutes_per_candle
+    horizon_minutes = timeout_candles * minutes_per_candle
     logged_at = datetime.fromisoformat(outcome["logged_at"])
     elapsed_minutes = (datetime.now(UTC) - logged_at).total_seconds() / 60.0
     return "timeout" if elapsed_minutes >= horizon_minutes else None
+
+
+def _directional_excursion_pct(direction: str, entry_price: float, close: float) -> float:
+    """How far ``close`` has moved from ``entry_price``, in the trade's own
+    favor (positive) or against it (negative) -- the sign-normalized,
+    direction-agnostic building block for MFE/MAE tracking, so a short's
+    favorable drop and a long's favorable rise both read as positive."""
+    raw_pct = (close - entry_price) / entry_price * 100.0
+    return raw_pct if direction == "long" else -raw_pct
+
+
+def _updated_excursion(
+    outcome: dict[str, Any], direction: str, entry_price: float, close: float
+) -> tuple[float, float, float, float]:
+    """Roll this cycle's close into the running MFE/MAE extrema already
+    stored on ``outcome``, returning the (possibly unchanged)
+    ``(mfe_pct, mfe_price, mae_pct, mae_price)`` to persist this cycle.
+    Falls back to a zero-excursion baseline at the entry price for any
+    trade that predates these columns (see storage._migrate_schema's
+    backfill, which should make that fallback a no-op in practice)."""
+    current = _directional_excursion_pct(direction, entry_price, close)
+    mfe_pct = outcome.get("mfe_pct")
+    mfe_price = outcome.get("mfe_price")
+    if mfe_pct is None or current > mfe_pct:
+        mfe_pct, mfe_price = current, close
+    mae_pct = outcome.get("mae_pct")
+    mae_price = outcome.get("mae_price")
+    if mae_pct is None or current < mae_pct:
+        mae_pct, mae_price = current, close
+    return mfe_pct, mfe_price, mae_pct, mae_price
 
 
 def _resolve_single_target_signal(conn: Any, outcome: dict[str, Any], close: float) -> int:
@@ -178,10 +296,24 @@ def _resolve_single_target_signal(conn: Any, outcome: dict[str, Any], close: flo
     else:
         status = _timeout_status(outcome)
 
+    mfe_pct, mfe_price, mae_pct, mae_price = _updated_excursion(outcome, direction, outcome["entry_price"], close)
     if status is None:
+        touch_signal_outcome_excursion(
+            conn, outcome["id"], mfe_pct=mfe_pct, mfe_price=mfe_price, mae_pct=mae_pct, mae_price=mae_price
+        )
         return 0
     net_return = _net_return_pct(direction, outcome["entry_price"], close)
-    resolve_signal_outcome(conn, outcome["id"], status, close, net_return)
+    resolve_signal_outcome(
+        conn,
+        outcome["id"],
+        status,
+        close,
+        net_return,
+        mfe_pct=mfe_pct,
+        mfe_price=mfe_price,
+        mae_pct=mae_pct,
+        mae_price=mae_price,
+    )
     return 1
 
 
@@ -227,10 +359,21 @@ def _resolve_multi_target_signal(conn: Any, outcome: dict[str, Any], close: floa
     targets = [outcome["take_profit_conservative"], outcome["take_profit"], outcome["take_profit_extended"]]
 
     stop_hit = close <= effective_stop if direction == "long" else close >= effective_stop
+    mfe_pct, mfe_price, mae_pct, mae_price = _updated_excursion(outcome, direction, entry_price, close)
     if stop_hit:
         status = {0: "stop_loss", 1: "tp1_be", 2: "tp2_be"}[targets_hit]
         net_return = _partial_close_net_return_pct(direction, entry_price, targets, targets_hit, close)
-        resolve_signal_outcome(conn, outcome["id"], status, close, net_return)
+        resolve_signal_outcome(
+            conn,
+            outcome["id"],
+            status,
+            close,
+            net_return,
+            mfe_pct=mfe_pct,
+            mfe_price=mfe_price,
+            mae_pct=mae_pct,
+            mae_price=mae_price,
+        )
         return 1
 
     # Bank every target reached this cycle (possibly more than one, if a
@@ -246,21 +389,51 @@ def _resolve_multi_target_signal(conn: Any, outcome: dict[str, Any], close: floa
     if new_targets_hit == 3:
         legs = list(zip(_TP_WEIGHTS, targets, strict=False))
         net_return = _weighted_net_return_pct(direction, entry_price, legs)
-        resolve_signal_outcome(conn, outcome["id"], "full_run", targets[-1], net_return)
+        resolve_signal_outcome(
+            conn,
+            outcome["id"],
+            "full_run",
+            targets[-1],
+            net_return,
+            mfe_pct=mfe_pct,
+            mfe_price=mfe_price,
+            mae_pct=mae_pct,
+            mae_price=mae_price,
+        )
         return 1
 
     if new_targets_hit != targets_hit:
         new_effective_stop = _effective_stop_for(new_targets_hit, entry_price, stop_loss, targets[0])
         update_signal_outcome_progress(
-            conn, outcome["id"], targets_hit=new_targets_hit, effective_stop_loss=new_effective_stop
+            conn,
+            outcome["id"],
+            targets_hit=new_targets_hit,
+            effective_stop_loss=new_effective_stop,
+            mfe_pct=mfe_pct,
+            mfe_price=mfe_price,
+            mae_pct=mae_pct,
+            mae_price=mae_price,
         )
         return 0  # stop just moved -- trade stays open, not a resolution
 
     status = _timeout_status(outcome)
     if status is None:
+        touch_signal_outcome_excursion(
+            conn, outcome["id"], mfe_pct=mfe_pct, mfe_price=mfe_price, mae_pct=mae_pct, mae_price=mae_price
+        )
         return 0
     net_return = _partial_close_net_return_pct(direction, entry_price, targets, targets_hit, close)
-    resolve_signal_outcome(conn, outcome["id"], status, close, net_return)
+    resolve_signal_outcome(
+        conn,
+        outcome["id"],
+        status,
+        close,
+        net_return,
+        mfe_pct=mfe_pct,
+        mfe_price=mfe_price,
+        mae_pct=mae_pct,
+        mae_price=mae_price,
+    )
     return 1
 
 

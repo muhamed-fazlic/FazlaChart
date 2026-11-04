@@ -7,6 +7,7 @@ calibration lookups are monkeypatched, same pattern as test_webapp.py.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -157,6 +158,26 @@ class TestLogNewSignals:
         assert logged == 1
         assert len(fetch_recent_signal_outcomes(conn)) == 1
 
+    def test_captures_an_entry_indicator_snapshot_and_a_per_timeframe_timeout(self, conn):
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])
+        assert log_new_signals(conn, _rows(conn)) == 1
+        outcome = fetch_recent_signal_outcomes(conn)[0]
+
+        snapshot = json.loads(outcome["entry_snapshot_json"])
+        assert snapshot["rsi"] == 45.0
+        assert snapshot["ema20"] == 10.0
+
+        # 1h is a multi-target timeframe (see MULTI_TARGET_TIMEFRAMES) --
+        # it gets the longer 72-candle live timeout, not the single-target
+        # 24-candle one, since its stop already moves to breakeven after TP1.
+        assert outcome["timeout_candles"] == 72
+
+    def test_single_target_timeframe_gets_the_shorter_timeout(self, conn):
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="5m"), [])
+        assert log_new_signals(conn, _rows(conn)) == 1
+        outcome = fetch_recent_signal_outcomes(conn)[0]
+        assert outcome["timeout_candles"] == 24
+
 
 class TestResolveOpenSignals:
     def test_resolves_take_profit_when_price_reaches_target(self, conn):
@@ -226,8 +247,10 @@ class TestResolveOpenSignals:
         save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])
         log_new_signals(conn, _rows(conn))
 
-        # Backdate logged_at well past the 12-candle (12h, on a 1h timeframe) horizon.
-        stale_time = (datetime.now(UTC) - timedelta(hours=20)).isoformat()
+        # Backdate logged_at well past the live tracker's 72-candle (72h, on
+        # a 1h multi-target timeframe) timeout -- see
+        # signal_tracking.TIMEOUT_CANDLES_MULTI_TARGET.
+        stale_time = (datetime.now(UTC) - timedelta(hours=80)).isoformat()
         conn.execute("UPDATE signal_outcomes SET logged_at = ?", (stale_time,))
         conn.commit()
 
@@ -371,7 +394,7 @@ class TestMultiTargetResolution:
         save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1 - 0.01, timeframe="4h"), [])
         resolve_open_signals(conn, _rows(conn))  # banks TP1
 
-        stale_time = (datetime.now(UTC) - timedelta(hours=60)).isoformat()
+        stale_time = (datetime.now(UTC) - timedelta(hours=300)).isoformat()
         conn.execute("UPDATE signal_outcomes SET logged_at = ?", (stale_time,))
         conn.commit()
 
@@ -382,6 +405,95 @@ class TestMultiTargetResolution:
         updated = fetch_recent_signal_outcomes(conn)[0]
         assert updated["status"] == "timeout"
         assert updated["realized_return_pct"] > 0  # TP1's banked profit still counts toward the final return
+
+    def test_banking_a_target_stamps_its_tp1_hit_at_timestamp(self, conn):
+        outcome = self._log_4h_short(conn)
+        assert outcome["tp1_hit_at"] is None
+        tp1 = outcome["take_profit_conservative"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1 - 0.01, timeframe="4h"), [])
+        resolve_open_signals(conn, _rows(conn))  # banks TP1
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["tp1_hit_at"] is not None
+        assert updated["tp2_hit_at"] is None
+        first_tp1_hit_at = updated["tp1_hit_at"]
+
+        # A further cycle that doesn't bank TP2 yet must not rewrite tp1_hit_at.
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp1, timeframe="4h"), [])
+        resolve_open_signals(conn, _rows(conn))
+        assert fetch_recent_signal_outcomes(conn)[0]["tp1_hit_at"] == first_tp1_hit_at
+
+    def test_a_jump_past_two_targets_in_one_cycle_stamps_both_timestamps(self, conn):
+        outcome = self._log_4h_short(conn)
+        tp2 = outcome["take_profit"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", tp2 - 0.01, timeframe="4h"), [])
+        resolve_open_signals(conn, _rows(conn))  # banks both TP1 and TP2 in one cycle
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["tp1_hit_at"] is not None
+        assert updated["tp2_hit_at"] is not None
+
+
+class TestExcursionTracking:
+    """MFE/MAE (maximum favorable/adverse excursion) is tracked every open
+    cycle, not just conditionally on which side eventually got hit -- see
+    signal_tracking._updated_excursion."""
+
+    def test_mfe_and_mae_start_at_the_entry_price_with_zero_excursion(self, conn):
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])
+        log_new_signals(conn, _rows(conn))
+        outcome = fetch_recent_signal_outcomes(conn)[0]
+        assert outcome["mfe_pct"] == 0.0
+        assert outcome["mae_pct"] == 0.0
+        assert outcome["mfe_price"] == outcome["entry_price"]
+        assert outcome["mae_price"] == outcome["entry_price"]
+
+    def test_a_favorable_move_that_reverts_is_still_recorded_as_the_mfe(self, conn):
+        # A short's favorable direction is downward. Uses 5m (single-target)
+        # so a dip toward TP doesn't also bank a multi-target partial close.
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="5m"), [])
+        log_new_signals(conn, _rows(conn))
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 9.95, timeframe="5m"), [])  # favorable dip
+        resolve_open_signals(conn, _rows(conn))
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="5m"), [])  # reverts to entry
+        resolve_open_signals(conn, _rows(conn))
+
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "open"
+        assert updated["mfe_price"] == 9.95  # best point reached toward TP, even though it reverted
+        assert updated["mfe_pct"] > 0
+        assert updated["mae_pct"] == 0.0  # price never moved against the short beyond entry
+
+    def test_an_adverse_move_that_reverts_is_still_recorded_as_the_mae(self, conn):
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="5m"), [])
+        log_new_signals(conn, _rows(conn))
+        stop_loss = fetch_recent_signal_outcomes(conn)[0]["stop_loss"]
+
+        near_stop = stop_loss - 0.01  # moves toward (not past) the stop -- still against a short
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", near_stop, timeframe="5m"), [])
+        resolve_open_signals(conn, _rows(conn))
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="5m"), [])  # reverts to entry
+        resolve_open_signals(conn, _rows(conn))
+
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "open"
+        assert updated["mae_price"] == near_stop  # worst point reached toward SL, even though it reverted
+        assert updated["mae_pct"] < 0
+
+    def test_excursion_is_still_recorded_on_the_resolving_cycle_itself(self, conn):
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="5m"), [])
+        log_new_signals(conn, _rows(conn))
+        stop_loss = fetch_recent_signal_outcomes(conn)[0]["stop_loss"]
+
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", stop_loss + 0.01, timeframe="5m"), [])
+        resolve_open_signals(conn, _rows(conn))
+
+        updated = fetch_recent_signal_outcomes(conn)[0]
+        assert updated["status"] == "stop_loss"
+        assert updated["mae_price"] == stop_loss + 0.01
 
 
 class TestNetReturnPct:

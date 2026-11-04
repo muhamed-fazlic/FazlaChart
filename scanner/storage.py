@@ -74,7 +74,32 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     take_profit_extended REAL,
     multi_target INTEGER NOT NULL DEFAULT 0,
     targets_hit INTEGER NOT NULL DEFAULT 0,
-    effective_stop_loss REAL
+    effective_stop_loss REAL,
+    -- Phase 8 prep: richer forward-outcome data for later "big picture"
+    -- analysis (correlated-trade independence, regime/indicator
+    -- conditioning, execution-path realism) that the point-in-time
+    -- entry/exit columns above can't answer alone. mfe/mae ("maximum
+    -- favorable/adverse excursion") are directional (positive = in the
+    -- trade's favor, regardless of long/short) and tracked every scan
+    -- cycle for the life of the trade, not just conditionally on which
+    -- side eventually got hit -- same close-price sampling granularity as
+    -- resolution itself (see module docstring), so a wick between cycles
+    -- can still be missed. entry_snapshot_json freezes the indicator/
+    -- derivatives/quality-score/correlation picture *at log time*, since
+    -- the live scan rows this was computed from are not kept forever
+    -- (see prune_old_scans). timeout_candles is the live tracker's own
+    -- patience before declaring a timeout, decoupled from horizon_candles
+    -- (which stays the backtest/calibration labeling horizon) -- see
+    -- signal_tracking.TIMEOUT_CANDLES_MULTI_TARGET/_SINGLE_TARGET.
+    mfe_pct REAL,
+    mfe_price REAL,
+    mae_pct REAL,
+    mae_price REAL,
+    entry_snapshot_json TEXT,
+    tp1_hit_at TEXT,
+    tp2_hit_at TEXT,
+    tp3_hit_at TEXT,
+    timeout_candles INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_status ON signal_outcomes (status);
 CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol_open ON signal_outcomes (symbol, timeframe, direction, status);
@@ -146,6 +171,29 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signal_outcomes ADD COLUMN targets_hit INTEGER NOT NULL DEFAULT 0")
     if "effective_stop_loss" not in columns:
         conn.execute("ALTER TABLE signal_outcomes ADD COLUMN effective_stop_loss REAL")
+    if "mfe_pct" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN mfe_pct REAL")
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN mfe_price REAL")
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN mae_pct REAL")
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN mae_price REAL")
+        # Backfill existing rows (open or already resolved) to a zero-
+        # excursion baseline at their own entry price, instead of leaving
+        # them NULL forever -- an open row then gets genuinely tracked
+        # from here on; a resolved row simply reads as "no excursion data
+        # available", which is honest for trades logged before this column
+        # existed.
+        conn.execute(
+            "UPDATE signal_outcomes SET mfe_pct = 0, mfe_price = entry_price,"
+            " mae_pct = 0, mae_price = entry_price WHERE mfe_pct IS NULL"
+        )
+    if "entry_snapshot_json" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN entry_snapshot_json TEXT")
+    if "tp1_hit_at" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN tp1_hit_at TEXT")
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN tp2_hit_at TEXT")
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN tp3_hit_at TEXT")
+    if "timeout_candles" not in columns:
+        conn.execute("ALTER TABLE signal_outcomes ADD COLUMN timeout_candles INTEGER")
 
 
 def connect_for_reads(storage_path: str, timeout: float = 10.0) -> sqlite3.Connection:
@@ -319,6 +367,8 @@ def log_signal_outcome(
     regime_fallback: bool | None = None,
     take_profit_extended: float | None = None,
     multi_target: bool = False,
+    entry_snapshot_json: str | None = None,
+    timeout_candles: int | None = None,
 ) -> None:
     """Record one new live signal to track to its outcome. Callers are
     responsible for not calling this twice for the same still-open trade
@@ -329,7 +379,17 @@ def log_signal_outcome(
     ``signal_tracking.MULTI_TARGET_TIMEFRAMES``) manages the trade through
     TP1/TP2/TP3 partial closes instead of one single exit --
     ``effective_stop_loss`` starts equal to ``stop_loss`` and moves as each
-    target is banked (see ``signal_tracking.resolve_open_signals``)."""
+    target is banked (see ``signal_tracking.resolve_open_signals``).
+
+    ``entry_snapshot_json`` freezes whatever indicator/derivatives/quality
+    context the caller had at log time (see
+    ``signal_tracking._build_entry_snapshot_json``) -- stored as-is, never
+    interpreted here. ``timeout_candles`` is the live tracker's own patience
+    before declaring a timeout (see ``signal_tracking._timeout_candles_for``),
+    independent of ``horizon_candles`` (the backtest/calibration labeling
+    horizon, which must not change just because the live timeout does).
+    mfe/mae start at zero excursion, at the entry price itself -- no price
+    movement has happened yet the instant a trade is logged."""
     conn.execute(
         """
         INSERT INTO signal_outcomes (
@@ -337,8 +397,9 @@ def log_signal_outcome(
             stop_loss, take_profit, take_profit_conservative,
             promised_win_rate_pct, promised_win_rate_ci_low_pct, promised_n,
             horizon_candles, status, regime, pattern, quality_score, regime_fallback,
-            take_profit_extended, multi_target, targets_hit, effective_stop_loss
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, 0, ?)
+            take_profit_extended, multi_target, targets_hit, effective_stop_loss,
+            mfe_pct, mfe_price, mae_pct, mae_price, entry_snapshot_json, timeout_candles
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, 0, ?, ?, ?)
         """,
         (
             symbol,
@@ -361,22 +422,82 @@ def log_signal_outcome(
             take_profit_extended,
             int(multi_target),
             stop_loss,
+            entry_price,
+            entry_price,
+            entry_snapshot_json,
+            timeout_candles,
         ),
     )
     conn.commit()
 
 
 def update_signal_outcome_progress(
-    conn: sqlite3.Connection, outcome_id: int, *, targets_hit: int, effective_stop_loss: float
+    conn: sqlite3.Connection,
+    outcome_id: int,
+    *,
+    targets_hit: int,
+    effective_stop_loss: float,
+    mfe_pct: float,
+    mfe_price: float,
+    mae_pct: float,
+    mae_price: float,
 ) -> None:
     """Persist multi-target partial-close progress without resolving the
     trade -- called when a TP1/TP2 is banked (see
     ``signal_tracking.resolve_open_signals``) so the next scan cycle checks
     the moved stop and the next un-banked target, and the trade stays
-    ``open`` until the final target or the (now moved) stop is hit."""
+    ``open`` until the final target or the (now moved) stop is hit.
+
+    Also stamps whichever of ``tp1_hit_at``/``tp2_hit_at``/``tp3_hit_at``
+    just became true this call -- the ``COALESCE`` means a column already
+    set keeps its original timestamp forever, so calling this repeatedly as
+    later targets bank never rewrites an earlier target's hit time. The
+    same sampling-cycle precision as resolution applies: if a fast move
+    jumps past two targets between cycles, both get the same timestamp.
+    Also updates the running MFE/MAE extrema the same as
+    :func:`touch_signal_outcome_excursion`, since this call already touches
+    the row this cycle."""
+    now = datetime.now(UTC).isoformat()
     conn.execute(
-        "UPDATE signal_outcomes SET targets_hit = ?, effective_stop_loss = ? WHERE id = ?",
-        (targets_hit, effective_stop_loss, outcome_id),
+        """
+        UPDATE signal_outcomes
+        SET targets_hit = ?, effective_stop_loss = ?,
+            mfe_pct = ?, mfe_price = ?, mae_pct = ?, mae_price = ?,
+            tp1_hit_at = COALESCE(tp1_hit_at, CASE WHEN ? >= 1 THEN ? END),
+            tp2_hit_at = COALESCE(tp2_hit_at, CASE WHEN ? >= 2 THEN ? END),
+            tp3_hit_at = COALESCE(tp3_hit_at, CASE WHEN ? >= 3 THEN ? END)
+        WHERE id = ?
+        """,
+        (
+            targets_hit,
+            effective_stop_loss,
+            mfe_pct,
+            mfe_price,
+            mae_pct,
+            mae_price,
+            targets_hit,
+            now,
+            targets_hit,
+            now,
+            targets_hit,
+            now,
+            outcome_id,
+        ),
+    )
+    conn.commit()
+
+
+def touch_signal_outcome_excursion(
+    conn: sqlite3.Connection, outcome_id: int, *, mfe_pct: float, mfe_price: float, mae_pct: float, mae_price: float
+) -> None:
+    """Update only the running MFE/MAE extrema for an open trade that
+    neither resolved nor banked a new target this cycle -- the common case
+    on most scan cycles for most open trades. Kept as its own cheap
+    single-purpose write rather than folded into a no-op progress/resolve
+    call."""
+    conn.execute(
+        "UPDATE signal_outcomes SET mfe_pct = ?, mfe_price = ?, mae_pct = ?, mae_price = ? WHERE id = ?",
+        (mfe_pct, mfe_price, mae_pct, mae_price, outcome_id),
     )
     conn.commit()
 
@@ -409,13 +530,43 @@ def fetch_open_signal_outcomes(conn: sqlite3.Connection) -> list[dict[str, Any]]
 
 
 def resolve_signal_outcome(
-    conn: sqlite3.Connection, outcome_id: int, status: str, exit_price: float, realized_return_pct: float
+    conn: sqlite3.Connection,
+    outcome_id: int,
+    status: str,
+    exit_price: float,
+    realized_return_pct: float,
+    *,
+    mfe_pct: float | None = None,
+    mfe_price: float | None = None,
+    mae_pct: float | None = None,
+    mae_price: float | None = None,
 ) -> None:
-    """Close out a tracked signal with its real, observed outcome."""
+    """Close out a tracked signal with its real, observed outcome.
+
+    ``mfe_pct``/``mfe_price``/``mae_pct``/``mae_price`` are optional so
+    existing callers (and tests) that only care about the exit itself keep
+    working unchanged; a caller resolving a live-tracked trade should always
+    pass the final running excursion values computed this same cycle,
+    folding what would otherwise be a second UPDATE into this one."""
     conn.execute(
-        "UPDATE signal_outcomes SET status = ?, resolved_at = ?, exit_price = ?, realized_return_pct = ?"
-        " WHERE id = ?",
-        (status, datetime.now(UTC).isoformat(), exit_price, realized_return_pct, outcome_id),
+        """
+        UPDATE signal_outcomes
+        SET status = ?, resolved_at = ?, exit_price = ?, realized_return_pct = ?,
+            mfe_pct = COALESCE(?, mfe_pct), mfe_price = COALESCE(?, mfe_price),
+            mae_pct = COALESCE(?, mae_pct), mae_price = COALESCE(?, mae_price)
+        WHERE id = ?
+        """,
+        (
+            status,
+            datetime.now(UTC).isoformat(),
+            exit_price,
+            realized_return_pct,
+            mfe_pct,
+            mfe_price,
+            mae_pct,
+            mae_price,
+            outcome_id,
+        ),
     )
     conn.commit()
 
