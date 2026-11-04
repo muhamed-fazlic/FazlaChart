@@ -584,19 +584,108 @@ async function loadBacktestTab() {
     const report = await res.json();
     if (!report.available) {
       renderBacktestUnavailable();
-      return;
+    } else {
+      renderBacktestMeta(report);
+      renderBacktestSummary(report.metrics);
+      renderBacktestEquityCurve(report.equity_curve, report.config ? report.config.initial_capital : 10000);
+      const breakdown = report.breakdown || {};
+      renderBacktestBreakdownTable("backtest-breakdown-timeframe", "Po timeframe-u", breakdown.by_timeframe, "TF");
+      renderBacktestBreakdownTable("backtest-breakdown-direction", "Po smjeru", breakdown.by_direction, "Smjer");
+      renderBacktestBreakdownTable("backtest-breakdown-label", "Po label-u (setup tipu)", breakdown.by_label, "Label");
+      renderStatisticalValidation(report.statistical_validation);
     }
-    renderBacktestMeta(report);
-    renderBacktestSummary(report.metrics);
-    renderBacktestEquityCurve(report.equity_curve, report.config ? report.config.initial_capital : 10000);
-    const breakdown = report.breakdown || {};
-    renderBacktestBreakdownTable("backtest-breakdown-timeframe", "Po timeframe-u", breakdown.by_timeframe, "TF");
-    renderBacktestBreakdownTable("backtest-breakdown-direction", "Po smjeru", breakdown.by_direction, "Smjer");
-    renderBacktestBreakdownTable("backtest-breakdown-label", "Po label-u (setup tipu)", breakdown.by_label, "Label");
   } catch (err) {
     console.error("Could not load backtest report:", err);
     document.getElementById("backtest-meta").textContent = `Greška: ${err.message}`;
   }
+  await loadExperimentHistory();
+}
+
+// --- Phase 8 Korak 3: Deflated Sharpe Ratio + experiment registry --------
+// These two sections are a statistical check ON the backtest report above,
+// not a separate dataset -- they belong in this tab because they answer
+// "how much should I actually trust the numbers above, given how many
+// times this (or a similar) strategy has been tried?" rather than
+// presenting a new, independent metric.
+
+function renderStatisticalValidation(dsr) {
+  const el = document.getElementById("backtest-statistical-validation");
+  if (!dsr) {
+    el.className = "trades-summary muted";
+    el.innerHTML =
+      "Statistička validacija (Deflated Sharpe Ratio) nije dostupna za ovaj izvještaj " +
+      "(premalo trejdova ili izvještaj je generisan prije dodavanja ove funkcije).";
+    return;
+  }
+  el.className = "trades-summary";
+  const skillBadge = dsr.likely_skill
+    ? '<span class="dsr-badge dsr-badge-pos">vjerovatno pravi rezultat</span>'
+    : '<span class="dsr-badge dsr-badge-neg">vjerovatno slučajnost/overfitting</span>';
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">
+      📐 Statistička validacija (Deflated Sharpe Ratio) ${skillBadge}
+    </div>
+    <p class="dsr-explainer muted">
+      Observed Sharpe je obični Sharpe ratio ovog izvještaja. Deflated benchmark je koliko visok Sharpe
+      bismo <b>očekivali da vidimo čisto slučajno</b> nakon <b>${dsr.n_trials}</b> pokušaja (ovaj + prethodni, iz
+      eksperimentalnog registra ispod). Probabilistic Sharpe Ratio (PSR) je procjena vjerovatnoće da je stvarni
+      Sharpe ove strategije iznad tog benchmarka — PSR blizu 100% znači da rezultat vjerovatno nije slučajnost;
+      blizu 0% znači da i dalje može biti.
+    </p>
+    <div class="trades-summary-cards">
+      <div class="trades-summary-card"><span class="label">Observed Sharpe</span><span class="value ${signClass(dsr.observed_sharpe)}">${fmt(dsr.observed_sharpe, 3)}</span></div>
+      <div class="trades-summary-card"><span class="label">Deflated benchmark</span><span class="value">${fmt(dsr.deflated_sharpe_benchmark, 3)}</span></div>
+      <div class="trades-summary-card"><span class="label">Probabilistic Sharpe Ratio</span><span class="value">${fmt(dsr.probabilistic_sharpe_ratio * 100, 1)}%</span></div>
+      <div class="trades-summary-card"><span class="label">Broj pokušaja (n_trials)</span><span class="value">${dsr.n_trials}</span></div>
+      <div class="trades-summary-card"><span class="label">Broj trejdova</span><span class="value">${dsr.n_observations}</span></div>
+      <div class="trades-summary-card"><span class="label">Skewness</span><span class="value">${fmt(dsr.skewness, 3)}</span></div>
+      <div class="trades-summary-card"><span class="label">Kurtosis</span><span class="value">${fmt(dsr.kurtosis, 3)}</span></div>
+    </div>`;
+}
+
+// Deliberately a separate fetch from loadBacktestTab's try/catch -- the
+// experiment registry can be populated (and interesting to see) even when
+// no dashboard report has been generated yet, and vice versa, so one
+// section being unavailable should never hide the other.
+async function loadExperimentHistory() {
+  try {
+    const res = await fetch("/api/backtest/experiments?limit=50");
+    const data = await res.json();
+    renderExperimentHistory(data.available ? data.experiments : null);
+  } catch (err) {
+    console.error("Could not load experiment history:", err);
+    renderExperimentHistory(null);
+  }
+}
+
+function renderExperimentHistory(experiments) {
+  const el = document.getElementById("backtest-experiments");
+  if (!experiments || !experiments.length) {
+    el.className = "bucket-breakdown muted";
+    el.textContent = "Još nema zabilježenih eksperimenata u registru.";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = experiments
+    .map(
+      (e) => `
+    <tr>
+      <td>${fmtDateTime(e.recorded_at)}</td>
+      <td><b>${e.strategy_family}</b>${e.strategy_version ? ` <span class="muted">(${e.strategy_version})</span>` : ""}</td>
+      <td>${e.timeframe ?? "—"}</td>
+      <td>${e.n_trades ?? "—"}</td>
+      <td class="${signClass(e.sharpe_ratio)}">${e.sharpe_ratio !== null && e.sharpe_ratio !== undefined ? fmt(e.sharpe_ratio, 3) : "—"}</td>
+      <td class="${signClass(e.net_profit_pct)}">${e.net_profit_pct !== null && e.net_profit_pct !== undefined ? fmt(e.net_profit_pct, 2) + "%" : "—"}</td>
+      <td class="muted">${e.notes ?? ""}</td>
+    </tr>`
+    )
+    .join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">📋 Historija eksperimenata (svaki pokušaj, ne samo najbolji)</div>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Vrijeme</th><th>Familija</th><th>TF</th><th>N</th><th>Sharpe</th><th>Net profit</th><th>Napomene</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 function renderBacktestUnavailable() {
@@ -612,6 +701,8 @@ function renderBacktestUnavailable() {
     document.getElementById(id).className = "bucket-breakdown muted";
     document.getElementById(id).textContent = "";
   });
+  document.getElementById("backtest-statistical-validation").className = "trades-summary muted";
+  document.getElementById("backtest-statistical-validation").textContent = "";
 }
 
 function renderBacktestMeta(report) {

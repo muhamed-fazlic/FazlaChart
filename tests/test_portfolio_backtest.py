@@ -416,6 +416,11 @@ class TestDashboardReport:
         assert len(report["equity_curve"]) == 2
         assert report["equity_curve"][-1]["equity"] == pytest.approx(10_098.0)
 
+        assert report["statistical_validation"] is not None
+        assert report["statistical_validation"]["n_observations"] == 2
+        assert report["statistical_validation"]["n_trials"] == 1
+        assert report["statistical_validation"]["deflated_sharpe_benchmark"] == 0.0
+
     def test_empty_trades_produce_empty_breakdowns_and_curve(self):
         from scanner.backtesting.portfolio_backtest import (
             PortfolioBacktestResult,
@@ -430,6 +435,46 @@ class TestDashboardReport:
 
         assert report["breakdown"]["by_timeframe"] == []
         assert report["equity_curve"] == []
+        assert report["statistical_validation"] is None
+
+    def test_n_trials_is_forwarded_into_statistical_validation(self):
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            Trade,
+            build_dashboard_report,
+        )
+
+        trades = [
+            Trade(
+                symbol="BTCUSDT",
+                timeframe="1h",
+                direction="long",
+                label="trend:bullish",
+                entry_time=_T0,
+                resolution_time=_T0 + timedelta(hours=i + 1),
+                net_return_pct=1.0 if i % 2 == 0 else -0.5,
+                r_multiple=1.0 if i % 2 == 0 else -0.5,
+                equity_before=10_000.0,
+                pnl=100.0 if i % 2 == 0 else -50.0,
+                equity_after=10_000.0,
+                win_rate_ci_low_pct=55.0,
+                n=50,
+            )
+            for i in range(10)
+        ]
+        config = PortfolioBacktestConfig(symbols=("BTCUSDT",))
+        metrics = _compute_metrics(trades, [(_T0, 10_000.0)], config, concurrency_samples=[1])
+        result = PortfolioBacktestResult(trades=trades, equity_curve=[(_T0, 10_000.0)], metrics=metrics)
+
+        report = build_dashboard_report(config, result, n_trials=25)
+
+        assert report["statistical_validation"]["n_trials"] == 25
+        # No trial_sharpe_ratios/variance is available at this call site, so
+        # the deflation benchmark stays 0 regardless of n_trials -- n_trials
+        # is still recorded faithfully for transparency, even though it
+        # currently has no numeric effect without a variance estimate (see
+        # deflated_sharpe_ratio's docstring).
+        assert report["statistical_validation"]["deflated_sharpe_benchmark"] == 0.0
 
 
 class TestIndependentEpisodes:

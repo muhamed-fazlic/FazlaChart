@@ -37,6 +37,10 @@ from scanner.storage import (
     fetch_symbol_history,
     init_db,
 )
+from scanner.validation.experiment_registry import (
+    fetch_experiments,
+    init_db as init_experiment_registry,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -277,6 +281,15 @@ def _backtest_report_path() -> str:
     ``python -m scanner.backtesting.portfolio_backtest --report-json ...``;
     it is NOT regenerated automatically by this webapp process."""
     return os.environ.get("BACKTEST_REPORT_PATH", "scanner_data/portfolio_backtest_report.json")
+
+
+def _experiment_registry_path() -> str:
+    """Read lazily so tests can point this at a throwaway file via the
+    EXPERIMENT_REGISTRY_PATH env var — mirrors ``_backtest_report_path()``'s
+    convention. Written on demand by
+    ``python -m scanner.backtesting.portfolio_backtest --experiment-family ...``;
+    this webapp process only ever reads it."""
+    return os.environ.get("EXPERIMENT_REGISTRY_PATH", "scanner_data/experiment_registry.db")
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -624,6 +637,31 @@ def backtest_report() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Could not read backtest report: {exc}") from None
     report["available"] = True
     return report
+
+
+@app.get("/api/backtest/experiments")
+def backtest_experiments(limit: int = 50) -> dict[str, Any]:
+    """Reads the Phase 8 Korak 3 experiment registry (see
+    ``scanner.validation.experiment_registry``) for the "🧪 Backtest"
+    tab's trial-history table — every recorded backtest/validation attempt,
+    most recent first, so the dashboard shows honestly how many trials
+    preceded any given result (the same count the Deflated Sharpe Ratio in
+    ``/api/backtest/report`` is corrected against), not just the winner.
+
+    Returns ``{"available": False}`` rather than a 404/500 if no registry
+    database has been created yet (nothing has ever been recorded)."""
+    path = Path(_experiment_registry_path())
+    if not path.exists():
+        return {"available": False}
+    try:
+        conn = init_experiment_registry(str(path), timeout=5.0)
+        try:
+            experiments = fetch_experiments(conn, limit=limit)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read experiment registry: {exc}") from None
+    return {"available": True, "experiments": experiments}
 
 
 @app.get("/api/forward-tracking/summary")

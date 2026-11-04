@@ -90,6 +90,13 @@ from scanner.calibration import (
     wilson_score_interval,
 )
 from scanner.signal_tracking import TIMEFRAME_MINUTES
+from scanner.validation.experiment_registry import (
+    count_prior_trials,
+    fetch_experiments,
+    init_db as init_experiment_registry,
+    record_experiment,
+)
+from scanner.validation.statistical_validation import deflated_sharpe_ratio
 from tradingagents.dataflows.errors import VendorError
 
 
@@ -423,12 +430,68 @@ def _breakdown_by(trades: list[Trade], key: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def build_dashboard_report(config: PortfolioBacktestConfig, result: PortfolioBacktestResult) -> dict[str, Any]:
+def _build_statistical_validation(
+    result: PortfolioBacktestResult,
+    n_trials: int,
+    trial_sharpe_ratios: list[float] | None = None,
+) -> dict[str, Any] | None:
+    """Phase 8 Korak 3: Deflated Sharpe Ratio for this report's trade
+    returns, honestly correcting the plain Sharpe ratio for ``n_trials``
+    (how many backtest attempts preceded this one) and, when
+    ``trial_sharpe_ratios`` is supplied (the per-trade Sharpe ratio of
+    every prior recorded trial in the same family, from
+    ``scanner.validation.experiment_registry`` -- see the CLI entry point
+    below), for how spread out those prior attempts' Sharpe ratios actually
+    were. Without ``trial_sharpe_ratios`` the deflation benchmark is 0 (no
+    multiple-testing inflation applied, since there is nothing to estimate
+    variance from) even if ``n_trials`` is large. Returns ``None`` if there
+    are too few trades for a Sharpe ratio to be meaningful at all (fewer
+    than 2, or all trades had the exact same return), rather than reporting
+    a misleading or undefined statistic."""
+    returns = [t.net_return_pct for t in result.trades]
+    if len(returns) < 2:
+        return None
+    try:
+        dsr = deflated_sharpe_ratio(returns, n_trials=n_trials, trial_sharpe_ratios=trial_sharpe_ratios)
+    except ValueError:
+        return None
+    return {
+        "observed_sharpe": round(dsr.observed_sharpe, 4),
+        "deflated_sharpe_benchmark": round(dsr.deflated_sharpe_benchmark, 4),
+        "probabilistic_sharpe_ratio": round(dsr.probabilistic_sharpe_ratio, 4),
+        "likely_skill": dsr.likely_skill,
+        "n_trials": dsr.n_trials,
+        "n_observations": dsr.n_observations,
+        "skewness": round(dsr.skewness, 3),
+        "kurtosis": round(dsr.kurtosis, 3),
+    }
+
+
+def build_dashboard_report(
+    config: PortfolioBacktestConfig,
+    result: PortfolioBacktestResult,
+    *,
+    n_trials: int = 1,
+    trial_sharpe_ratios: list[float] | None = None,
+) -> dict[str, Any]:
     """Assembles the full JSON payload the dashboard's "🧪 Backtest" tab
     reads (see ``webapp/main.py``'s ``/api/backtest/report`` endpoint) --
-    metrics plus breakdowns and a downsampled equity curve, with enough
-    metadata (when it ran, with what config) that a stale/cached report is
-    never mistaken for a live result."""
+    metrics plus breakdowns, a downsampled equity curve, and a Deflated
+    Sharpe Ratio statistical-validation block, with enough metadata (when
+    it ran, with what config) that a stale/cached report is never mistaken
+    for a live result.
+
+    ``n_trials`` should be the honest count of how many backtest attempts
+    (across this and prior runs of the same strategy family) preceded this
+    one, and ``trial_sharpe_ratios`` the per-trade Sharpe ratio of every one
+    of those prior trials (this one included) -- pass both from
+    ``scanner.validation.experiment_registry.count_prior_trials()``/
+    ``fetch_experiments()`` when calling this from a context that also
+    records the experiment; the CLI entry point below does this
+    automatically via ``--experiment-family``. Both default to values that
+    apply no multiple-testing deflation at all, for callers with no
+    registry to consult.
+    """
     # Downsample the equity curve for the frontend chart -- a multi-hundred
     # trade run doesn't need a point per trade to show the shape of the curve.
     max_points = 200
@@ -461,6 +524,7 @@ def build_dashboard_report(config: PortfolioBacktestConfig, result: PortfolioBac
             "by_label": _breakdown_by(result.trades, lambda t: t.label),
         },
         "equity_curve": equity_curve,
+        "statistical_validation": _build_statistical_validation(result, n_trials, trial_sharpe_ratios),
     }
 
 
@@ -609,6 +673,18 @@ def _main() -> None:
         help="Optional path to write the dashboard-ready report (metrics + breakdowns + equity curve) as JSON, "
         "e.g. scanner_data/portfolio_backtest_report.json for the webapp's 'Backtest' tab to pick up",
     )
+    parser.add_argument(
+        "--experiment-family",
+        help="Phase 8 Korak 3: if given, this run is counted as one more trial of this strategy family in "
+        "the experiment registry (scanner_data/experiment_registry.db by default) BEFORE its results are "
+        "used, so the Deflated Sharpe Ratio in --report-json is honestly corrected for every prior attempt, "
+        "not just this one",
+    )
+    parser.add_argument(
+        "--experiment-registry-path",
+        default="scanner_data/experiment_registry.db",
+        help="Path to the experiment registry SQLite database (default: scanner_data/experiment_registry.db)",
+    )
     args = parser.parse_args()
 
     config = PortfolioBacktestConfig(
@@ -655,7 +731,38 @@ def _main() -> None:
         print(f"Wrote {len(result.trades)} trades to {args.trades_json}")
 
     if args.report_json:
-        report = build_dashboard_report(config, result)
+        n_trials = 1
+        trial_sharpe_ratios: list[float] | None = None
+        if args.experiment_family:
+            conn = init_experiment_registry(args.experiment_registry_path)
+            n_trials = count_prior_trials(conn, args.experiment_family) + 1
+            record_experiment(
+                conn,
+                strategy_family=args.experiment_family,
+                timeframe=",".join(config.timeframes),
+                horizon_candles=config.horizon_candles,
+                sl_tp_config={
+                    "round_trip_cost_pct": config.round_trip_cost_pct,
+                    "extra_slippage_pct": config.extra_slippage_pct,
+                    "warmup_candles": config.warmup_candles,
+                },
+                n_trades=result.metrics.get("n_trades"),
+                sharpe_ratio=result.metrics.get("sharpe_ratio"),
+                net_profit_pct=result.metrics.get("net_profit_pct"),
+                result=result.metrics,
+                notes=f"CLI run: {len(config.symbols)} symbols, --report-json {args.report_json}",
+            )
+            print(f"Recorded trial #{n_trials} of experiment family '{args.experiment_family}'")
+
+            # Pull every prior (and this) trial's Sharpe ratio so the DSR
+            # benchmark reflects how spread out this family's real attempts
+            # have actually been, instead of applying no deflation at all.
+            prior_experiments = fetch_experiments(conn, args.experiment_family, limit=10_000)
+            sharpes = [e["sharpe_ratio"] for e in prior_experiments if e["sharpe_ratio"] is not None]
+            if len(sharpes) >= 2:
+                trial_sharpe_ratios = sharpes
+
+        report = build_dashboard_report(config, result, n_trials=n_trials, trial_sharpe_ratios=trial_sharpe_ratios)
         with open(args.report_json, "w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=2)
         print(f"Wrote dashboard report to {args.report_json}")

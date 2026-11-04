@@ -417,6 +417,40 @@ def test_backtest_report_returns_cached_file_contents(client, tmp_path, monkeypa
     assert body["metrics"]["n_trades"] == 42
 
 
+def test_backtest_experiments_reports_unavailable_when_no_registry_exists(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("EXPERIMENT_REGISTRY_PATH", str(tmp_path / "no_such_registry.db"))
+    resp = client.get("/api/backtest/experiments")
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False}
+
+
+def test_backtest_experiments_returns_recorded_rows(client, tmp_path, monkeypatch):
+    from scanner.validation.experiment_registry import init_db, record_experiment
+
+    registry_path = tmp_path / "experiment_registry.db"
+    conn = init_db(str(registry_path))
+    record_experiment(
+        conn,
+        strategy_family="portfolio_backtest_20symbol_warmup1500",
+        timeframe="15m,1h,4h",
+        n_trades=302,
+        sharpe_ratio=-3.92,
+        net_profit_pct=-45.15,
+        result={"win_rate_pct": 38.1},
+        notes="unit test row",
+    )
+    conn.close()
+    monkeypatch.setenv("EXPERIMENT_REGISTRY_PATH", str(registry_path))
+
+    resp = client.get("/api/backtest/experiments")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert len(body["experiments"]) == 1
+    assert body["experiments"][0]["strategy_family"] == "portfolio_backtest_20symbol_warmup1500"
+    assert body["experiments"][0]["n_trades"] == 302
+
+
 def test_best_signal_excludes_a_muted_bucket(client, monkeypatch):
     from scanner.calibration import CalibrationStats
     from scanner.storage import init_db, mute_bucket
