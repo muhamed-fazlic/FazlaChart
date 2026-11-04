@@ -160,12 +160,15 @@ class TestLogNewSignals:
 
 class TestResolveOpenSignals:
     def test_resolves_take_profit_when_price_reaches_target(self, conn):
-        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0), [])
+        # 15m is single-target (not in MULTI_TARGET_TIMEFRAMES) -- the
+        # multi-target 1h/4h partial-close path is covered separately in
+        # TestMultiTargetResolution below.
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="15m"), [])
         log_new_signals(conn, _rows(conn))
         outcome = fetch_recent_signal_outcomes(conn)[0]
         take_profit = outcome["take_profit"]
 
-        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", take_profit - 0.01), [])
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", take_profit - 0.01, timeframe="15m"), [])
         resolved = resolve_open_signals(conn, _rows(conn))
 
         assert resolved == 1
@@ -264,6 +267,14 @@ class TestMultiTargetResolution:
         # TP3 (extended) should be further from entry than TP2 (take_profit)
         # for a short -- i.e. a lower price.
         assert outcome["take_profit_extended"] < outcome["take_profit"]
+
+    def test_1h_signals_are_also_managed_as_multi_target(self, conn):
+        # Any timeframe of 1h or longer gets TP1/TP2/TP3 -- not just 4h.
+        save_scan_result(conn, "INJUSDT", _snapshot("INJUSDT", "bearish", 10.0, timeframe="1h"), [])
+        log_new_signals(conn, _rows(conn))
+        outcome = fetch_recent_signal_outcomes(conn)[0]
+        assert outcome["multi_target"] == 1
+        assert outcome["take_profit_extended"] is not None
 
     def test_banking_tp1_moves_the_stop_to_breakeven_and_keeps_the_trade_open(self, conn):
         outcome = self._log_4h_short(conn)

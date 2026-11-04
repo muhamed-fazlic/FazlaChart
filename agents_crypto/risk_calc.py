@@ -34,7 +34,7 @@ ELEVATED_VOLATILITY_RISK_PCT = 4.0
 CONSERVATIVE_TP_FRACTION = 0.75
 
 # Extended third target: for timeframes whose moves tend to run further and
-# for longer (currently 4h -- see signal_tracking.MULTI_TARGET_TIMEFRAMES),
+# for longer (currently 1h and 4h -- see signal_tracking.MULTI_TARGET_TIMEFRAMES),
 # a trade is managed with three partial targets instead of one single exit.
 # TP1 = take_profit_conservative (the existing 0.75x target), TP2 =
 # take_profit (the existing full 1.0x target), TP3 = this extra "let it run"

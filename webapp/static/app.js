@@ -78,6 +78,11 @@ const BEST_SIGNAL_TIMEFRAME_LABELS = {
   "1h": "1h · Intraday",
   "4h": "4h · Swing",
 };
+
+// Timeframes managed with TP1/TP2/TP3 instead of one single target — must
+// mirror scanner.signal_tracking.MULTI_TARGET_TIMEFRAMES (any timeframe of
+// 1h or longer).
+const MULTI_TARGET_TIMEFRAMES = new Set(["1h", "4h"]);
 let activeBestSignalTimeframe = "1h";
 
 function winRateRangeHtml(low, high) {
@@ -92,7 +97,7 @@ function bestSignalEntryHtml(sig) {
   // 4h candidates are managed as multi-target trades (TP1/TP2/TP3, stop to
   // breakeven after TP1) — show all three so the plan matches how it will
   // actually be tracked, instead of just the single TP a 1h/15m trade gets.
-  const isMultiTarget = sig.timeframe === "4h" && e.take_profit_extended !== undefined && e.take_profit_extended !== null;
+  const isMultiTarget = MULTI_TARGET_TIMEFRAMES.has(sig.timeframe) && e.take_profit_extended !== undefined && e.take_profit_extended !== null;
   const tpHtml = isMultiTarget
     ? `<span>TP1: ${fmtPrice(e.take_profit_conservative)} (40%) · TP2: ${fmtPrice(e.take_profit)} (35%) · TP3: ${fmtPrice(e.take_profit_extended)} (25%)</span>`
     : `<span>TP: ${fmtPrice(e.take_profit)}${e.take_profit_conservative !== undefined && e.take_profit_conservative !== null ? ` <span class="muted">(konzervativan: ${fmtPrice(e.take_profit_conservative)})</span>` : ""}</span>`;

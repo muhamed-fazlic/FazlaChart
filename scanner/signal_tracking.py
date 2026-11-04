@@ -48,12 +48,15 @@ logger = logging.getLogger(__name__)
 TIMEFRAME_MINUTES: dict[str, int] = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
 
 # Timeframes managed through three partial targets (TP1/TP2/TP3, see
-# agents_crypto.risk_calc) instead of one single exit -- currently just 4h,
-# the only timeframe above 1h this scanner tracks; a longer-running signal's
-# moves tend to run further, so locking in profit progressively (rather than
-# one all-or-nothing target) captures more of that without giving back a
-# banked gain. Extend this set if/when a 1d or 1w timeframe is added.
-MULTI_TARGET_TIMEFRAMES: frozenset[str] = frozenset({"4h"})
+# agents_crypto.risk_calc) instead of one single exit -- any timeframe of
+# 1h or longer (i.e. > 59 minutes), since a longer-running signal's moves
+# tend to run further, so locking in profit progressively (rather than one
+# all-or-nothing target) captures more of that without giving back a
+# banked gain. Derived from TIMEFRAME_MINUTES so adding a 1d/1w timeframe
+# there automatically makes it multi-target too, with no change needed here.
+MULTI_TARGET_TIMEFRAMES: frozenset[str] = frozenset(
+    tf for tf, minutes in TIMEFRAME_MINUTES.items() if minutes > 59
+)
 
 _TP_WEIGHTS = (TP1_WEIGHT, TP2_WEIGHT, TP3_WEIGHT)
 
