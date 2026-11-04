@@ -104,6 +104,42 @@ def test_find_stats_for_labels_filters_by_horizon():
     assert matches == []
 
 
+def test_load_cache_is_memoized_until_the_file_changes(tmp_path):
+    """Regression test for a production CPU hotspot: the dashboard's
+    background warm-up loop calls ``get_cached_calibration_stats`` for
+    every (symbol, timeframe) pair on every cycle, which used to re-read
+    and re-``json.loads`` the whole on-disk cache file every single call.
+    Once that file grew to several MB this pinned a full CPU core. Repeated
+    lookups between writes must now be a cheap in-memory hit."""
+    from agents_crypto import calibration_lookup
+
+    cache_path = str(tmp_path / "cal.json")
+    with (
+        patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+        patch("agents_crypto.calibration_lookup.summarize", return_value=_FAKE_STATS),
+    ):
+        get_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)  # warms the cache on disk
+    get_cached_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)  # warms the in-memory memo too
+
+    with patch("agents_crypto.calibration_lookup.json.loads", wraps=calibration_lookup.json.loads) as mock_loads:
+        get_cached_calibration_stats("BTCUSDT", "1h", cache_path=cache_path)
+        get_cached_calibration_stats("ETHUSDT", "1h", cache_path=cache_path)
+        get_cached_calibration_stats("BTCUSDT", "4h", cache_path=cache_path)
+        assert not mock_loads.called
+
+        # A real on-disk change (another backtest completing) must still be
+        # picked up -- memoization must key off the file's mtime, not just
+        # never refresh.
+        with (
+            patch("agents_crypto.calibration_lookup.backtest_symbol", return_value=["case"]),
+            patch("agents_crypto.calibration_lookup.summarize", return_value=_FAKE_STATS),
+        ):
+            get_calibration_stats("ETHUSDT", "1h", cache_path=cache_path)
+        stats = get_cached_calibration_stats("ETHUSDT", "1h", cache_path=cache_path)
+        assert mock_loads.called
+        assert len(stats) == 2
+
+
 def test_get_cached_calibration_stats_never_backtests_on_miss(tmp_path):
     """A cold/empty cache must return [] immediately — never trigger a
     backtest — since this is the cache-only path used by endpoints that

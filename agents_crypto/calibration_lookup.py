@@ -89,14 +89,35 @@ def _cache_key(symbol: str, timeframe: str) -> str:
     return f"{symbol.upper()}:{timeframe}"
 
 
+# `_load_cache` is called for essentially every (symbol, timeframe) lookup --
+# including once per pair, every few seconds, from the dashboard's background
+# warm-up loop -- so re-reading and re-parsing the whole on-disk JSON file
+# from scratch on every single call does not scale once the cache grows past
+# a few hundred KB (it reached several MB in production and made the
+# dashboard process pin a full CPU core just re-parsing JSON). Memoize the
+# parsed dict per-process, keyed by the file's mtime, so repeated calls
+# between writes are a cheap `stat()` instead of a full read + json.loads.
+_cache_memo_lock = Lock()
+_cache_memo: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
 def _load_cache(cache_path: str) -> dict[str, Any]:
     path = Path(cache_path)
-    if not path.exists():
-        return {}
     try:
-        return json.loads(path.read_text())
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    with _cache_memo_lock:
+        memoized = _cache_memo.get(cache_path)
+        if memoized is not None and memoized[0] == mtime:
+            return memoized[1]
+    try:
+        data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
+    with _cache_memo_lock:
+        _cache_memo[cache_path] = (mtime, data)
+    return data
 
 
 def _save_cache(cache_path: str, cache: dict[str, Any]) -> None:
