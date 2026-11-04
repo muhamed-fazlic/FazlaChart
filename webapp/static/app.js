@@ -581,8 +581,16 @@ function tradesRangeQueryParams() {
   return params;
 }
 
+// Monotonically increasing token guarding against slow, overlapping loads
+// (the VPS can take a while under load) -- without this, an older in-flight
+// request (e.g. the unfiltered initial load) can resolve *after* a newer one
+// (e.g. clicking the "SL" filter) and silently clobber the table back to the
+// stale, unfiltered result even though the filter button shows "active".
+let _tradesLoadToken = 0;
+
 async function loadTradesTab(status) {
   if (status !== undefined) currentTradesStatusFilter = status;
+  const token = ++_tradesLoadToken;
   try {
     const rangeParams = tradesRangeQueryParams();
     const tradesParams = new URLSearchParams(rangeParams);
@@ -602,6 +610,7 @@ async function loadTradesTab(status) {
     const patternData = await patternRes.json();
     const regimeData = await regimeRes.json();
     const qualityData = await qualityRes.json();
+    if (token !== _tradesLoadToken) return; // a newer load (e.g. a filter click) already started -- discard this stale one
     renderTradesSummary(summary, tradesData.trades || []);
     renderTradesTable(tradesData.trades || []);
     renderBucketBreakdown(bucketData.buckets || []);
@@ -609,6 +618,7 @@ async function loadTradesTab(status) {
     renderRegimeBreakdown(regimeData.regimes || []);
     renderQualityBreakdown(qualityData.quality_buckets || []);
   } catch (err) {
+    if (token !== _tradesLoadToken) return;
     console.error("Could not load trades analytics:", err);
     document.getElementById("trades-body").innerHTML = `<tr><td colspan="15" class="muted">Greška: ${err.message}</td></tr>`;
   }
