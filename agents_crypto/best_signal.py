@@ -189,6 +189,7 @@ def compute_candidates(
     muted_buckets = muted_buckets or set()
     from agents_crypto.calibration_lookup import find_stats_for_labels, get_cached_calibration_stats
     from agents_crypto.risk_calc import compute_kelly_fraction, compute_risk_levels
+    from agents_crypto.signal_pattern import classify_pattern
     from agents_crypto.signal_quality import compute_quality_score
 
     candidates: list[dict[str, Any]] = []
@@ -290,6 +291,7 @@ def compute_candidates(
                     "timeframe": tf,
                     "trend": trend,
                     "label": best.label,
+                    "pattern": classify_pattern(best.label),
                     "direction": best.direction,
                     "n": best.n,
                     "win_rate_pct": best.win_rate_pct,

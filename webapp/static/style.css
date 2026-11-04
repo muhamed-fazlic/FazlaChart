@@ -680,6 +680,17 @@ footer {
   cursor: help;
 }
 
+.pattern-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid currentcolor;
+}
+
+.pattern-trending { color: var(--blue, #4aa3ff); }
+.pattern-breakout { color: var(--green); }
+.pattern-reversal { color: var(--amber, #e0a030); }
+
 .best-signal-entry {
   display: flex;
   gap: 14px;

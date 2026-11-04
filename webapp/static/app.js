@@ -85,6 +85,16 @@ function bestSignalEntryHtml(sig) {
     ${kelly && kelly.warning ? `<div class="best-signal-warning">💰 ${kelly.warning}</div>` : ""}`;
 }
 
+const PATTERN_LABELS = { trending: "📈 Trending", breakout: "🚀 Breakout", reversal: "↩️ Reversal" };
+const PATTERN_CLASSES = { trending: "pattern-trending", breakout: "pattern-breakout", reversal: "pattern-reversal" };
+
+function patternBadgeHtml(pattern) {
+  if (!pattern) return "";
+  const text = PATTERN_LABELS[pattern] || pattern;
+  const cls = PATTERN_CLASSES[pattern] || "";
+  return `<span class="pattern-badge ${cls}">${text}</span>`;
+}
+
 function qualityScoreBadgeHtml(qs) {
   if (!qs || qs.total === undefined || qs.total === null) return "";
   const cls = qs.total >= 70 ? "pos" : qs.total >= 50 ? "" : "neg";
@@ -105,6 +115,7 @@ function bestSignalCardHtml(sig, rank) {
         <b>${sig.symbol}</b>
         <span class="${dirClass}">${dirWord}</span>
         <span class="muted">${sig.timeframe}</span>
+        ${patternBadgeHtml(sig.pattern)}
         ${qualityScoreBadgeHtml(sig.quality_score)}
       </div>
       <div class="best-signal-stats">

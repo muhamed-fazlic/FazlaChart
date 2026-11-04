@@ -112,6 +112,13 @@ def test_neutral_trend_with_no_anomalies_never_surfaces():
     assert result["signals"] == []
 
 
+def test_candidate_carries_its_pattern_classification():
+    row = _row("AAAUSDT", "bullish")
+    with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_LONG]):
+        result = compute_candidates([row], limit=5)
+    assert result["signals"][0]["pattern"] == "trending"
+
+
 def test_two_bearish_altcoins_aligned_with_bearish_btc_are_flagged_correlated():
     rows = [_row("BTCUSDT", "bearish"), _row("AAAUSDT", "bearish"), _row("BBBUSDT", "bearish")]
     with patch("agents_crypto.calibration_lookup.get_cached_calibration_stats", return_value=[_STRONG_SHORT]):
