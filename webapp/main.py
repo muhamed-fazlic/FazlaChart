@@ -153,13 +153,20 @@ async def _health_watchdog_loop() -> None:
     while True:
         try:
             if Path(_storage_path()).exists() and telegram.enabled:
-                conn = _get_conn()
-                try:
-                    result = await anyio.to_thread.run_sync(
-                        lambda: check_scanner_health(conn, max_staleness_seconds=_health_max_staleness_seconds())
-                    )
-                finally:
-                    conn.close()
+                # Open (and close) the connection inside the worker-thread
+                # callback itself: sqlite3 connections are thread-affine by
+                # default, so one opened here on the event-loop thread and
+                # then handed across to anyio's worker thread would raise
+                # "SQLite objects created in a thread can only be used in
+                # that same thread" on every single cycle.
+                def _check_health() -> Any:
+                    conn = _get_conn()
+                    try:
+                        return check_scanner_health(conn, max_staleness_seconds=_health_max_staleness_seconds())
+                    finally:
+                        conn.close()
+
+                result = await anyio.to_thread.run_sync(_check_health)
                 now = _time.time()
                 if result.status == "stale":
                     cooldown_elapsed = now - _health_alert_state["last_alert_at"] > _HEALTH_ALERT_COOLDOWN_SECONDS
