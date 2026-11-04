@@ -78,6 +78,14 @@ class LabeledCase:
     # level touched within the horizon), or None for undirected labels/cases
     # built directly by tests that don't set it.
     exit_reason: str | None = None
+    # Stop-loss distance at entry, as a percentage of entry_close (same ATR
+    # multiplier the live system would have shown — see _walk_forward_exit).
+    # None for undirected labels (no SL/TP side exists) or cases built by
+    # older code paths/tests that don't set it. Lets a consumer (e.g.
+    # scanner.backtesting.portfolio_backtest) convert a raw percentage
+    # outcome into a risk-normalized "R-multiple" without needing to
+    # re-derive ATR itself.
+    sl_distance_pct: float | None = None
 
 
 @dataclass
@@ -365,6 +373,7 @@ def backtest_symbol(
             hit_candle, exit_price, reason = exit_by_direction.get(direction, (None, None, None))
             if reason is None:
                 continue  # no usable ATR at this candle (NaN/zero) — skip
+            sl_distance_pct = entry_atr * DEFAULT_SL_ATR_MULTIPLIER / entry_close * 100.0
             for horizon in horizons:
                 if hit_candle is not None and hit_candle <= horizon:
                     # SL/TP resolved the trade before the horizon's end.
@@ -390,6 +399,7 @@ def backtest_symbol(
                         horizon,
                         regime,
                         horizon_exit_reason,
+                        sl_distance_pct,
                     )
                 )
     return cases
