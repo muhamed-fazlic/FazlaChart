@@ -12,6 +12,7 @@ import pytest
 
 from scanner.validation.statistical_validation import (
     benjamini_hochberg,
+    block_bootstrap_confidence_interval,
     deflated_sharpe_ratio,
     expected_max_sharpe,
     probability_of_backtest_overfitting,
@@ -164,3 +165,78 @@ class TestBenjaminiHochberg:
         # Result must be index-aligned to the ORIGINAL (unsorted) order.
         assert significant[1] is True  # 0.001
         assert significant[0] is False  # 0.9
+
+
+class TestBlockBootstrapConfidenceInterval:
+    def test_rejects_too_few_values(self):
+        with pytest.raises(ValueError):
+            block_bootstrap_confidence_interval([0.1, 0.2, 0.3])
+
+    def test_rejects_non_positive_block_size(self):
+        with pytest.raises(ValueError):
+            block_bootstrap_confidence_interval([0.1] * 20, block_size=0)
+
+    def test_rejects_block_size_too_large(self):
+        values = [0.1] * 20
+        with pytest.raises(ValueError):
+            block_bootstrap_confidence_interval(values, block_size=len(values))
+
+    def test_rejects_invalid_confidence_pct(self):
+        values = [0.1] * 20
+        with pytest.raises(ValueError):
+            block_bootstrap_confidence_interval(values, confidence_pct=100.0)
+        with pytest.raises(ValueError):
+            block_bootstrap_confidence_interval(values, confidence_pct=0.0)
+
+    def test_observed_statistic_matches_plain_computation_on_raw_values(self):
+        rng = random.Random(1)
+        values = [rng.gauss(0.01, 0.02) for _ in range(100)]
+        result = block_bootstrap_confidence_interval(values, seed=5, n_resamples=200)
+        assert result["observed"] == pytest.approx(sum(values) / len(values))
+
+    def test_ci_contains_observed_for_a_clear_positive_edge(self):
+        # Consistent, low-variance positive returns: the CI should sit
+        # comfortably away from zero on both sides.
+        rng = random.Random(2)
+        values = [rng.gauss(0.02, 0.003) for _ in range(300)]
+        result = block_bootstrap_confidence_interval(values, seed=9, n_resamples=500)
+        assert result["ci_low"] <= result["observed"] <= result["ci_high"]
+        assert result["ci_low"] > 0.0  # edge survives even the lower bound
+
+    def test_ci_straddles_zero_for_pure_noise(self):
+        rng = random.Random(3)
+        values = [rng.gauss(0.0, 0.02) for _ in range(300)]
+        result = block_bootstrap_confidence_interval(values, seed=4, n_resamples=500)
+        assert result["ci_low"] < 0.0 < result["ci_high"]
+
+    def test_wider_confidence_level_widens_the_interval(self):
+        rng = random.Random(6)
+        values = [rng.gauss(0.01, 0.02) for _ in range(200)]
+        narrow = block_bootstrap_confidence_interval(values, seed=1, n_resamples=500, confidence_pct=80.0)
+        wide = block_bootstrap_confidence_interval(values, seed=1, n_resamples=500, confidence_pct=99.0)
+        assert (wide["ci_high"] - wide["ci_low"]) > (narrow["ci_high"] - narrow["ci_low"])
+
+    def test_default_block_size_is_reported_and_sane(self):
+        values = [0.01] * 64
+        result = block_bootstrap_confidence_interval(values, seed=1, n_resamples=50)
+        assert 2 <= result["block_size"] < len(values)
+
+    def test_explicit_block_size_and_statistic_are_honored(self):
+        rng = random.Random(8)
+        values = [rng.gauss(0.01, 0.02) for _ in range(150)]
+        result = block_bootstrap_confidence_interval(
+            values,
+            statistic=max,
+            block_size=5,
+            seed=2,
+            n_resamples=300,
+        )
+        assert result["block_size"] == 5
+        assert result["observed"] == max(values)
+
+    def test_deterministic_with_fixed_seed(self):
+        rng = random.Random(10)
+        values = [rng.gauss(0.01, 0.02) for _ in range(120)]
+        first = block_bootstrap_confidence_interval(values, seed=42, n_resamples=100)
+        second = block_bootstrap_confidence_interval(values, seed=42, n_resamples=100)
+        assert first == second

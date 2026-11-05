@@ -27,6 +27,17 @@ they answer different questions and have different inputs:
   many hypotheses simultaneously (e.g. one per (symbol, timeframe, label)
   combination): standard correction for "if you test 50 things at 5%
   significance, roughly 2-3 will look significant by chance alone".
+- :func:`block_bootstrap_confidence_interval` -- Phase 8 Korak 7 Test 3:
+  moving-block bootstrap confidence interval for any summary statistic
+  (mean return, Sharpe, etc.) computed over a chronologically-ordered
+  series of trade returns. A naive bootstrap (resampling individual trades
+  independently) silently assumes trades are i.i.d.; nearby trades often
+  share the same market regime (a cluster of correlated moves, same as
+  :mod:`scanner.validation.independence` addresses for raw win-rate
+  counts), so resampling contiguous *blocks* of trades instead preserves
+  whatever short-range serial correlation the real data has, giving an
+  honestly wider (more conservative) confidence interval than treating
+  every trade as independent evidence would.
 
 Deliberately dependency-free: uses stdlib ``statistics.NormalDist`` for the
 normal CDF/inverse-CDF instead of scipy, since this project has no numpy/
@@ -38,13 +49,21 @@ from __future__ import annotations
 
 import itertools
 import math
-from collections.abc import Sequence
+import random
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from statistics import NormalDist
 from typing import Any
 
 _NORMAL = NormalDist()
 _EULER_MASCHERONI = 0.5772156649015329
+
+# Phase 8 Korak 7 Test 3 defaults for block_bootstrap_confidence_interval,
+# exported so callers (the portfolio backtest config) can reference the same
+# constants instead of re-typing magic numbers -- same convention as
+# scanner.validation.walk_forward's WALK_FORWARD_* constants.
+BLOCK_BOOTSTRAP_N_RESAMPLES = 2000
+BLOCK_BOOTSTRAP_CONFIDENCE_PCT = 95.0
 
 
 @dataclass(frozen=True)
@@ -299,3 +318,87 @@ def benjamini_hochberg(p_values: Sequence[float], alpha: float = 0.05) -> list[b
     for k in range(largest_k + 1):
         significant[order[k]] = True
     return significant
+
+
+def _default_block_size(n: int) -> int:
+    """Politis-White style heuristic (simplified, dependency-free): block
+    length grows roughly as the cube root of the sample size, with a floor
+    of 2 (a block of 1 degenerates to the naive i.i.d. bootstrap) and a
+    cap so a single resample never collapses to re-running the whole
+    series verbatim."""
+    return max(2, min(round(n ** (1 / 3)), n // 2))
+
+
+def block_bootstrap_confidence_interval(
+    values: Sequence[float],
+    *,
+    statistic: Callable[[Sequence[float]], float] = lambda xs: sum(xs) / len(xs),
+    block_size: int | None = None,
+    n_resamples: int = BLOCK_BOOTSTRAP_N_RESAMPLES,
+    confidence_pct: float = BLOCK_BOOTSTRAP_CONFIDENCE_PCT,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """Moving-block bootstrap confidence interval for ``statistic`` applied
+    to the chronologically-ordered series ``values`` (e.g. per-trade net
+    return percentages, in execution order).
+
+    Unlike a plain percentile bootstrap (which resamples individual
+    observations with replacement, implicitly assuming they are
+    independent), this resamples contiguous *blocks* of length
+    ``block_size`` -- preserving whatever short-range serial correlation
+    consecutive trades actually have (shared market regime, overlapping
+    holding periods, etc.) instead of washing it out. ``block_size``
+    defaults to a cube-root-of-n heuristic (see :func:`_default_block_size`)
+    when not given explicitly.
+
+    Procedure, repeated ``n_resamples`` times: draw
+    ``ceil(len(values) / block_size)`` blocks (each a contiguous run of
+    ``block_size`` consecutive values, start position chosen uniformly at
+    random with replacement from every valid start position), concatenate
+    them and truncate to ``len(values)``, then evaluate ``statistic`` on
+    that resampled series. The confidence interval is the corresponding
+    lower/upper percentile of the resulting distribution of statistics.
+
+    Returns a dict with ``observed`` (the statistic on the real,
+    unshuffled series), ``ci_low``/``ci_high``, ``confidence_pct``,
+    ``block_size``, ``n_resamples``, and ``n_observations``.
+
+    Raises ``ValueError`` if there are fewer than 4 values, ``block_size``
+    is not a positive integer smaller than ``len(values)``, or
+    ``confidence_pct`` is not strictly between 0 and 100.
+    """
+    n = len(values)
+    if n < 4:
+        raise ValueError("need at least 4 values for a block bootstrap")
+    if not 0.0 < confidence_pct < 100.0:
+        raise ValueError("confidence_pct must be strictly between 0 and 100")
+    resolved_block_size = block_size if block_size is not None else _default_block_size(n)
+    if resolved_block_size < 1 or resolved_block_size >= n:
+        raise ValueError("block_size must be a positive integer smaller than len(values)")
+
+    rng = random.Random(seed)
+    n_blocks_needed = math.ceil(n / resolved_block_size)
+    max_start = n - resolved_block_size  # inclusive
+
+    bootstrap_stats: list[float] = []
+    for _ in range(n_resamples):
+        resampled: list[float] = []
+        for _ in range(n_blocks_needed):
+            start = rng.randint(0, max_start)
+            resampled.extend(values[start : start + resolved_block_size])
+        bootstrap_stats.append(statistic(resampled[:n]))
+
+    bootstrap_stats.sort()
+    tail = (100.0 - confidence_pct) / 2.0 / 100.0
+    low_idx = int(tail * n_resamples)
+    high_idx = min(n_resamples - 1, int((1.0 - tail) * n_resamples))
+
+    return {
+        "observed": statistic(values),
+        "ci_low": bootstrap_stats[low_idx],
+        "ci_high": bootstrap_stats[high_idx],
+        "confidence_pct": confidence_pct,
+        "block_size": resolved_block_size,
+        "n_resamples": n_resamples,
+        "n_observations": n,
+    }

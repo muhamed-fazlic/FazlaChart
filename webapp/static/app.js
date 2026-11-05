@@ -708,6 +708,33 @@ function renderStatisticalValidation(dsr) {
   const skillBadge = dsr.likely_skill
     ? '<span class="dsr-badge dsr-badge-pos">vjerovatno pravi rezultat</span>'
     : '<span class="dsr-badge dsr-badge-neg">vjerovatno slučajnost/overfitting</span>';
+  const bb = dsr.block_bootstrap_mean_return;
+  const bbHtml = bb
+    ? `
+    <div class="bucket-breakdown-title" style="margin-top:14px;">
+      🎲 Block bootstrap CI za prosječan povrat po trejdu
+      ${
+        bb.edge_survives_lower_bound
+          ? '<span class="dsr-badge dsr-badge-pos">edge preživi i donju granicu</span>'
+          : '<span class="dsr-badge dsr-badge-neg">donja granica ≤ 0%</span>'
+      }
+    </div>
+    <p class="dsr-explainer muted">
+      Umjesto da svaki trejd tretira kao nezavisan dokaz (kao prosti bootstrap), ovo preuzorkuje
+      <b>cjeline uzastopnih trejdova</b> (blok veličine ${bb.block_size}) da sačuva kratkoročnu korelaciju
+      između susjednih trejdova (npr. isti tržišni režim). ${bb.confidence_pct}% interval povjerenja za prosječan
+      povrat po trejdu je <b>[${fmt(bb.ci_low_pct, 3)}%, ${fmt(bb.ci_high_pct, 3)}%]</b> preko ${bb.n_resamples}
+      preuzorkovanja — ako donja granica nije iznad 0%, edge nije pouzdano odvojen od šuma čak ni uz ovu konzervativniju provjeru.
+    </p>
+    <div class="trades-summary-cards">
+      <div class="trades-summary-card"><span class="label">Observed prosjek</span><span class="value ${signClass(bb.observed_pct)}">${fmt(bb.observed_pct, 3)}%</span></div>
+      <div class="trades-summary-card"><span class="label">CI donja granica</span><span class="value ${signClass(bb.ci_low_pct)}">${fmt(bb.ci_low_pct, 3)}%</span></div>
+      <div class="trades-summary-card"><span class="label">CI gornja granica</span><span class="value ${signClass(bb.ci_high_pct)}">${fmt(bb.ci_high_pct, 3)}%</span></div>
+      <div class="trades-summary-card"><span class="label">Blok veličina</span><span class="value">${bb.block_size}</span></div>
+    </div>`
+    : `
+    <div class="bucket-breakdown-title" style="margin-top:14px;">🎲 Block bootstrap CI</div>
+    <p class="muted">Nije dostupno (isključeno preko --no-block-bootstrap, ili premalo trejdova — potrebno je najmanje 4).</p>`;
   el.innerHTML = `
     <div class="bucket-breakdown-title">
       📐 Statistička validacija (Deflated Sharpe Ratio) ${skillBadge}
@@ -727,7 +754,8 @@ function renderStatisticalValidation(dsr) {
       <div class="trades-summary-card"><span class="label">Broj trejdova</span><span class="value">${dsr.n_observations}</span></div>
       <div class="trades-summary-card"><span class="label">Skewness</span><span class="value">${fmt(dsr.skewness, 3)}</span></div>
       <div class="trades-summary-card"><span class="label">Kurtosis</span><span class="value">${fmt(dsr.kurtosis, 3)}</span></div>
-    </div>`;
+    </div>
+    ${bbHtml}`;
 }
 
 // Phase 8 Korak 6 (audit follow-up): per (label, horizon) check of whether
@@ -1027,6 +1055,12 @@ function renderBacktestFullConfig(cfg) {
       cfg.include_walk_forward_validation
         ? `<span class="pos">uključena</span> (${cfg.walk_forward_n_folds ?? "—"} uzastopnih foldova, min. ${cfg.walk_forward_min_test_n ?? "—"} po foldu, min. ${cfg.walk_forward_min_folds_evaluated ?? "—"} ocijenjenih foldova za verdikt)`
         : '<span class="muted">isključena</span>',
+    ],
+    [
+      "Block bootstrap CI (prosječan povrat)",
+      cfg.include_block_bootstrap
+        ? `<span class="pos">uključen</span> (${cfg.block_bootstrap_n_resamples ?? "—"} preuzorkovanja, ${cfg.block_bootstrap_confidence_pct ?? "—"}% interval povjerenja)`
+        : '<span class="muted">isključen</span>',
     ],
   ];
   const tableRows = rows.map(([label, value]) => `<tr><td>${label}</td><td>${value}</td></tr>`).join("");

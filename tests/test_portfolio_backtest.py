@@ -22,6 +22,10 @@ from scanner.backtesting.portfolio_backtest import (
     run_portfolio_backtest,
 )
 from scanner.calibration import DEFAULT_ROUND_TRIP_COST_PCT, LabeledCase
+from scanner.validation.statistical_validation import (
+    BLOCK_BOOTSTRAP_CONFIDENCE_PCT,
+    BLOCK_BOOTSTRAP_N_RESAMPLES,
+)
 from tradingagents.dataflows.errors import VendorError
 
 pytestmark = pytest.mark.unit
@@ -740,6 +744,120 @@ class TestWalkForwardValidationWiring:
         assert received == {"cost_pct": 0.2, "n_folds": 3, "min_test_n": 10, "min_folds_evaluated": 1}
 
 
+class TestBlockBootstrapWiring:
+    """Phase 8 Korak 7 Test 3: moving-block bootstrap CI for the mean
+    per-trade return is pure re-computation on trades already produced by
+    this backtest run (same cost category as OOS/independence/walk-forward
+    above), so it is wired on by default and rides along inside the
+    existing `statistical_validation` dashboard report block as
+    `block_bootstrap_mean_return`."""
+
+    def _trades(self, n: int, *, returns: list[float] | None = None):
+        from scanner.backtesting.portfolio_backtest import Trade
+
+        returns = returns if returns is not None else [1.0, -0.5, 0.8, 1.2, -0.3, 0.6][:n]
+        trades = []
+        for i, r in enumerate(returns):
+            entry = _T0 + timedelta(hours=i)
+            trades.append(
+                Trade(
+                    symbol="BTCUSDT",
+                    timeframe="1h",
+                    direction="long",
+                    label="trend:bullish",
+                    entry_time=entry,
+                    resolution_time=entry + timedelta(hours=1),
+                    net_return_pct=r,
+                    r_multiple=r / 2.0,
+                    equity_before=10_000.0,
+                    pnl=r * 100,
+                    equity_after=10_000.0 + r * 100,
+                    win_rate_ci_low_pct=55.0,
+                    n=50,
+                )
+            )
+        return trades
+
+    def test_default_produces_a_block_bootstrap_block_with_enough_trades(self):
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            build_dashboard_report,
+        )
+
+        trades = self._trades(6)
+        equity_curve = [(t.resolution_time, t.equity_after) for t in trades]
+        config = PortfolioBacktestConfig(symbols=("BTCUSDT",), initial_capital=10_000.0)
+        metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples=[1] * len(trades))
+        result = PortfolioBacktestResult(trades=trades, equity_curve=equity_curve, metrics=metrics)
+
+        report = build_dashboard_report(config, result)
+
+        block = report["statistical_validation"]["block_bootstrap_mean_return"]
+        assert block is not None
+        assert block["ci_low_pct"] <= block["observed_pct"] <= block["ci_high_pct"]
+        assert block["confidence_pct"] == BLOCK_BOOTSTRAP_CONFIDENCE_PCT
+        assert block["n_resamples"] == BLOCK_BOOTSTRAP_N_RESAMPLES
+        assert isinstance(block["edge_survives_lower_bound"], bool)
+
+    def test_include_block_bootstrap_false_reports_none(self):
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            build_dashboard_report,
+        )
+
+        trades = self._trades(6)
+        equity_curve = [(t.resolution_time, t.equity_after) for t in trades]
+        config = PortfolioBacktestConfig(
+            symbols=("BTCUSDT",), initial_capital=10_000.0, include_block_bootstrap=False
+        )
+        metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples=[1] * len(trades))
+        result = PortfolioBacktestResult(trades=trades, equity_curve=equity_curve, metrics=metrics)
+
+        report = build_dashboard_report(config, result)
+
+        assert report["statistical_validation"]["block_bootstrap_mean_return"] is None
+
+    def test_too_few_trades_reports_none_without_raising(self):
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            build_dashboard_report,
+        )
+
+        trades = self._trades(3)
+        equity_curve = [(t.resolution_time, t.equity_after) for t in trades]
+        config = PortfolioBacktestConfig(symbols=("BTCUSDT",), initial_capital=10_000.0)
+        metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples=[1] * len(trades))
+        result = PortfolioBacktestResult(trades=trades, equity_curve=equity_curve, metrics=metrics)
+
+        report = build_dashboard_report(config, result)
+
+        assert report["statistical_validation"] is not None
+        assert report["statistical_validation"]["block_bootstrap_mean_return"] is None
+
+    def test_params_forwarded_to_the_bootstrap(self):
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            build_dashboard_report,
+        )
+
+        trades = self._trades(6)
+        equity_curve = [(t.resolution_time, t.equity_after) for t in trades]
+        config = PortfolioBacktestConfig(
+            symbols=("BTCUSDT",),
+            initial_capital=10_000.0,
+            block_bootstrap_n_resamples=50,
+            block_bootstrap_confidence_pct=80.0,
+        )
+        metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples=[1] * len(trades))
+        result = PortfolioBacktestResult(trades=trades, equity_curve=equity_curve, metrics=metrics)
+
+        report = build_dashboard_report(config, result)
+
+        block = report["statistical_validation"]["block_bootstrap_mean_return"]
+        assert block["n_resamples"] == 50
+        assert block["confidence_pct"] == 80.0
+
+
 class TestMetricsComputation:
     def test_known_trades_produce_expected_net_profit_and_win_rate(self):
         from scanner.backtesting.portfolio_backtest import Trade
@@ -921,6 +1039,9 @@ class TestDashboardReport:
         assert report["config"]["include_oos_validation"] is True
         assert report["config"]["include_independence_validation"] is True
         assert report["config"]["include_walk_forward_validation"] is True
+        assert report["config"]["include_block_bootstrap"] is True
+        assert report["config"]["block_bootstrap_n_resamples"] == BLOCK_BOOTSTRAP_N_RESAMPLES
+        assert report["config"]["block_bootstrap_confidence_pct"] == BLOCK_BOOTSTRAP_CONFIDENCE_PCT
         assert report["oos_validation"] == [
             {
                 "label": "trend:bullish",
@@ -990,6 +1111,9 @@ class TestDashboardReport:
         assert report["statistical_validation"]["n_observations"] == 2
         assert report["statistical_validation"]["n_trials"] == 1
         assert report["statistical_validation"]["deflated_sharpe_benchmark"] == 0.0
+        # Too few trades (2) for the block bootstrap (needs >= 4) -- reported
+        # as None rather than raising or silently omitting the key.
+        assert report["statistical_validation"]["block_bootstrap_mean_return"] is None
 
         assert report["point_in_time_universe"] == {"enabled": False}
 

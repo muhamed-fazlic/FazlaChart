@@ -112,7 +112,12 @@ from scanner.validation.independence import (
     IndependenceClusterStats,
     summarize_with_independence,
 )
-from scanner.validation.statistical_validation import deflated_sharpe_ratio
+from scanner.validation.statistical_validation import (
+    BLOCK_BOOTSTRAP_CONFIDENCE_PCT,
+    BLOCK_BOOTSTRAP_N_RESAMPLES,
+    block_bootstrap_confidence_interval,
+    deflated_sharpe_ratio,
+)
 from scanner.validation.walk_forward import (
     WALK_FORWARD_MIN_FOLDS_EVALUATED,
     WALK_FORWARD_MIN_TEST_N,
@@ -254,6 +259,20 @@ class PortfolioBacktestConfig:
     walk_forward_n_folds: int = WALK_FORWARD_N_FOLDS
     walk_forward_min_test_n: int = WALK_FORWARD_MIN_TEST_N
     walk_forward_min_folds_evaluated: int = WALK_FORWARD_MIN_FOLDS_EVALUATED
+    # Phase 8 Korak 7 Test 3: moving-block bootstrap confidence interval for
+    # the mean per-trade return, computed over the same chronologically-
+    # ordered trade list already used for the Deflated Sharpe Ratio above.
+    # Unlike a naive bootstrap this resamples contiguous blocks of trades
+    # (not individual trades) so the interval honestly widens if nearby
+    # trades are correlated instead of silently assuming independence. Pure
+    # re-computation on trades already produced by this backtest run (no
+    # extra network calls), so safe to default to True, same as the other
+    # validation passes above. See
+    # scanner.validation.statistical_validation.block_bootstrap_confidence_interval's
+    # docstring for the full method.
+    include_block_bootstrap: bool = True
+    block_bootstrap_n_resamples: int = BLOCK_BOOTSTRAP_N_RESAMPLES
+    block_bootstrap_confidence_pct: float = BLOCK_BOOTSTRAP_CONFIDENCE_PCT
     # Phase 8 Korak 4 (survivorship-bias fix): when set, any candidate event
     # whose symbol was NOT in the point-in-time top-N universe at its own
     # entry_time is dropped before the portfolio simulation runs -- i.e. a
@@ -561,20 +580,37 @@ def _build_statistical_validation(
     result: PortfolioBacktestResult,
     n_trials: int,
     trial_sharpe_ratios: list[float] | None = None,
+    *,
+    include_block_bootstrap: bool = True,
+    block_bootstrap_n_resamples: int = BLOCK_BOOTSTRAP_N_RESAMPLES,
+    block_bootstrap_confidence_pct: float = BLOCK_BOOTSTRAP_CONFIDENCE_PCT,
 ) -> dict[str, Any] | None:
-    """Phase 8 Korak 3: Deflated Sharpe Ratio for this report's trade
-    returns, honestly correcting the plain Sharpe ratio for ``n_trials``
-    (how many backtest attempts preceded this one) and, when
+    """Phase 8 Korak 3 + Korak 7 Test 3: Deflated Sharpe Ratio and a
+    moving-block bootstrap confidence interval for this report's trade
+    returns.
+
+    The Deflated Sharpe Ratio honestly corrects the plain Sharpe ratio for
+    ``n_trials`` (how many backtest attempts preceded this one) and, when
     ``trial_sharpe_ratios`` is supplied (the per-trade Sharpe ratio of
     every prior recorded trial in the same family, from
     ``scanner.validation.experiment_registry`` -- see the CLI entry point
     below), for how spread out those prior attempts' Sharpe ratios actually
     were. Without ``trial_sharpe_ratios`` the deflation benchmark is 0 (no
     multiple-testing inflation applied, since there is nothing to estimate
-    variance from) even if ``n_trials`` is large. Returns ``None`` if there
-    are too few trades for a Sharpe ratio to be meaningful at all (fewer
-    than 2, or all trades had the exact same return), rather than reporting
-    a misleading or undefined statistic."""
+    variance from) even if ``n_trials`` is large.
+
+    The block bootstrap (see
+    ``scanner.validation.statistical_validation.block_bootstrap_confidence_interval``)
+    gives a confidence interval for the mean per-trade return that accounts
+    for serial correlation between nearby trades, rather than treating
+    every trade as independent evidence the way the plain Sharpe ratio
+    implicitly does. Skipped (``block_bootstrap`` key is ``None`` in the
+    result) when ``include_block_bootstrap`` is False or there are too few
+    trades for the bootstrap to run.
+
+    Returns ``None`` if there are too few trades for a Sharpe ratio to be
+    meaningful at all (fewer than 2, or all trades had the exact same
+    return), rather than reporting a misleading or undefined statistic."""
     returns = [t.net_return_pct for t in result.trades]
     if len(returns) < 2:
         return None
@@ -582,6 +618,18 @@ def _build_statistical_validation(
         dsr = deflated_sharpe_ratio(returns, n_trials=n_trials, trial_sharpe_ratios=trial_sharpe_ratios)
     except ValueError:
         return None
+
+    block_bootstrap: dict[str, Any] | None = None
+    if include_block_bootstrap:
+        try:
+            block_bootstrap = block_bootstrap_confidence_interval(
+                returns,
+                n_resamples=block_bootstrap_n_resamples,
+                confidence_pct=block_bootstrap_confidence_pct,
+            )
+        except ValueError:
+            block_bootstrap = None
+
     return {
         "observed_sharpe": round(dsr.observed_sharpe, 4),
         "deflated_sharpe_benchmark": round(dsr.deflated_sharpe_benchmark, 4),
@@ -591,6 +639,19 @@ def _build_statistical_validation(
         "n_observations": dsr.n_observations,
         "skewness": round(dsr.skewness, 3),
         "kurtosis": round(dsr.kurtosis, 3),
+        "block_bootstrap_mean_return": (
+            {
+                "observed_pct": round(block_bootstrap["observed"], 4),
+                "ci_low_pct": round(block_bootstrap["ci_low"], 4),
+                "ci_high_pct": round(block_bootstrap["ci_high"], 4),
+                "confidence_pct": block_bootstrap["confidence_pct"],
+                "block_size": block_bootstrap["block_size"],
+                "n_resamples": block_bootstrap["n_resamples"],
+                "edge_survives_lower_bound": block_bootstrap["ci_low"] > 0.0,
+            }
+            if block_bootstrap is not None
+            else None
+        ),
     }
 
 
@@ -654,6 +715,9 @@ def build_dashboard_report(
             "walk_forward_n_folds": config.walk_forward_n_folds,
             "walk_forward_min_test_n": config.walk_forward_min_test_n,
             "walk_forward_min_folds_evaluated": config.walk_forward_min_folds_evaluated,
+            "include_block_bootstrap": config.include_block_bootstrap,
+            "block_bootstrap_n_resamples": config.block_bootstrap_n_resamples,
+            "block_bootstrap_confidence_pct": config.block_bootstrap_confidence_pct,
             "point_in_time_universe_cache_path": config.point_in_time_universe_cache_path,
         },
         "metrics": result.metrics,
@@ -664,7 +728,14 @@ def build_dashboard_report(
             "by_label": _breakdown_by(result.trades, lambda t: t.label),
         },
         "equity_curve": equity_curve,
-        "statistical_validation": _build_statistical_validation(result, n_trials, trial_sharpe_ratios),
+        "statistical_validation": _build_statistical_validation(
+            result,
+            n_trials,
+            trial_sharpe_ratios,
+            include_block_bootstrap=config.include_block_bootstrap,
+            block_bootstrap_n_resamples=config.block_bootstrap_n_resamples,
+            block_bootstrap_confidence_pct=config.block_bootstrap_confidence_pct,
+        ),
         "oos_validation": [
             {
                 "label": r.label,
@@ -1044,6 +1115,25 @@ def _main() -> None:
         f"given at all, rather than defaulting to no-verdict (default {WALK_FORWARD_MIN_FOLDS_EVALUATED}).",
     )
     parser.add_argument(
+        "--no-block-bootstrap",
+        action="store_true",
+        help="Phase 8 Korak 7 Test 3: skip the moving-block bootstrap confidence interval (scanner.validation."
+        "statistical_validation.block_bootstrap_confidence_interval) for the mean per-trade return. On by "
+        "default -- it's pure re-computation on trades already produced by this run, no extra network calls.",
+    )
+    parser.add_argument(
+        "--block-bootstrap-n-resamples",
+        type=int,
+        default=BLOCK_BOOTSTRAP_N_RESAMPLES,
+        help=f"Number of bootstrap resamples to draw (default {BLOCK_BOOTSTRAP_N_RESAMPLES}).",
+    )
+    parser.add_argument(
+        "--block-bootstrap-confidence-pct",
+        type=float,
+        default=BLOCK_BOOTSTRAP_CONFIDENCE_PCT,
+        help=f"Confidence level for the block bootstrap interval, e.g. 95.0 (default {BLOCK_BOOTSTRAP_CONFIDENCE_PCT}).",
+    )
+    parser.add_argument(
         "--point-in-time-universe-cache",
         help="Phase 8 Korak 4: path to a cache produced by "
         "'python -m scanner.backtesting.historical_universe'. When given, any trade whose symbol was not in "
@@ -1097,6 +1187,9 @@ def _main() -> None:
         walk_forward_n_folds=args.walk_forward_n_folds,
         walk_forward_min_test_n=args.walk_forward_min_test_n,
         walk_forward_min_folds_evaluated=args.walk_forward_min_folds_evaluated,
+        include_block_bootstrap=not args.no_block_bootstrap,
+        block_bootstrap_n_resamples=args.block_bootstrap_n_resamples,
+        block_bootstrap_confidence_pct=args.block_bootstrap_confidence_pct,
         point_in_time_windows=point_in_time_windows,
         point_in_time_universe_cache_path=args.point_in_time_universe_cache,
     )
@@ -1167,6 +1260,9 @@ def _main() -> None:
                     "walk_forward_n_folds": config.walk_forward_n_folds,
                     "walk_forward_min_test_n": config.walk_forward_min_test_n,
                     "walk_forward_min_folds_evaluated": config.walk_forward_min_folds_evaluated,
+                    "include_block_bootstrap": config.include_block_bootstrap,
+                    "block_bootstrap_n_resamples": config.block_bootstrap_n_resamples,
+                    "block_bootstrap_confidence_pct": config.block_bootstrap_confidence_pct,
                 },
                 n_trades=result.metrics.get("n_trades"),
                 sharpe_ratio=result.metrics.get("sharpe_ratio"),
