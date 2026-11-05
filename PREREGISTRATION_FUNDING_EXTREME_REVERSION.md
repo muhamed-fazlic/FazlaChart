@@ -249,3 +249,69 @@ SL-a "popravilo" rezultat nakon sto se vidi gdje su najgori gubici. Ako
 train/validation period pokaze da su gubici dominantno vodjeni ovim
 efektom, to je legitiman nalaz (hipoteza u ovom obliku ne radi), ne razlog
 da se odmah doda SL i re-testira kao da je "ista" hipoteza.
+
+## 9. Implementation notes (appended AFTER the first run — design decisions not pinned above)
+
+This section is appended by the implementer at the time
+`scanner/backtesting/funding_extreme_backtest.py` was written, as
+instructed by this doc's own rule (section-1-5 content above is frozen and
+unedited; only this new section is new). Every item below is a decision
+the pre-registered spec deliberately left open and asked to be recorded,
+not silently made.
+
+1. **Rolling percentile tie convention.** Computed as `(count of
+   strictly-prior window values < current value) / window_size * 100`
+   (strict `<`, not `<=`). A simple, dependency-free rank-percentile
+   definition; ties within the window never inflate the computed
+   percentile of the current observation. Not otherwise specified by
+   section 2.
+2. **Price data / candle timeframe.** 1h candles
+   (`cached_load_extended_history(..., "1h", ...)`), requested up to 8000
+   candles per symbol (comfortably exceeds the ~8-month real ceiling
+   already measured in section 2a — the loader stops early once a
+   symbol's real history is exhausted). Entry/exit price = close of the
+   most recent candle at or before the target timestamp (never a candle
+   opening after it, to preserve no-look-ahead).
+3. **Tradable-range filtering.** Funding history reaches much further
+   back than candle history (section 2a). A signal whose entry time or
+   8h-later exit time falls outside the symbol's available candle range
+   is dropped BEFORE cooldown/dedup (it cannot be realized as an actual
+   priced trade, and should not consume a cooldown slot or "win" a
+   cross-symbol dedup cluster that a genuinely tradable signal could
+   otherwise have represented).
+4. **Cross-symbol dedup representative choice.** Among signals whose
+   `[entry_time, entry_time+8h]` windows transitively overlap within the
+   same direction, the kept representative is the cluster member with
+   the MOST EXTREME percentile (farthest from the neutral midpoint, 50),
+   not simply the first chronologically — mirrors
+   `portfolio_backtest._dedupe_correlated_events` keeping the
+   highest-confidence bucket member. Ties are broken to the earliest
+   chronologically (`max()`'s natural tie-break given each group is
+   iterated in chronological order).
+5. **Measured sigma definition.** Sample standard deviation
+   (`statistics.stdev`, i.e. `ddof=1`), not population standard deviation
+   — the standard inferential choice when estimating a population sigma
+   from a single finite observed sample, which is what feeds the
+   `n_required` power calculation in section 5.
+6. **Block-bootstrap seed.** No explicit `seed` is passed to
+   `block_bootstrap_confidence_interval` (mirrors
+   `portfolio_backtest.py`'s own existing call site, which also does not
+   fix one) — the CI is therefore not bit-for-bit reproducible run over
+   run, though with `n_resamples=2000` the variation between runs is
+   expected to be small. This affects only the CI's own estimation noise,
+   not which trades/signals were found (that part is fully deterministic
+   given a frozen `end_timestamp_ms`).
+7. **Point-in-time universe filter.** Supported via an optional
+   `--point-in-time-universe-cache` CLI flag, reusing
+   `historical_universe.load_universe_cache`/`is_symbol_in_universe_at`
+   verbatim (same mechanism as `portfolio_backtest.py`, "no change" per
+   section 2). No such cache existed on disk at the time of this run (it
+   is not checked into git — `scanner_data/` is gitignored — and building
+   one from scratch was out of scope for this task), so the filter ran
+   disabled for the one pre-registered run, consistent with
+   `tool/run_full_portfolio_backtest.sh`'s own documented fallback
+   behaviour when its cache file is missing.
+8. **Cost-model base rate.** `DEFAULT_ROUND_TRIP_COST_PCT` plus
+   `round_trip_cost_pct_for`'s existing per-symbol liquidity tiers, used
+   as-is with no override — same base rate `portfolio_backtest.py` uses
+   by default, per section 2's "isti cost model" instruction.
