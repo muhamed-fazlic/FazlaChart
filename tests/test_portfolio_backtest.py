@@ -14,10 +14,12 @@ import pytest
 
 from scanner.backtesting.historical_universe import UniverseWindow
 from scanner.backtesting.portfolio_backtest import (
+    CandidateEvent,
     PortfolioBacktestConfig,
     _build_candidate_events,
     _compute_metrics,
     _count_independent_episodes,
+    _dedupe_correlated_events,
     _net_return_pct,
     run_portfolio_backtest,
 )
@@ -212,7 +214,12 @@ class TestPortfolioAdmission:
         # 100%-win "trend:bullish" run that every symbol shares identically,
         # so all three symbols fire a significant long candidate at exactly
         # the same hours -- a genuine simultaneous-admission scenario -- but
-        # cap the portfolio at 2 concurrent positions overall.
+        # cap the portfolio at 2 concurrent positions overall. Korak 1's
+        # correlated-event dedupe is explicitly disabled here: it would
+        # collapse this deliberately-simultaneous, multi-symbol fixture
+        # down to a single candidate before the concurrency cap even gets
+        # a chance to matter, which would stop this test from exercising
+        # what it's actually meant to test.
         warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
         from scanner.backtesting import portfolio_backtest as module
 
@@ -221,7 +228,10 @@ class TestPortfolioAdmission:
 
         monkeypatch.setattr(module, "backtest_symbol", fake_backtest_symbol)
         config = self._config(
-            symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT"), max_concurrent_positions=2, horizon_candles=1
+            symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
+            max_concurrent_positions=2,
+            horizon_candles=1,
+            dedupe_correlated_events=False,
         )
         result = run_portfolio_backtest(config)
         assert result.trades, "expected at least one trade to be admitted"
@@ -231,6 +241,10 @@ class TestPortfolioAdmission:
         assert result.metrics["avg_concurrent_positions"] <= config.max_concurrent_positions
 
     def test_respects_max_concurrent_per_direction(self, monkeypatch):
+        # Same reasoning as test_respects_max_concurrent_positions above:
+        # dedupe is disabled so the deliberately-overlapping, same-label
+        # fixture across two symbols still produces several simultaneous
+        # candidates for the per-direction cap to actually constrain.
         warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
         from scanner.backtesting import portfolio_backtest as module
 
@@ -240,6 +254,7 @@ class TestPortfolioAdmission:
             max_concurrent_positions=5,
             max_concurrent_per_direction=1,
             horizon_candles=1,
+            dedupe_correlated_events=False,
         )
         result = run_portfolio_backtest(config)
         assert result.trades, "expected at least one trade to be admitted"
@@ -320,7 +335,13 @@ class TestPointInTimeUniverseFilter:
         from scanner.backtesting import portfolio_backtest as module
 
         monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
-        result = run_portfolio_backtest(self._config())
+        # Korak 1's correlated-event dedupe is explicitly disabled: both
+        # symbols share the exact same overlapping "trend:bullish" fixture
+        # on purpose here, which would otherwise collapse them into one
+        # symbol's trade and break this test's actual point (that the
+        # point-in-time filter, with no windows configured, keeps every
+        # symbol -- not a claim about dedup).
+        result = run_portfolio_backtest(self._config(dedupe_correlated_events=False))
 
         assert result.point_in_time_filtered_count == 0
         assert {t.symbol for t in result.trades} == {"BTCUSDT", "ETHUSDT"}
@@ -353,6 +374,162 @@ class TestPointInTimeUniverseFilter:
 
         assert result.trades == []
         assert result.point_in_time_filtered_count > 0
+
+
+class TestDedupeCorrelatedEvents:
+    """Korak 1: `_dedupe_correlated_events` collapses time-overlapping
+    candidate events that share a label into a single representative, so a
+    persistent trend re-firing every candle (or one BTC-wide move firing
+    the same label on many symbols at once) is traded once, not dozens of
+    times."""
+
+    def _event(
+        self,
+        label: str,
+        entry_hour: int,
+        resolution_hour: int,
+        win_rate_ci_low_pct: float,
+        symbol: str = "BTCUSDT",
+        direction: str = "long",
+    ) -> CandidateEvent:
+        return CandidateEvent(
+            symbol=symbol,
+            timeframe="1h",
+            direction=direction,
+            label=label,
+            entry_time=_T0 + timedelta(hours=entry_hour),
+            resolution_time=_T0 + timedelta(hours=resolution_hour),
+            net_return_pct=1.0,
+            r_multiple=None,
+            n=50,
+            win_rate_pct=60.0,
+            win_rate_ci_low_pct=win_rate_ci_low_pct,
+            regime="normal",
+            regime_fallback=False,
+        )
+
+    def test_overlapping_same_label_events_collapse_to_the_highest_ci_low(self):
+        events = [
+            self._event("trend:bullish", 0, 3, win_rate_ci_low_pct=52.0),
+            self._event("trend:bullish", 1, 4, win_rate_ci_low_pct=58.0),  # overlaps the first, highest ci_low
+            self._event("trend:bullish", 2, 5, win_rate_ci_low_pct=55.0),  # overlaps both -> same cluster
+        ]
+        kept, n_removed = _dedupe_correlated_events(events)
+
+        assert n_removed == 2
+        assert len(kept) == 1
+        assert kept[0].win_rate_ci_low_pct == 58.0
+
+    def test_non_overlapping_same_label_events_are_both_kept(self):
+        events = [
+            self._event("trend:bullish", 0, 1, win_rate_ci_low_pct=52.0),
+            self._event("trend:bullish", 5, 6, win_rate_ci_low_pct=58.0),
+        ]
+        kept, n_removed = _dedupe_correlated_events(events)
+
+        assert n_removed == 0
+        assert len(kept) == 2
+
+    def test_different_labels_are_never_merged_even_if_overlapping(self):
+        events = [
+            self._event("trend:bullish", 0, 3, win_rate_ci_low_pct=52.0),
+            self._event("anomaly:breakout", 0, 3, win_rate_ci_low_pct=58.0),
+        ]
+        kept, n_removed = _dedupe_correlated_events(events)
+
+        assert n_removed == 0
+        assert len(kept) == 2
+
+    def test_cross_symbol_overlap_on_the_same_label_still_collapses(self):
+        """The whole point: one BTC-wide move firing the same label on
+        several different altcoins near-simultaneously must still be
+        treated as one correlated bet, not several independent ones."""
+        events = [
+            self._event("trend:bearish", 0, 2, win_rate_ci_low_pct=51.0, symbol="ETHUSDT", direction="short"),
+            self._event("trend:bearish", 0, 2, win_rate_ci_low_pct=58.0, symbol="SOLUSDT", direction="short"),
+            self._event("trend:bearish", 0, 2, win_rate_ci_low_pct=50.0, symbol="INJUSDT", direction="short"),
+        ]
+        kept, n_removed = _dedupe_correlated_events(events)
+
+        assert n_removed == 2
+        assert len(kept) == 1
+        assert kept[0].symbol == "SOLUSDT"
+
+    def test_empty_input_returns_empty_list(self):
+        kept, n_removed = _dedupe_correlated_events([])
+        assert kept == []
+        assert n_removed == 0
+
+    def test_same_label_different_timeframes_are_never_merged(self):
+        """A 1h and a 4h candidate sharing a label are genuinely different
+        trade setups (different horizon/resolution delay) -- even with
+        identical, fully-overlapping windows, they must stay separate."""
+        events = [
+            self._event("trend:bullish", 0, 2, win_rate_ci_low_pct=52.0, symbol="BTCUSDT"),
+            CandidateEvent(
+                symbol="BTCUSDT",
+                timeframe="4h",
+                direction="long",
+                label="trend:bullish",
+                entry_time=_T0,
+                resolution_time=_T0 + timedelta(hours=2),
+                net_return_pct=1.0,
+                r_multiple=None,
+                n=50,
+                win_rate_pct=60.0,
+                win_rate_ci_low_pct=58.0,
+                regime="normal",
+                regime_fallback=False,
+            ),
+        ]
+        kept, n_removed = _dedupe_correlated_events(events)
+
+        assert n_removed == 0
+        assert len(kept) == 2
+
+
+class TestDedupeCorrelatedEventsIntegration:
+    """`PortfolioBacktestConfig.dedupe_correlated_events` must actually
+    reduce `run_portfolio_backtest`'s trade count when correlated
+    candidates exist, and `False` must reproduce the pre-dedupe behaviour
+    exactly (so existing callers that need every raw candidate traded --
+    e.g. other tests in this file -- can opt back out)."""
+
+    def _config(self, **overrides) -> PortfolioBacktestConfig:
+        base = {
+            "symbols": ("BTCUSDT", "ETHUSDT"),
+            "timeframes": ("1h",),
+            "initial_capital": 10_000.0,
+            "risk_per_trade_pct": 1.0,
+            "max_concurrent_positions": 5,
+            "max_concurrent_per_direction": 5,
+            "round_trip_cost_pct": 0.0,
+            "extra_slippage_pct": 0.0,
+            "warmup_candles": 0,
+            "horizon_candles": 1,
+        }
+        base.update(overrides)
+        return PortfolioBacktestConfig(**base)
+
+    def test_dedupe_true_reduces_trade_count_when_candidates_overlap(self, monkeypatch):
+        # One persistent trend firing on consecutive hourly candles, each a
+        # distinct LabeledCase (as the live labeling pipeline would really
+        # produce), so every candle is individually "significant" on its
+        # own -- exactly the overtrading scenario Korak 1 targets.
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+
+        deduped = run_portfolio_backtest(self._config(dedupe_correlated_events=True))
+        raw = run_portfolio_backtest(self._config(dedupe_correlated_events=False))
+
+        assert deduped.correlated_dedupe_removed_count > 0
+        assert len(deduped.trades) < len(raw.trades)
+        assert raw.correlated_dedupe_removed_count == 0
+
+    def test_dedupe_defaults_to_true(self):
+        assert PortfolioBacktestConfig(symbols=("BTCUSDT",), timeframes=("1h",)).dedupe_correlated_events is True
 
 
 class TestCostTierAndFundingWiring:

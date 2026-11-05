@@ -431,6 +431,7 @@ def backtest_symbol(
     funding_events: list[FundingEvent] | None = None,
     sl_tp_tie_break: str = "conservative",
     invert_signals: bool = False,
+    sl_tp_overrides: dict[str, tuple[float, float]] | None = None,
 ) -> list[LabeledCase]:
     """Walk every candle in ``symbol``'s history, label it the way the live
     scanner would (trend + anomalies, point-in-time), and record the outcome
@@ -487,7 +488,23 @@ def backtest_symbol(
     price delta: it's stored so that re-applying the *original* label's
     static direction convention downstream yields the correct P&L for the
     trade that was actually (and oppositely) taken.
+
+    ``sl_tp_overrides`` (Korak 2 — data-driven SL/TP calibration, see
+    :mod:`scanner.analysis.sl_tp_calibration`) maps a directional ``label``
+    to its own ``(sl_atr_multiplier, tp_atr_multiplier)`` pair, replacing
+    the flat :data:`DEFAULT_SL_ATR_MULTIPLIER`/:data:`DEFAULT_TP_ATR_MULTIPLIER`
+    for that label only — labels absent from the dict (or when the dict
+    itself is ``None``, the default) keep walking the live system's flat
+    multipliers. This lets a re-run test whether a label's own empirical
+    MFE/MAE distribution (rather than one blanket ratio for every label)
+    produces a better-calibrated, more profitable stop/target. Mutually
+    exclusive with ``invert_signals`` — mixing "fade the signal" with
+    "use this label's own calibrated SL/TP" in one run would conflate two
+    different kinds of strategy variant and make a resulting edge (or lack
+    of one) impossible to attribute to either change individually.
     """
+    if sl_tp_overrides and invert_signals:
+        raise ValueError("sl_tp_overrides and invert_signals cannot be combined in a single backtest_symbol() run")
     df = history if history is not None else _load_history(symbol, timeframe, limit)
     atr_pct = (df["atr"] / df["close"] * 100.0).replace([float("inf"), float("-inf")], pd.NA)
     max_horizon = max(horizons)
@@ -504,18 +521,33 @@ def backtest_symbol(
         regime = regime_for_window(atr_pct.iloc[: i + 1].dropna())
         entry_atr = float(df["atr"].iloc[i])
 
-        # Path-dependent exit depends only on direction (long vs short), not
-        # on which label implied it, so at most two walk-forwards per candle
-        # are needed no matter how many directional labels fire together.
-        exit_by_direction: dict[str, tuple[int | None, float | None, str | None]] = {}
+        # Path-dependent exit depends only on (direction, sl_mult, tp_mult),
+        # not on which label implied it, so labels that share a direction
+        # AND the same multiplier pair still share a single walk-forward.
+        # Without sl_tp_overrides every directional label on a candle maps
+        # to the same flat pair, so this is still at most two walks per
+        # candle (the original behaviour) -- extra walks only happen when
+        # overrides actually diversify the multipliers used.
         opposite = {"long": "short", "short": "long"}
-        for direction in ("long", "short"):
-            needed = any(LABEL_DIRECTION.get(label) == direction for label in labels)
-            if needed:
+
+        def _label_sl_tp_mult(label: str) -> tuple[float, float]:
+            if sl_tp_overrides and label in sl_tp_overrides:
+                return sl_tp_overrides[label]
+            return DEFAULT_SL_ATR_MULTIPLIER, DEFAULT_TP_ATR_MULTIPLIER
+
+        exit_by_key: dict[tuple[str, float, float], tuple[int | None, float | None, str | None]] = {}
+        for label in labels:
+            direction = LABEL_DIRECTION.get(label)
+            if direction is None:
+                continue
+            if invert_signals:
+                sl_mult, tp_mult = DEFAULT_TP_ATR_MULTIPLIER, DEFAULT_SL_ATR_MULTIPLIER
+            else:
+                sl_mult, tp_mult = _label_sl_tp_mult(label)
+            key = (direction, sl_mult, tp_mult)
+            if key not in exit_by_key:
                 walk_direction = opposite[direction] if invert_signals else direction
-                sl_mult = DEFAULT_TP_ATR_MULTIPLIER if invert_signals else DEFAULT_SL_ATR_MULTIPLIER
-                tp_mult = DEFAULT_SL_ATR_MULTIPLIER if invert_signals else DEFAULT_TP_ATR_MULTIPLIER
-                exit_by_direction[direction] = _walk_forward_exit(
+                exit_by_key[key] = _walk_forward_exit(
                     df, i, walk_direction, entry_close, entry_atr, max_horizon, sl_tp_tie_break, sl_mult, tp_mult
                 )
 
@@ -535,11 +567,14 @@ def backtest_symbol(
                     )
                 continue
 
-            hit_candle, exit_price, reason = exit_by_direction.get(direction, (None, None, None))
+            if invert_signals:
+                sl_mult, tp_mult = DEFAULT_TP_ATR_MULTIPLIER, DEFAULT_SL_ATR_MULTIPLIER
+            else:
+                sl_mult, tp_mult = _label_sl_tp_mult(label)
+            hit_candle, exit_price, reason = exit_by_key.get((direction, sl_mult, tp_mult), (None, None, None))
             if reason is None:
                 continue  # no usable ATR at this candle (NaN/zero) — skip
             traded_direction = opposite[direction] if invert_signals else direction
-            sl_mult = DEFAULT_TP_ATR_MULTIPLIER if invert_signals else DEFAULT_SL_ATR_MULTIPLIER
             sl_distance_pct = entry_atr * sl_mult / entry_close * 100.0
             for horizon in horizons:
                 if hit_candle is not None and hit_candle <= horizon:

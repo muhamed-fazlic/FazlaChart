@@ -43,13 +43,21 @@ full discussion):
   extra slippage), exactly mirroring ``scanner.calibration.summarize``'s
   correction — ``LabeledCase.forward_return_pct`` itself is raw and
   uncorrected, so any direct consumer must replicate this.
-* Correlation control is a deliberately simplified v1 proxy:
-  ``max_concurrent_per_direction`` caps how many same-direction positions can
-  be open at once, standing in for the live system's BTC-divergence
-  correlation tag (``agents_crypto.best_signal._tag_correlated_exposure``),
-  which would require a parallel point-in-time BTC trend series per
-  timestamp to replicate here. This is a known, documented approximation,
-  not a claim of equivalent rigor.
+* Correlation control has two layers. ``max_concurrent_per_direction`` is
+  the original, deliberately simplified v1 proxy: it caps how many
+  same-direction positions can be open at once, standing in for the live
+  system's BTC-divergence correlation tag
+  (``agents_crypto.best_signal._tag_correlated_exposure``), which would
+  require a parallel point-in-time BTC trend series per timestamp to
+  replicate here. v2, ``dedupe_correlated_events`` (on by default), goes
+  further: it actually *acts on* the same time-overlap clustering that
+  ``scanner.validation.independence`` had only ever used to *measure*
+  correlation after the fact — see ``_dedupe_correlated_events`` below.
+  This is what stops a single persistent trend (same symbol firing the same
+  label candle after candle while the move runs) or a single BTC-wide move
+  (same label firing on a dozen altcoins within the same window) from being
+  entered as a dozen-plus "independent" trades, each paying its own
+  transaction cost, when it was really one bet.
 * Sharpe/Sortino are annualized using trades-per-year (``n_trades /
   years_span``) rather than resampling the equity curve to fixed calendar
   periods, since trades are irregularly spaced in time. This is a common,
@@ -212,6 +220,17 @@ class PortfolioBacktestConfig:
     risk_per_trade_pct: float = 1.0
     max_concurrent_positions: int = 5
     max_concurrent_per_direction: int = 3
+    # v2 correlation control (see module docstring): collapses time-
+    # overlapping candidate events that share the same label -- regardless
+    # of symbol -- into a single representative (the one with the highest
+    # win_rate_ci_low_pct) before the portfolio simulation ever sees them.
+    # On by default: it directly targets the dominant real-world driver of
+    # both overtrading (a persistent trend re-qualifying every candle) and
+    # the independence-check failures seen in practice (tens of thousands
+    # of raw cases collapsing to single-digit independent events) -- taking
+    # only one trade per genuinely independent event instead of all of
+    # them. Set to False to reproduce pre-this-change behaviour.
+    dedupe_correlated_events: bool = True
     round_trip_cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT
     extra_slippage_pct: float = 0.0
     # Phase 8 Korak 5 (execution realism): when True, round_trip_cost_pct is
@@ -326,6 +345,10 @@ class PortfolioBacktestResult:
     # their symbol was not in the point-in-time universe at entry_time (0 if
     # config.point_in_time_windows was None, i.e. the filter was off).
     point_in_time_filtered_count: int = 0
+    # How many otherwise-significant candidate events were dropped by the v2
+    # correlated-event dedupe pass (0 if config.dedupe_correlated_events was
+    # False, or there was nothing to collapse).
+    correlated_dedupe_removed_count: int = 0
     # Phase 8 Korak 6 (audit follow-up): in/out-of-sample split check, one
     # entry per (label, horizon) seen across every symbol/timeframe in this
     # run -- pooled across the whole universe since OutOfSampleResult groups
@@ -465,6 +488,63 @@ def _build_candidate_events(
             # highest confidence-lower-bound label wins.
             events.append(max(significant, key=lambda e: e.win_rate_ci_low_pct))
     return events
+
+
+def _dedupe_correlated_events(events: list[CandidateEvent]) -> tuple[list[CandidateEvent], int]:
+    """The actual trade-taking counterpart of
+    ``scanner.validation.independence.cluster_independent_events``, which
+    until now only ever *measured* this correlation after the fact instead
+    of acting on it at entry time.
+
+    Groups ``events`` by ``(label, timeframe)`` -- not symbol, since each
+    label implies a fixed direction via ``LABEL_DIRECTION`` (same
+    convention as ``summarize_with_independence``) and the whole point is
+    to catch a BTC-wide move firing the same label on a dozen correlated
+    altcoins at once, regardless of which symbol happens to carry it.
+    ``timeframe`` IS kept as part of the key, though: a 1h and a 4h
+    candidate sharing a label are genuinely different trade setups (
+    different horizon, different resolution delay, often open side by
+    side as legitimately separate bets), not the same signal counted
+    twice, so they must never be collapsed into each other.
+
+    Within each ``(label, timeframe)`` group's own events, sorted
+    chronologically, merges any whose ``[entry_time, resolution_time]``
+    windows overlap *transitively* (if A overlaps B and B overlaps C, all
+    three land in one cluster even if A and C don't directly overlap) into
+    one cluster, keeping only the single member with the highest
+    ``win_rate_ci_low_pct`` (ties broken by whichever occurs first
+    chronologically, since ``max()`` returns the first maximum it sees and
+    ``group`` is iterated in chronological order).
+
+    This is exactly how one persistent trend firing the same label on the
+    same symbol candle after candle, or one BTC-wide move firing the same
+    label on a dozen correlated altcoins within the same window, both
+    collapse into a single trade instead of a dozen-plus "independent"
+    ones that were really the same bet counted (and cost-charged)
+    repeatedly.
+
+    Returns ``(kept_events, n_removed)``."""
+    by_label_timeframe: dict[tuple[str, str], list[CandidateEvent]] = defaultdict(list)
+    for e in events:
+        by_label_timeframe[(e.label, e.timeframe)].append(e)
+
+    kept: list[CandidateEvent] = []
+    for group in by_label_timeframe.values():
+        group.sort(key=lambda e: e.entry_time)
+        cluster: list[CandidateEvent] = []
+        cluster_end: datetime | None = None
+        for e in group:
+            if cluster_end is None or e.entry_time > cluster_end:
+                if cluster:
+                    kept.append(max(cluster, key=lambda c: c.win_rate_ci_low_pct))
+                cluster = [e]
+                cluster_end = e.resolution_time
+            else:
+                cluster.append(e)
+                cluster_end = max(cluster_end, e.resolution_time)
+        if cluster:
+            kept.append(max(cluster, key=lambda c: c.win_rate_ci_low_pct))
+    return kept, len(events) - len(kept)
 
 
 def _count_independent_episodes(trades: list[Trade]) -> int:
@@ -732,6 +812,7 @@ def build_dashboard_report(
             "risk_per_trade_pct": config.risk_per_trade_pct,
             "max_concurrent_positions": config.max_concurrent_positions,
             "max_concurrent_per_direction": config.max_concurrent_per_direction,
+            "dedupe_correlated_events": config.dedupe_correlated_events,
             "round_trip_cost_pct": config.round_trip_cost_pct,
             "extra_slippage_pct": config.extra_slippage_pct,
             "use_symbol_cost_tiers": config.use_symbol_cost_tiers,
@@ -833,6 +914,10 @@ def build_dashboard_report(
             if config.point_in_time_windows is not None
             else {"enabled": False}
         ),
+        "correlated_dedupe": {
+            "enabled": config.dedupe_correlated_events,
+            "candidates_removed": result.correlated_dedupe_removed_count,
+        },
     }
 
 
@@ -907,6 +992,11 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
         ]
         point_in_time_filtered_count = len(all_events) - len(kept_events)
         all_events = kept_events
+
+    correlated_dedupe_removed_count = 0
+    if config.dedupe_correlated_events:
+        all_events, correlated_dedupe_removed_count = _dedupe_correlated_events(all_events)
+        all_events.sort(key=lambda e: e.entry_time)
 
     equity = config.initial_capital
     open_positions: list[dict[str, Any]] = []
@@ -1030,6 +1120,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
         metrics=metrics,
         skipped_symbols=skipped,
         point_in_time_filtered_count=point_in_time_filtered_count,
+        correlated_dedupe_removed_count=correlated_dedupe_removed_count,
         oos_validation=oos_validation,
         independence_validation=independence_validation,
         walk_forward_validation=walk_forward_validation,
@@ -1046,6 +1137,14 @@ def _main() -> None:
     parser.add_argument("--risk-per-trade-pct", type=float, default=1.0)
     parser.add_argument("--max-concurrent-positions", type=int, default=5)
     parser.add_argument("--max-concurrent-per-direction", type=int, default=3)
+    parser.add_argument(
+        "--no-correlated-dedupe",
+        action="store_true",
+        help="Disable the v2 correlated-event dedupe pass (collapses time-overlapping candidate events sharing "
+        "a label -- regardless of symbol -- into one representative trade before simulation). On by default; "
+        "this reproduces pre-this-change behaviour, where a persistent trend or a BTC-wide move firing the "
+        "same label on several symbols at once was entered as several separate trades.",
+    )
     parser.add_argument("--kline-limit", type=int, default=1500)
     parser.add_argument(
         "--warmup-candles",
@@ -1214,6 +1313,7 @@ def _main() -> None:
         risk_per_trade_pct=args.risk_per_trade_pct,
         max_concurrent_positions=args.max_concurrent_positions,
         max_concurrent_per_direction=args.max_concurrent_per_direction,
+        dedupe_correlated_events=not args.no_correlated_dedupe,
         kline_limit=args.kline_limit,
         warmup_candles=args.warmup_candles,
         round_trip_cost_pct=args.round_trip_cost_pct,
@@ -1244,6 +1344,11 @@ def _main() -> None:
         print(f"\nSkipped (vendor error): {', '.join(result.skipped_symbols)}")
     if config.point_in_time_windows is not None:
         print(f"Point-in-time universe filter excluded {result.point_in_time_filtered_count} candidate trade(s)")
+    if config.dedupe_correlated_events:
+        print(
+            f"Correlated-event dedupe collapsed {result.correlated_dedupe_removed_count} candidate trade(s) "
+            "into their cluster's single representative"
+        )
 
     if args.trades_json:
         with open(args.trades_json, "w", encoding="utf-8") as fh:

@@ -642,3 +642,99 @@ class TestInvertSignals:
         assert checked, "expected at least one SL/TP-resolved directional case to compare"
 
 
+class TestSlTpOverrides:
+    """Korak 2: `backtest_symbol(sl_tp_overrides=...)` -- a per-label
+    ATR-multiplier override, calibrated from live MFE/MAE data (see
+    `scanner.analysis.sl_tp_calibration`), that lets a re-run test whether
+    a label's own empirical excursion distribution beats the flat
+    default."""
+
+    _HOUR_MS = 3_600_000
+    _N_CANDLES = 90
+
+    def _history(self) -> pd.DataFrame:
+        from tradingagents.dataflows.vendors.binance.indicators import (
+            add_indicators,
+            klines_to_dataframe,
+        )
+
+        klines = [_trend_kline(i * self._HOUR_MS, base=100.0 + i * 0.5) for i in range(self._N_CANDLES)]
+        return add_indicators(klines_to_dataframe(klines))
+
+    def test_none_overrides_matches_omitting_the_argument(self):
+        from scanner.calibration import backtest_symbol
+
+        df = self._history()
+        without_arg = backtest_symbol("TESTUSDT", "1h", horizons=(4,), history=df, min_history=60)
+        with_none = backtest_symbol(
+            "TESTUSDT", "1h", horizons=(4,), history=df, min_history=60, sl_tp_overrides=None
+        )
+        assert [(c.label, c.entry_time, c.forward_return_pct) for c in without_arg] == [
+            (c.label, c.entry_time, c.forward_return_pct) for c in with_none
+        ]
+
+    def test_override_changes_sl_distance_only_for_the_overridden_label(self):
+        from scanner.calibration import backtest_symbol
+
+        df = self._history()
+        baseline = {(c.label, c.entry_time): c for c in backtest_symbol("TESTUSDT", "1h", horizons=(4,), history=df, min_history=60)}
+        overridden = {
+            (c.label, c.entry_time): c
+            for c in backtest_symbol(
+                "TESTUSDT",
+                "1h",
+                horizons=(4,),
+                history=df,
+                min_history=60,
+                sl_tp_overrides={"trend:bullish": (1.0, 1.0)},
+            )
+        }
+        changed_any = False
+        for key, base_case in baseline.items():
+            over_case = overridden[key]
+            if key[0] == "trend:bullish":
+                if base_case.sl_distance_pct is not None:
+                    assert over_case.sl_distance_pct != pytest.approx(base_case.sl_distance_pct)
+                    changed_any = True
+            else:
+                assert over_case.sl_distance_pct == base_case.sl_distance_pct
+        assert changed_any, "expected at least one trend:bullish case with a changed sl_distance_pct"
+
+    def test_overrides_and_invert_signals_cannot_be_combined(self):
+        from scanner.calibration import backtest_symbol
+
+        df = self._history()
+        with pytest.raises(ValueError):
+            backtest_symbol(
+                "TESTUSDT",
+                "1h",
+                horizons=(4,),
+                history=df,
+                min_history=60,
+                invert_signals=True,
+                sl_tp_overrides={"trend:bullish": (1.0, 1.0)},
+            )
+
+    def test_walk_forward_exit_receives_the_overridden_multipliers(self, monkeypatch):
+        import scanner.calibration as calibration_module
+
+        df = self._history()
+        seen_mults: list[tuple[float, float]] = []
+        real_walk_forward_exit = calibration_module._walk_forward_exit
+
+        def spy(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break="conservative", *mults):
+            seen_mults.append(mults)
+            return real_walk_forward_exit(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break, *mults)
+
+        monkeypatch.setattr(calibration_module, "_walk_forward_exit", spy)
+        calibration_module.backtest_symbol(
+            "TESTUSDT",
+            "1h",
+            horizons=(4,),
+            history=df,
+            min_history=60,
+            sl_tp_overrides={"trend:bullish": (0.7, 3.3)},
+        )
+        assert (0.7, 3.3) in seen_mults, "expected at least one walk to use the overridden (sl, tp) multiplier pair"
+
+
