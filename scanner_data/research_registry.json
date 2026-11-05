@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "shared_holdout": {
+    "end_timestamp_ms": 1790253820000,
+    "end_timestamp_iso": "2026-09-24T12:43:40Z",
+    "note": "Zajednicka granica izmedju train/validation i zakljucanog holdout perioda, ista za sve dosadasnje porodice. Holdout je i dalje netaknut."
+  },
+  "families": [
+    {
+      "id": 1,
+      "name": "Trend/anomaly signal (original + inverted)",
+      "doc": "PHASE8_PROFITABILITY_RESEARCH_TODO.md (Korak 7)",
+      "status": "closed",
+      "decision": "no_edge",
+      "decision_text": "Nema dokazane edge nakon troskova. Original: 38 trejdova, -13.5%, 0/10 na sva tri testa. Inverted: -21 do -22%, win rate 53%, OOS 4/10 ali dijeli ~95% istih svijeca sa drugim runom (nije nezavisna replikacija); walk-forward 1/10.",
+      "variants": [
+        {
+          "name": "original",
+          "n_independent": 38,
+          "net_observed_pct": -13.5,
+          "net_ci_low_pct": null,
+          "net_ci_high_pct": null,
+          "edge_survives_lower_bound": false,
+          "oos_pass_count": "0/10",
+          "independence_pass_count": "0/10",
+          "walk_forward_pass_count": "0/10"
+        },
+        {
+          "name": "inverted",
+          "n_independent": 37,
+          "net_observed_pct": -12.1,
+          "net_ci_low_pct": null,
+          "net_ci_high_pct": null,
+          "edge_survives_lower_bound": false,
+          "oos_pass_count": "4/10 (nije nezavisno - ~95% istih svijeca)",
+          "independence_pass_count": null,
+          "walk_forward_pass_count": "1/10"
+        },
+        {
+          "name": "frozen_baseline",
+          "net_observed_pct": null,
+          "net_ci_low_pct": -0.73,
+          "net_ci_high_pct": 0.34,
+          "edge_survives_lower_bound": false
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Funding-extreme reversion",
+      "doc": "PREREGISTRATION_FUNDING_EXTREME_REVERSION.md (sekcije 9-10)",
+      "status": "closed",
+      "decision": "no_edge_decisive",
+      "decision_text": "Odlucno pada (ne neodlucivo). I neto i bruto povrat negativni - problem nije (samo) trosak, sirovi signal sam po sebi ne pokazuje edge.",
+      "dataset_hash": "1cdef092f543ed96",
+      "n_independent": 448,
+      "n_required": 371,
+      "undecidable": false,
+      "net_observed_pct": -0.2418,
+      "net_ci_low_pct": -0.4519,
+      "net_ci_high_pct": -0.0692,
+      "net_edge_survives_lower_bound": false,
+      "gross_observed_pct": -0.1264,
+      "gross_ci_low_pct": -0.3358,
+      "gross_ci_high_pct": 0.0426,
+      "gross_edge_survives_lower_bound": false,
+      "measured_sigma_pct": 2.0614,
+      "win_rate_pct": 45.76
+    },
+    {
+      "id": 3,
+      "name": "Cross-sectional momentum (market-neutral)",
+      "doc": "PREREGISTRATION_CROSS_SECTIONAL_MOMENTUM.md (sekcije 9-10)",
+      "status": "closed",
+      "decision": "no_edge_decisive",
+      "decision_text": "Odlucno pada. Bruto signal je nula unutar suma (visok turnover nije glavni problem). Beta-provjera potvrdjuje da je market-neutral dizajn uspio (r blizu 0 naspram BTC).",
+      "dataset_hash": "1cdef092f543ed96",
+      "n_independent": 332,
+      "n_required": 123,
+      "undecidable": false,
+      "net_observed_pct": -0.0793,
+      "net_ci_low_pct": -0.1778,
+      "net_ci_high_pct": 0.0282,
+      "net_edge_survives_lower_bound": false,
+      "gross_observed_pct": 0.076,
+      "gross_ci_low_pct": -0.0246,
+      "gross_ci_high_pct": 0.1872,
+      "gross_edge_survives_lower_bound": false,
+      "measured_sigma_pct": 1.1838,
+      "win_rate_pct": 42.47,
+      "avg_daily_turnover_pct": 72.71,
+      "btc_beta_correlation": -0.0012,
+      "btc_beta_flag_triggered": false
+    }
+  ],
+  "overall_note": "Sve tri testirane porodice (direkcione i market-neutral) zatvorene su bez dokaza edge-a nakon troskova na 20-simbol Binance futures univerzumu, ~8-mjesecni period, 5m-24h horizonti. Sljedeca faza: eksploratorni sken (Korak 10) na prosirenom univerzumu (170 simbola, 3 tercila likvidnosti), obiljezen kao eksploratoran, ne konfirmatoran - rezultati ce biti dodani ovdje kada se zavrse."
+}

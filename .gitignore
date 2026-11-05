@@ -224,6 +224,10 @@ reports/
 
 # Market Scanner persisted snapshots (local SQLite data, not source)
 scanner_data/
+# Exception: curated, hand-maintained summary of closed pre-registered
+# hypothesis families (source of truth, not a runtime cache) -- read by
+# the "Istrazivanje" dashboard tab.
+!scanner_data/research_registry.json
 
 # Runtime PID/log files written by tool/start_all.ps1 and tool/stop_all.ps1
 tool/.run/
