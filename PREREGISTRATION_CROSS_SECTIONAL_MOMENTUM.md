@@ -307,3 +307,63 @@ not silently made.
     `round_trip_cost_pct_for`'s existing per-symbol liquidity tiers, used
     as-is with no override -- same base rate both prior hypotheses use by
     default.
+
+## 10. Rezultat prvog (i jedinog) runa i FINALNO zatvaranje
+
+**Datum:** 2026-11-05. **Run:** jedan, train/validation period, na VPS-u
+(`/opt/FazlaChart`), `end_timestamp_ms=1790253820000` (isti holdout-granica
+kao obje prethodne zatvorene porodice). Holdout ostaje netaknut.
+`dataset_hash: 1cdef092f543ed96` (identican hash-u iz funding-extreme
+porodice -- ocekivano, isti 20 simbola/isti candle+funding dataset na
+istom `end_timestamp_ms`, ne greska). 20/20 simbola koristeno, 0
+preskoceno.
+
+| Mjera | Vrijednost |
+|---|---|
+| n_rebalance_grid_points | 334 |
+| n preskocenih (min-eligible/pricing) | 1 |
+| **n_independent** (stvarno formiranih kosara) | **332** |
+| Net (nakon troskova i funding-a) observed_pct | **-0.0793%** |
+| Net 95% CI | **[-0.1778%, +0.0282%]** |
+| Net edge_survives_lower_bound | **false** |
+| Gross (prije troskova/funding-a) observed_pct | **+0.0760%** |
+| Gross 95% CI | **[-0.0246%, +0.1872%]** |
+| Gross edge_survives_lower_bound | **false** |
+| Prosjecan dnevni turnover | **0.7271** (72.71%) |
+| Beta-provjera (Pearson r, kosara vs BTC) | **-0.0012** (|r| < 0.3) |
+| Izmjerena sigma (sample stdev, net) | **1.1838%** |
+| Win rate | 42.47% |
+| n_required (d=0.3%, izmjerena sigma) | 123 |
+| n_independent vs n_required | 332 > 123 -> **NIJE neodlucivo** |
+
+**Interpretacija:** Ovo NIJE "neodlucivo" -- 332 nezavisnih dnevnih
+rebalans-perioda je znacajno vise nego sto je pre-registrovani power-racun
+(sa IZMJERENOM sigmom od ovog runa) trazio (123), pa je test imao dovoljno
+snage da donese odluku. Neto expectancy je blago negativan i CI prelazi
+nulu s obje strane (gornja granica je pozitivna), ali DONJA granica je
+ispod nule, pa `edge_survives_lower_bound=false` -- nema dokazane edge
+nakon troskova i funding-a. Bruto (prije troskova/funding-a) povrat je
+blago POZITIVAN, ali njegov CI takodjer prelazi nulu (donja granica je
+ispod nule) -- dakle ni sirovi signal sam po sebi nema cvrst dokaz edge-a,
+cak i prije ijednog troska. Prosjecan dnevni turnover od 72.71% je visok
+(ocekivano za dnevni cross-sectional re-rank sa uskim univerzumom od 20
+simbola) i objasnjava zasto je neto povrat niziji od bruto povrata --
+troskovi (turnover-bazirani + funding) jedu priblizno
+`0.076% - (-0.0793%) = ~0.155%` po rebalansu u prosjeku. Beta-provjera
+POTVRDJUJE da je dizajn "market-neutral" ispao ispravan i empirijski: r =
+-0.0012 je prakticno nula, duboko unutar |r| <= 0.3 praga -- ova hipoteza
+NIJE izlozena BTC-beti (za razliku od prve dvije, direkcione porodice), sto
+je bila i namjera dizajna iz uvoda ovog dokumenta.
+
+**Odluka:** Hipoteza "cross-sectional momentum" (24h lookback, dnevni
+rebalans, top-5/bottom-5 od 20 simbola, dollar-neutral) se FORMALNO
+ZATVARA kao "nema edge-a, ni bruto ni neto, nakon sto se uzme u obzir
+turnover-trosak i funding". Beta-provjera potvrdjuje da je metodoloski
+cilj (market-neutral izlozenost) postignut -- problem dakle NIJE u
+beta-izlozenosti nego u samom signalu (24h unazadni cross-sectional
+momentum na ovom univerzumu nema mjerljivu edge). Po pravilu iz sekcije
+6: ovaj ishod se NE smatra povodom da se smjer okrene na reversion (to bi
+bio zaseban, cetvrti trial, #4, sa novim holdoutom) niti da se N, lookback
+ili rebalans-frekvencija retuniraju na istim podacima. Holdout
+(`end_timestamp_ms > 1790253820000`) ostaje netaknut. Trial/porodica #3
+zatvorena.
