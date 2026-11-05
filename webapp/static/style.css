@@ -507,6 +507,22 @@ tbody tr:hover { background: #1c2430; }
 .analysis-bar button:hover { border-color: var(--blue); }
 .analysis-bar button:disabled { opacity: 0.5; cursor: wait; }
 
+.cpu-limit-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.cpu-limit-control input[type="range"] {
+  width: 110px;
+  accent-color: var(--blue);
+}
+#backtest-cpu-limit-value {
+  min-width: 34px;
+  text-align: right;
+  color: var(--text);
+}
+
 .analysis-result.hidden { display: none; }
 
 .analysis-result {
@@ -1028,6 +1044,8 @@ footer {
     align-items: stretch;
   }
   .analysis-bar select, .analysis-bar button { width: 100%; }
+  .cpu-limit-control { width: 100%; }
+  .cpu-limit-control input[type="range"] { flex: 1; width: auto; }
 
   .heatmap-bar-row {
     grid-template-columns: 80px 1fr 42px;

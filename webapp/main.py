@@ -325,6 +325,39 @@ def _backtest_refresh_script_path() -> Path:
     return Path(__file__).resolve().parent.parent / "tool" / "run_full_portfolio_backtest.sh"
 
 
+DEFAULT_BACKTEST_CPU_LIMIT_PCT = 30
+
+
+def _backtest_cpu_limit_path() -> str:
+    """Read lazily so tests can point this at a throwaway file via the
+    BACKTEST_CPU_LIMIT_PATH env var — mirrors ``_backtest_report_path()``'s
+    convention. Persists the "koliko % servera smije ovaj run da koristi"
+    slider next to the "🔄 Osvježi" button across webapp restarts. One
+    value shared by every strategy variant (the knob is "how much of the
+    server", not "how much for this particular variant") and read fresh
+    inside ``POST /api/backtest/refresh`` on every call, so changing the
+    slider once applies to the very next refresh — manual or any future
+    automated one that reuses this same endpoint — with no extra wiring."""
+    return os.environ.get("BACKTEST_CPU_LIMIT_PATH", "scanner_data/backtest_cpu_limit.json")
+
+
+def _read_backtest_cpu_limit_pct() -> int:
+    path = Path(_backtest_cpu_limit_path())
+    if not path.exists():
+        return DEFAULT_BACKTEST_CPU_LIMIT_PCT
+    try:
+        pct = int(json.loads(path.read_text(encoding="utf-8"))["cpu_limit_pct"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return DEFAULT_BACKTEST_CPU_LIMIT_PCT
+    return pct if 1 <= pct <= 100 else DEFAULT_BACKTEST_CPU_LIMIT_PCT
+
+
+def _write_backtest_cpu_limit_pct(pct: int) -> None:
+    path = Path(_backtest_cpu_limit_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"cpu_limit_pct": pct}, indent=2), encoding="utf-8")
+
+
 def _read_refresh_status(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
     path = Path(_backtest_refresh_status_path(variant))
     if not path.exists():
@@ -791,6 +824,28 @@ def backtest_experiments(limit: int = 50) -> dict[str, Any]:
     return {"available": True, "experiments": experiments}
 
 
+@app.get("/api/backtest/cpu-limit")
+def get_backtest_cpu_limit() -> dict[str, Any]:
+    """Current persisted CPU-throttle percentage for the next backtest
+    refresh (see the slider next to "🔄 Osvježi"). Defaults to
+    ``DEFAULT_BACKTEST_CPU_LIMIT_PCT`` the first time, before anything has
+    ever been saved."""
+    return {"cpu_limit_pct": _read_backtest_cpu_limit_pct()}
+
+
+@app.post("/api/backtest/cpu-limit")
+def set_backtest_cpu_limit(pct: int) -> dict[str, Any]:
+    """Persist a new CPU-throttle percentage (1-100) used by every
+    subsequent ``POST /api/backtest/refresh`` call — manual (the dashboard
+    button) or any future automated trigger — until changed again. Does
+    NOT affect a run already in progress; ``cpulimit`` is only attached at
+    launch time."""
+    if not 1 <= pct <= 100:
+        raise HTTPException(status_code=400, detail="cpu_limit_pct must be between 1 and 100")
+    _write_backtest_cpu_limit_pct(pct)
+    return {"cpu_limit_pct": pct}
+
+
 @app.post("/api/backtest/refresh")
 def backtest_refresh(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
     """Explicit, on-demand only (same spirit as ``/api/analyze/{symbol}``):
@@ -800,9 +855,13 @@ def backtest_refresh(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
     script and PHASE8_PROFITABILITY_RESEARCH_TODO.md for why this one
     command exists instead of hand-typed flags) -- as a detached background
     process and returns immediately. ``nice``+``cpulimit`` throttle it to
-    ~30% of one CPU so it doesn't starve the scanner/dashboard on the VPS's
-    limited vCPU budget; falls back to un-throttled (nice only) if
-    ``cpulimit`` isn't installed, rather than failing the request.
+    the persisted ``_read_backtest_cpu_limit_pct()`` percentage of one CPU
+    (default 30%, user-configurable via the dashboard's CPU slider / the
+    ``/api/backtest/cpu-limit`` endpoints) so it doesn't starve the
+    scanner/dashboard on the VPS's limited vCPU budget; falls back to
+    un-throttled (nice only) if ``cpulimit`` isn't installed, or if the
+    configured percentage is 100 ("use as much as it wants"), rather than
+    failing the request.
 
     ``variant`` (Phase 8 "strategy variants" framework) is forwarded to the
     script as ``--strategy-variant`` so it runs that variant's own canonical
@@ -850,10 +909,15 @@ def backtest_refresh(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Could not launch backtest: {exc}") from None
 
+        cpu_limit_pct = _read_backtest_cpu_limit_pct()
         cpulimit_bin = shutil.which("cpulimit")
-        if cpulimit_bin:
+        # 100% means "don't throttle at all" -- this script is
+        # single-threaded, so capping it at 100% of one core is identical
+        # to not launching cpulimit in the first place, and skipping it
+        # avoids a pointless extra monitoring process.
+        if cpulimit_bin and cpu_limit_pct < 100:
             subprocess.Popen(
-                [cpulimit_bin, "-p", str(proc.pid), "-l", "30", "-b"],
+                [cpulimit_bin, "-p", str(proc.pid), "-l", str(cpu_limit_pct), "-b"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,

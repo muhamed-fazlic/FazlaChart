@@ -154,6 +154,11 @@
       <label for="backtest-variant-select">Strategija:</label>
       <select id="backtest-variant-select"></select>
       <button id="backtest-refresh-btn" type="button">🔄 Osvježi cijeli test</button>
+      <span class="cpu-limit-control" title="Koliko % CPU-a na serveru smije koristiti sljedeći run (ručni ili automatski). 100% = najbrže, bez ograničenja.">
+        <label for="backtest-cpu-limit-range">CPU:</label>
+        <input id="backtest-cpu-limit-range" type="range" min="1" max="100" step="1" value="30">
+        <span id="backtest-cpu-limit-value">30%</span>
+      </span>
       <span id="backtest-refresh-status" class="muted"></span>
     </section>
 

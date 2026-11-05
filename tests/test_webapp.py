@@ -400,6 +400,40 @@ def test_backtest_report_reports_unavailable_when_no_file_exists(client, tmp_pat
     assert resp.json() == {"available": False}
 
 
+def test_backtest_cpu_limit_defaults_to_30_when_nothing_saved(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKTEST_CPU_LIMIT_PATH", str(tmp_path / "no_such_cpu_limit.json"))
+    resp = client.get("/api/backtest/cpu-limit")
+    assert resp.status_code == 200
+    assert resp.json() == {"cpu_limit_pct": 30}
+
+
+def test_backtest_cpu_limit_post_persists_and_get_returns_it(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKTEST_CPU_LIMIT_PATH", str(tmp_path / "backtest_cpu_limit.json"))
+    resp = client.post("/api/backtest/cpu-limit", params={"pct": 75})
+    assert resp.status_code == 200
+    assert resp.json() == {"cpu_limit_pct": 75}
+
+    resp = client.get("/api/backtest/cpu-limit")
+    assert resp.status_code == 200
+    assert resp.json() == {"cpu_limit_pct": 75}
+
+
+@pytest.mark.parametrize("bad_pct", [0, -5, 101, 1000])
+def test_backtest_cpu_limit_post_rejects_out_of_range_values(client, tmp_path, monkeypatch, bad_pct):
+    monkeypatch.setenv("BACKTEST_CPU_LIMIT_PATH", str(tmp_path / "backtest_cpu_limit.json"))
+    resp = client.post("/api/backtest/cpu-limit", params={"pct": bad_pct})
+    assert resp.status_code == 400
+
+
+def test_backtest_cpu_limit_get_ignores_corrupt_saved_file(client, tmp_path, monkeypatch):
+    bad_path = tmp_path / "backtest_cpu_limit.json"
+    bad_path.write_text("not json at all", encoding="utf-8")
+    monkeypatch.setenv("BACKTEST_CPU_LIMIT_PATH", str(bad_path))
+    resp = client.get("/api/backtest/cpu-limit")
+    assert resp.status_code == 200
+    assert resp.json() == {"cpu_limit_pct": 30}
+
+
 def test_backtest_report_returns_cached_file_contents(client, tmp_path, monkeypatch):
     import json
 

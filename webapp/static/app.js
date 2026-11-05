@@ -613,9 +613,51 @@ async function loadBacktestVariantsDropdown() {
   }
 }
 
+// --- CPU-throttle slider ("koliko % servera smije koristiti ovaj run") --
+// Persisted server-side (scanner_data/backtest_cpu_limit.json via
+// GET/POST /api/backtest/cpu-limit, see webapp/main.py) so it survives
+// page reloads AND is reused by the next refresh regardless of what
+// triggers it -- the manual button here, or any future automated trigger,
+// since both ultimately go through the same POST /api/backtest/refresh
+// handler that reads this exact same setting. Loaded once per page load
+// (like the variants dropdown) so a user mid-drag on the slider doesn't
+// get overwritten by a routine tab reload.
+let backtestCpuLimitLoaded = false;
+
+function renderBacktestCpuLimitValue(pct) {
+  const valueEl = document.getElementById("backtest-cpu-limit-value");
+  if (valueEl) valueEl.textContent = `${pct}%`;
+}
+
+async function loadBacktestCpuLimit() {
+  const rangeEl = document.getElementById("backtest-cpu-limit-range");
+  if (!rangeEl) return;
+  try {
+    const res = await fetch("/api/backtest/cpu-limit");
+    const data = await res.json();
+    const pct = Number(data.cpu_limit_pct) || 30;
+    rangeEl.value = String(pct);
+    renderBacktestCpuLimitValue(pct);
+    backtestCpuLimitLoaded = true;
+  } catch (err) {
+    console.error("Could not load backtest CPU limit:", err);
+  }
+}
+
+async function saveBacktestCpuLimit(pct) {
+  try {
+    await fetch(`/api/backtest/cpu-limit?pct=${encodeURIComponent(pct)}`, { method: "POST" });
+  } catch (err) {
+    console.error("Could not save backtest CPU limit:", err);
+  }
+}
+
 async function loadBacktestTab() {
   if (!backtestVariantsLoaded) {
     await loadBacktestVariantsDropdown();
+  }
+  if (!backtestCpuLimitLoaded) {
+    await loadBacktestCpuLimit();
   }
   try {
     const res = await fetch(`/api/backtest/report?variant=${encodeURIComponent(currentBacktestVariant)}`);
@@ -1947,6 +1989,12 @@ document.getElementById("backtest-refresh-btn").addEventListener("click", trigge
 document.getElementById("backtest-variant-select").addEventListener("change", (e) => {
   currentBacktestVariant = e.target.value;
   loadBacktestTab();
+});
+document.getElementById("backtest-cpu-limit-range").addEventListener("input", (e) => {
+  renderBacktestCpuLimitValue(e.target.value);
+});
+document.getElementById("backtest-cpu-limit-range").addEventListener("change", (e) => {
+  saveBacktestCpuLimit(e.target.value);
 });
 
 async function loadHealth() {
