@@ -19,7 +19,7 @@ biti eksplicitno obrazlozena, ne tiho uradjena.
 Kad je funding rate na USDT-perpetualu u ekstremu (gornji ili donji 5% svoje
 HISTORIJSKE (prosle, rolling) distribucije za taj konkretni simbol), trziste
 je prenatrpano na jednoj strani (previse long ili previse short pozicija
-placa funding), pa je ocekivani povrat u SUPROTNOM smjeru u narednih 8-24h
+placa funding), pa je ocekivani povrat u SUPROTNOM smjeru u narednih **8h**
 pozitivan nakon troskova.
 
 ## 2. Specifikacija (zamrznuta — ne tunirati nakon prvog runa)
@@ -41,13 +41,13 @@ pozitivan nakon troskova.
   nego se uopste zna da li sirovi smjer signala ima ikakvu edge.
 - **Cooldown / ponovljeni ekstremi (zamrznuto, ranije nedefinisan stepen
   slobode):** funding ekstremi su jako autokorelisani — isti simbol cesto
-  ostaje u percentil>95 (ili <5) vise uzastopnih 8h ciklusa. Pravilo: NE
-  ulaziti ponovo u isti (symbol, smjer) dok je (a) prethodna pozicija na tom
-  simbolu jos otvorena, ILI (b) manje od **jednog dodatnog punog funding
-  ciklusa (8h)** nije prošlo od njenog zatvaranja — tj. minimalni razmak
-  izmedju ulaza na istom (symbol, smjer) je drzanje (8h) + cooldown (8h) =
-  **16h**. Ovo je izabrano unaprijed (ne tunirano na rezultatima) jer
-  odgovara logici "jedan dogadjaj = jedan trejd", isti duh kao postojeci
+  ostaje u percentil>95 (ili <5) vise uzastopnih 8h ciklusa. Pravilo (jedna
+  recenica): **novi ulaz na istom (symbol, smjer) je dozvoljen najranije
+  16h nakon prethodnog ulaza** na tom (symbol, smjer) — bez obzira da li je
+  prethodna pozicija vec zatvorena (16h = drzanje od 8h + jos jedan pun
+  funding ciklus od 8h). Ovo je izabrano unaprijed (ne tunirano na
+  rezultatima) jer odgovara logici "jedan dogadjaj = jedan trejd", isti duh
+  kao postojeci
   correlated-event dedup za cross-symbol klastere ispod.
 - **Univerzum:** isti skup od 20 simbola kao zatvorena porodica, sa
   point-in-time universe filterom (isti mehanizam kao
@@ -135,6 +135,13 @@ pozajmljenu sigmu). Stvarno pravilo je:
 > znacajnog" raspona 0.3-0.5% navedenog ranije — bira se gornja/konzervativnija
 > granica tog raspona da prag bude teze proci slucajno).
 
+**Definicija `n_independent` (zapisano unaprijed, da se ne raspravlja
+naknadno):** broj preostalih KLASTERA nakon primjene cooldown-a (16h
+pravilo, sekcija 2) i cross-symbol correlated-event dedup-a (sekcija 2) —
+NE sirovi broj pojedinacnih trejdova prije tog filtriranja. Isto znacenje
+kao `n_independent_episodes` koji vec postoji u postojecem backtest
+izvjestaju za trend/anomaly porodicu.
+
 Tabela ispod postoji samo da se UNAPRIJED vidi red velicine (koliko
 dogadjaja bi bilo "dovoljno" za razlicite pretpostavljene sigme/edge-ove), ne
 da propisuje tacan broj.
@@ -163,6 +170,14 @@ runa je zato **"neodlucivo"**, ne jasan prolaz ili pad. Ovo se ne smatra
 razocaravajucim niti povodom da se prag percentila ublazi (npr. na 90/10)
 da bi se "nabrao" vise dogadjaja — takva izmjena bi bila NOVA, zasebna
 hipoteza (vidi sekciju 2), ne popravka ove.
+
+**Sta tacno znaci "neodlucivo" (zapisano unaprijed, da se izbjegne tiho
+beskonacno ponavljanje):** ako je ishod neodlucivo, hipoteza se NE vraca na
+istu specifikaciju "s malo vise podataka" bez novog, posebno
+pre-registrovanog perioda/datuma. "Pauzirati" (sekcija 7) znaci cekati da
+prirodno prodje dovoljno kalendarskog vremena da se nakupi NOVI, svjez
+train/validation period — ne ponovno gledati isti vec iskorisceni period
+nadajuci se da ce ovaj put biti dovoljno dogadjaja.
 
 ## 6. Multiple-testing racunovodstvo
 
