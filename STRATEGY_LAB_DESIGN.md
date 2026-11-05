@@ -135,6 +135,21 @@ Modul: `scanner/backtesting/rolling_holdout.py`.
   podataka nikad ne koristi dva puta u potvrdi. Testirano direktno
   (`tests/test_rolling_holdout.py`).
 
+**Odluka (ne otvoreno pitanje):** kad se potvrda okine, `run_layer2_check()`
+poziva `advance_boundary(state, consumed_until_ms=now_ms)` — tj. potroši
+CIJELI do tad akumulirani svježi prozor, ne samo statistički minimum
+(`n_required`) potreban za taj konkretan test. Alternativa ("banker" samo
+minimum, ostatak sačuvaj za sljedeću, bržu potvrdu) je razmatrana i
+odbačena: granica između "minimalno potrebnih" i "viška" dana bi zavisila
+od toga koliko dana walk-forward/warmup logika backtest enginea stvarno
+dotakne za taj uzorak, što nije čisto odvojivo od samog broja nezavisnih
+proba (`n_independent`) bez rizika da se neki dan tretira kao nikad
+"pogledan" iako ga je neki raniji poziv već djelimično koristio za
+warmup/kontekst. Trošenje cijelog prozora je konzervativnije i garantuje
+"nijedan bajt podataka nikad dva puta" bez te dvosmislenosti, po cijenu
+rjeđih potvrda nego što bi teoretski bilo moguće. Ovo je svjestan
+trade-off (jednostavnost i sigurnost ispred brzine), ne nedovršen dio.
+
 ### Power-gated odluka (ne fiksni kalendar)
 
 Modul: `scanner/backtesting/power.py` — `required_sample_size(sigma_pct, ...)`
