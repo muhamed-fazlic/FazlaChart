@@ -81,6 +81,7 @@ from agents_crypto.best_signal import (
     BEST_SIGNAL_MIN_SAMPLE_SIZE,
     TRACKED_TIMEFRAMES,
 )
+from scanner.backtesting.funding_simulator import FundingEvent, fetch_funding_history
 from scanner.backtesting.historical_universe import (
     UniverseWindow,
     is_symbol_in_universe_at,
@@ -92,6 +93,7 @@ from scanner.calibration import (
     LabeledCase,
     backtest_symbol,
     load_extended_history,
+    round_trip_cost_pct_for,
     wilson_score_interval,
 )
 from scanner.signal_tracking import TIMEFRAME_MINUTES
@@ -169,6 +171,22 @@ class PortfolioBacktestConfig:
     max_concurrent_per_direction: int = 3
     round_trip_cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT
     extra_slippage_pct: float = 0.0
+    # Phase 8 Korak 5 (execution realism): when True, round_trip_cost_pct is
+    # no longer applied flat to every symbol -- each symbol's own liquidity
+    # tier surcharge (see scanner.calibration.round_trip_cost_pct_for) is
+    # added on top instead. Majors (BTC/ETH/BNB) are unaffected (+0.0%); the
+    # existing test suite only ever uses majors with a base cost of 0.0, so
+    # this is on by default with zero risk of changing any existing
+    # numeric assertion.
+    use_symbol_cost_tiers: bool = True
+    # Phase 8 Korak 5 (execution realism): when True, fetch each symbol's
+    # real funding-rate settlement history once (cached across timeframes)
+    # and charge every directional case the funding it would actually have
+    # accrued between entry and exit. Off by default because it requires a
+    # network call per symbol -- existing callers/tests that monkeypatch
+    # backtest_symbol without a funding_events kwarg are unaffected unless
+    # they opt in.
+    include_funding_cost: bool = False
     # Phase 8 Korak 4 (survivorship-bias fix): when set, any candidate event
     # whose symbol was NOT in the point-in-time top-N universe at its own
     # entry_time is dropped before the portfolio simulation runs -- i.e. a
@@ -203,10 +221,14 @@ def _parse_time(iso_timestamp: str) -> datetime:
 def _net_return_pct(case: LabeledCase, cost_pct: float, extra_slippage_pct: float) -> float:
     """Direction-corrected, cost-adjusted net return for one case — mirrors
     ``scanner.calibration.summarize``'s correction, which is NOT baked into
-    ``LabeledCase.forward_return_pct`` itself."""
+    ``LabeledCase.forward_return_pct`` itself.
+
+    Also subtracts ``case.funding_cost_pct`` (Phase 8 Korak 5) -- 0.0 for
+    every case unless ``backtest_symbol`` was given real ``funding_events``,
+    so this is a no-op for existing callers/tests that never populate it."""
     direction = LABEL_DIRECTION[case.label]
     signed = case.forward_return_pct if direction == "long" else -case.forward_return_pct
-    return signed - cost_pct - extra_slippage_pct
+    return signed - cost_pct - extra_slippage_pct - case.funding_cost_pct
 
 
 def _build_candidate_events(
@@ -534,6 +556,8 @@ def build_dashboard_report(
             "max_concurrent_per_direction": config.max_concurrent_per_direction,
             "round_trip_cost_pct": config.round_trip_cost_pct,
             "extra_slippage_pct": config.extra_slippage_pct,
+            "use_symbol_cost_tiers": config.use_symbol_cost_tiers,
+            "include_funding_cost": config.include_funding_cost,
         },
         "metrics": result.metrics,
         "skipped_symbols": result.skipped_symbols,
@@ -566,6 +590,14 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
     skipped: list[str] = []
 
     for symbol in config.symbols:
+        funding_events: list[FundingEvent] | None = None
+        if config.include_funding_cost:
+            funding_events = fetch_funding_history(symbol)
+        cost_pct = (
+            round_trip_cost_pct_for(symbol, config.round_trip_cost_pct)
+            if config.use_symbol_cost_tiers
+            else config.round_trip_cost_pct
+        )
         for timeframe in config.timeframes:
             try:
                 if config.warmup_candles > 0:
@@ -575,12 +607,16 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
                     # _build_candidate_events, but never emits a CandidateEvent).
                     boundary_idx = max(0, len(history) - config.kline_limit)
                     decision_start_time = history["open_time"].iloc[boundary_idx] if boundary_idx < len(history) else None
-                    cases = backtest_symbol(symbol, timeframe, horizons=(config.horizon_candles,), history=history)
+                    kwargs: dict[str, Any] = {"history": history}
+                    if config.include_funding_cost:
+                        kwargs["funding_events"] = funding_events
+                    cases = backtest_symbol(symbol, timeframe, horizons=(config.horizon_candles,), **kwargs)
                 else:
                     decision_start_time = None
-                    cases = backtest_symbol(
-                        symbol, timeframe, horizons=(config.horizon_candles,), limit=config.kline_limit
-                    )
+                    kwargs = {"limit": config.kline_limit}
+                    if config.include_funding_cost:
+                        kwargs["funding_events"] = funding_events
+                    cases = backtest_symbol(symbol, timeframe, horizons=(config.horizon_candles,), **kwargs)
             except VendorError:
                 skipped.append(f"{symbol}:{timeframe}")
                 continue
@@ -591,7 +627,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
                     timeframe,
                     cases,
                     min_n,
-                    config.round_trip_cost_pct,
+                    cost_pct,
                     config.extra_slippage_pct,
                     config.horizon_candles,
                     decision_start_time,
@@ -708,6 +744,28 @@ def _main() -> None:
     )
     parser.add_argument("--extra-slippage-pct", type=float, default=0.0)
     parser.add_argument(
+        "--no-symbol-cost-tiers",
+        action="store_true",
+        help="Phase 8 Korak 5: disable per-symbol liquidity cost tiers (see "
+        "scanner.calibration.round_trip_cost_pct_for) and use --round-trip-cost-pct flat for every symbol, "
+        "reproducing pre-Korak-5 behaviour.",
+    )
+    parser.add_argument(
+        "--round-trip-cost-pct",
+        type=float,
+        default=DEFAULT_ROUND_TRIP_COST_PCT,
+        help="Base round-trip cost (fees + assumed spread) in percentage points, applied flat unless "
+        "per-symbol cost tiers are enabled (default), in which case it is this run's Tier-1 (majors) cost "
+        "and other tiers add a surcharge on top.",
+    )
+    parser.add_argument(
+        "--include-funding-cost",
+        action="store_true",
+        help="Phase 8 Korak 5: fetch each symbol's real Binance funding-rate settlement history and charge "
+        "every trade the funding it would actually have accrued between entry and exit. Off by default "
+        "because it requires one network call per symbol.",
+    )
+    parser.add_argument(
         "--point-in-time-universe-cache",
         help="Phase 8 Korak 4: path to a cache produced by "
         "'python -m scanner.backtesting.historical_universe'. When given, any trade whose symbol was not in "
@@ -747,7 +805,10 @@ def _main() -> None:
         max_concurrent_per_direction=args.max_concurrent_per_direction,
         kline_limit=args.kline_limit,
         warmup_candles=args.warmup_candles,
+        round_trip_cost_pct=args.round_trip_cost_pct,
         extra_slippage_pct=args.extra_slippage_pct,
+        use_symbol_cost_tiers=not args.no_symbol_cost_tiers,
+        include_funding_cost=args.include_funding_cost,
         point_in_time_windows=point_in_time_windows,
         point_in_time_universe_cache_path=args.point_in_time_universe_cache,
     )
@@ -806,6 +867,8 @@ def _main() -> None:
                     "round_trip_cost_pct": config.round_trip_cost_pct,
                     "extra_slippage_pct": config.extra_slippage_pct,
                     "warmup_candles": config.warmup_candles,
+                    "use_symbol_cost_tiers": config.use_symbol_cost_tiers,
+                    "include_funding_cost": config.include_funding_cost,
                 },
                 n_trades=result.metrics.get("n_trades"),
                 sharpe_ratio=result.metrics.get("sharpe_ratio"),

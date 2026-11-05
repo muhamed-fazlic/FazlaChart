@@ -23,6 +23,7 @@ from typing import Any
 import pandas as pd
 
 from agents_crypto.risk_calc import DEFAULT_SL_ATR_MULTIPLIER, DEFAULT_TP_ATR_MULTIPLIER
+from scanner.backtesting.funding_simulator import FundingEvent, funding_cost_pct
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance import client
 from tradingagents.dataflows.vendors.binance.anomaly import detect_anomalies
@@ -38,6 +39,37 @@ from tradingagents.dataflows.vendors.binance.indicators import (
 # ~2x Binance USDT-M futures taker fee (0.04% each way) plus a slippage margin.
 # A "win" must clear this, not just point the right direction.
 DEFAULT_ROUND_TRIP_COST_PCT = 0.10
+
+# Phase 8 Korak 5: a static liquidity-tier surcharge added on top of the base
+# exchange taker fee above, applied per symbol (not per timeframe — the fee
+# itself doesn't change with timeframe; a flat cost just happens to consume
+# a *larger share* of the smaller average edge a short-timeframe trade has,
+# which this surcharge doesn't need to encode separately).
+#
+# This is a documented judgment call, not measured from real order-book/fill
+# data: majors (BTC, ETH, BNB) have the tightest effective spreads on Binance
+# USDT-M futures; large-cap alts are usually still liquid but noticeably
+# wider; everything else gets the largest surcharge. Revisit with real fill
+# data before trusting this for anything beyond a directional sanity check.
+TIER1_MAJORS = frozenset({"BTCUSDT", "ETHUSDT", "BNBUSDT"})
+TIER2_LARGE_CAP = frozenset(
+    {"SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "TRXUSDT", "SUIUSDT"}
+)
+TIER1_EXTRA_COST_PCT = 0.0
+TIER2_EXTRA_COST_PCT = 0.02
+TIER3_EXTRA_COST_PCT = 0.05  # everything else: smaller-cap/less liquid alts
+
+
+def round_trip_cost_pct_for(symbol: str, base_cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT) -> float:
+    """``base_cost_pct`` (the flat exchange-fee estimate) plus a per-symbol
+    liquidity-tier surcharge — see the tier comment above for the caveat
+    that this is a judgment call, not a measurement."""
+    if symbol in TIER1_MAJORS:
+        return base_cost_pct + TIER1_EXTRA_COST_PCT
+    if symbol in TIER2_LARGE_CAP:
+        return base_cost_pct + TIER2_EXTRA_COST_PCT
+    return base_cost_pct + TIER3_EXTRA_COST_PCT
+
 
 # Explicit, pre-committed direction for every label the scanner can emit — the
 # project brief's core rule: never let a label's "success" be invented after
@@ -87,6 +119,13 @@ class LabeledCase:
     # outcome into a risk-normalized "R-multiple" without needing to
     # re-derive ATR itself.
     sl_distance_pct: float | None = None
+    # Phase 8 Korak 5: funding cost actually accrued while this trade was
+    # open, already sign-adjusted for direction (see
+    # scanner.backtesting.funding_simulator.funding_cost_pct) — meant to be
+    # subtracted directly from forward_return_pct's direction-corrected
+    # value, same as cost_pct. 0.0 when no funding_events were supplied to
+    # backtest_symbol (the default — no network call forced on every caller).
+    funding_cost_pct: float = 0.0
 
 
 @dataclass
@@ -292,7 +331,13 @@ def _forward_return_pct(df: pd.DataFrame, i: int, horizon: int) -> float | None:
 
 
 def _walk_forward_exit(
-    df: pd.DataFrame, i: int, direction: str, entry_close: float, atr: float, max_horizon: int
+    df: pd.DataFrame,
+    i: int,
+    direction: str,
+    entry_close: float,
+    atr: float,
+    max_horizon: int,
+    tie_break: str = "conservative",
 ) -> tuple[int | None, float | None, str | None]:
     """Simulate the same SL/TP a live user would actually be shown (same ATR
     multipliers as :func:`agents_crypto.risk_calc.compute_risk_levels`) and
@@ -302,10 +347,27 @@ def _walk_forward_exit(
     is ``None`` and ``exit_reason`` is ``"timeout"`` when neither level is
     touched within ``max_horizon`` candles (the trade is still open at the
     point every caller-requested horizon must eventually resolve against the
-    close price instead). If both the stop and the target fall within the
-    same candle's high/low range, the stop is assumed to hit first — the
-    conservative assumption, since intra-candle order can't be known from
-    OHLC data alone.
+    close price instead).
+
+    ``tie_break`` decides what happens when a single candle's high/low range
+    contains *both* the stop and the target — intra-candle order genuinely
+    can't be known from OHLC data alone, so this is an explicit, documented
+    assumption rather than a silent default:
+
+    - ``"conservative"`` (default, unchanged from the original behaviour):
+      the stop is assumed to hit first. Never makes a backtest's win rate
+      look better than reality would allow.
+    - ``"optimistic"``: the target is assumed to hit first. Useful as the
+      opposite bound, to see how much a label's apparent edge depends on
+      this single assumption — if "conservative" and "optimistic" give very
+      different win rates, that label's edge is mostly an artifact of candle
+      resolution, not a real signal.
+
+    A true higher-resolution check (replaying the lower-timeframe candles
+    inside the ambiguous bar to see which level was actually touched first)
+    is not implemented here — it would need a second, much larger set of
+    kline fetches (one per ambiguous candle) and is left as documented
+    future work, not silently assumed to be unnecessary.
     """
     if pd.isna(atr) or atr <= 0:
         return None, None, None
@@ -328,6 +390,10 @@ def _walk_forward_exit(
             sl_touched, tp_touched = low <= stop_loss, high >= take_profit
         else:
             sl_touched, tp_touched = high >= stop_loss, low <= take_profit
+        if sl_touched and tp_touched:
+            if tie_break == "optimistic":
+                return h, take_profit, "take_profit"
+            return h, stop_loss, "stop_loss"
         if sl_touched:
             return h, stop_loss, "stop_loss"
         if tp_touched:
@@ -354,6 +420,8 @@ def backtest_symbol(
     min_history: int = 60,
     limit: int = 1500,
     history: pd.DataFrame | None = None,
+    funding_events: list[FundingEvent] | None = None,
+    sl_tp_tie_break: str = "conservative",
 ) -> list[LabeledCase]:
     """Walk every candle in ``symbol``'s history, label it the way the live
     scanner would (trend + anomalies, point-in-time), and record the outcome
@@ -365,6 +433,18 @@ def backtest_symbol(
     needing to know anything about pagination. Must already have indicators
     applied (i.e. be the output of ``add_indicators``), same as
     ``_load_history``'s return value.
+
+    ``sl_tp_tie_break`` is forwarded to :func:`_walk_forward_exit` -- see its
+    docstring for what "conservative" (default) vs "optimistic" means when a
+    single candle touches both the stop and the target.
+
+    ``funding_events``, if given (see
+    :func:`scanner.backtesting.funding_simulator.fetch_funding_history`), is
+    used to charge each directional case the funding it would actually have
+    accrued between its entry and exit (see
+    :data:`LabeledCase.funding_cost_pct`). ``None`` (the default) keeps the
+    old behaviour of ignoring funding entirely -- no network call is forced
+    on callers that don't ask for it.
 
     For directional labels ("long"/"short"), the outcome is **path-dependent**:
     it reconstructs the same ATR-based SL/TP a live user would actually be
@@ -405,7 +485,7 @@ def backtest_symbol(
             needed = any(LABEL_DIRECTION.get(label) == direction for label in labels)
             if needed:
                 exit_by_direction[direction] = _walk_forward_exit(
-                    df, i, direction, entry_close, entry_atr, max_horizon
+                    df, i, direction, entry_close, entry_atr, max_horizon, sl_tp_tie_break
                 )
 
         for label in labels:
@@ -442,6 +522,12 @@ def backtest_symbol(
                     if forward_return is None:
                         continue
                     horizon_exit_reason = "timeout"
+                trade_funding_cost_pct = 0.0
+                if funding_events:
+                    exit_idx = i + (hit_candle if hit_candle is not None and hit_candle <= horizon else horizon)
+                    entry_dt = df["open_time"].iloc[i].to_pydatetime()
+                    exit_dt = df["open_time"].iloc[exit_idx].to_pydatetime()
+                    trade_funding_cost_pct = funding_cost_pct(direction, entry_dt, exit_dt, funding_events)
                 cases.append(
                     LabeledCase(
                         symbol,
@@ -454,6 +540,7 @@ def backtest_symbol(
                         regime,
                         horizon_exit_reason,
                         sl_distance_pct,
+                        trade_funding_cost_pct,
                     )
                 )
     return cases
@@ -489,9 +576,9 @@ def summarize(
     for (label, horizon), group in df.groupby(["label", "horizon_candles"]):
         direction = LABEL_DIRECTION.get(label)
         if direction == "short":
-            net_return = -group["forward_return_pct"] - cost_pct
+            net_return = -group["forward_return_pct"] - cost_pct - group["funding_cost_pct"]
         elif direction == "long":
-            net_return = group["forward_return_pct"] - cost_pct
+            net_return = group["forward_return_pct"] - cost_pct - group["funding_cost_pct"]
         else:
             net_return = None  # undirected: report magnitude only, no win rate
 

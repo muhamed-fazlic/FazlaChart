@@ -372,3 +372,141 @@ class TestLoadExtendedHistory:
         assert "close_20_ema" in df.columns
         assert df["close_20_ema"].notna().sum() > 0
 
+
+class TestRoundTripCostPctFor:
+    """Phase 8 Korak 5: per-symbol liquidity-tier cost surcharge."""
+
+    def test_tier1_major_gets_no_surcharge(self):
+        from scanner.calibration import round_trip_cost_pct_for
+
+        assert round_trip_cost_pct_for("BTCUSDT", base_cost_pct=0.1) == pytest.approx(0.1)
+        assert round_trip_cost_pct_for("ETHUSDT", base_cost_pct=0.1) == pytest.approx(0.1)
+        assert round_trip_cost_pct_for("BNBUSDT", base_cost_pct=0.1) == pytest.approx(0.1)
+
+    def test_tier2_large_cap_gets_small_surcharge(self):
+        from scanner.calibration import round_trip_cost_pct_for
+
+        assert round_trip_cost_pct_for("SOLUSDT", base_cost_pct=0.1) == pytest.approx(0.12)
+        assert round_trip_cost_pct_for("XRPUSDT", base_cost_pct=0.1) == pytest.approx(0.12)
+
+    def test_tier3_everything_else_gets_largest_surcharge(self):
+        from scanner.calibration import round_trip_cost_pct_for
+
+        assert round_trip_cost_pct_for("SOMERANDOMCOINUSDT", base_cost_pct=0.1) == pytest.approx(0.15)
+
+    def test_default_base_cost_is_the_module_default(self):
+        from scanner.calibration import DEFAULT_ROUND_TRIP_COST_PCT, round_trip_cost_pct_for
+
+        assert round_trip_cost_pct_for("BTCUSDT") == pytest.approx(DEFAULT_ROUND_TRIP_COST_PCT)
+
+
+class TestWalkForwardExitTieBreak:
+    """Phase 8 Korak 5: the default ("conservative") tie-break is unchanged
+    from before; "optimistic" is a new, explicitly opt-in alternative."""
+
+    def test_optimistic_tie_break_assumes_target_hit_first(self):
+        df = _ohlc_df([(96.0, 106.0)])  # spans both SL (97) and TP (105)
+        hit_candle, exit_price, reason = _walk_forward_exit(
+            df, 0, "long", 100.0, 2.0, max_horizon=5, tie_break="optimistic"
+        )
+        assert reason == "take_profit"
+        assert exit_price == pytest.approx(105.0)
+
+    def test_conservative_is_still_the_default(self):
+        df = _ohlc_df([(96.0, 106.0)])
+        hit_candle, exit_price, reason = _walk_forward_exit(df, 0, "long", 100.0, 2.0, max_horizon=5)
+        assert reason == "stop_loss"
+        assert exit_price == pytest.approx(97.0)
+
+
+def _trend_kline(open_time_ms: int, base: float) -> dict:
+    """A steadily-climbing OHLCV candle with enough intra-candle range to
+    yield a non-zero ATR, for feeding a real `backtest_symbol` walk-forward
+    (as opposed to `_kline`'s flat candles used elsewhere in this file,
+    which would never trigger either SL or TP)."""
+    return {
+        "open_time": open_time_ms,
+        "open": str(base - 0.2),
+        "high": str(base + 0.5),
+        "low": str(base - 0.5),
+        "close": str(base),
+        "volume": "100.0",
+        "close_time": open_time_ms + 3_599_999,
+        "quote_volume": "10000.0",
+        "trades": 10,
+        "taker_buy_base_volume": "50.0",
+        "taker_buy_quote_volume": "5000.0",
+        "ignore": "0",
+    }
+
+
+class TestBacktestSymbolFundingCost:
+    """Phase 8 Korak 5: `backtest_symbol`'s optional `funding_events` wiring.
+    Uses a real (synthetic) OHLCV series run through the actual indicator /
+    trend-classification pipeline, rather than mocking those internals, so
+    the test fails if the funding wiring ever stops lining up with the real
+    entry/exit timestamps `_walk_forward_exit` resolves."""
+
+    _HOUR_MS = 3_600_000
+    _N_CANDLES = 90
+
+    def _history(self) -> pd.DataFrame:
+        from tradingagents.dataflows.vendors.binance.indicators import (
+            add_indicators,
+            klines_to_dataframe,
+        )
+
+        klines = [
+            _trend_kline(i * self._HOUR_MS, base=100.0 + i * 0.5) for i in range(self._N_CANDLES)
+        ]
+        return add_indicators(klines_to_dataframe(klines))
+
+    def test_funding_events_none_means_zero_cost_on_every_case(self):
+        from scanner.calibration import backtest_symbol
+
+        df = self._history()
+        cases = backtest_symbol("TESTUSDT", "1h", horizons=(4,), history=df, min_history=60)
+        assert cases, "expected at least one case from a steady 90-candle uptrend"
+        assert all(c.funding_cost_pct == 0.0 for c in cases)
+
+    def test_funding_events_given_charges_directional_cases(self):
+        from scanner.backtesting.funding_simulator import FundingEvent
+        from scanner.calibration import backtest_symbol
+
+        df = self._history()
+        # A settlement exactly on every candle boundary in the series --
+        # every multi-candle-horizon long case must therefore pick up at
+        # least one (positive-rate) settlement and so pay a nonzero cost.
+        funding_events = [
+            FundingEvent(timestamp=df["open_time"].iloc[i].to_pydatetime(), rate=0.0001)
+            for i in range(len(df))
+        ]
+        cases = backtest_symbol(
+            "TESTUSDT", "1h", horizons=(4,), history=df, min_history=60, funding_events=funding_events
+        )
+        long_cases = [c for c in cases if c.label == "trend:bullish"]
+        assert long_cases, "expected the steady uptrend to be classified bullish at least once"
+        assert all(c.funding_cost_pct > 0.0 for c in long_cases)
+
+    def test_sl_tp_tie_break_is_forwarded_from_backtest_symbol(self, monkeypatch):
+        """`backtest_symbol`'s `sl_tp_tie_break` kwarg must actually reach
+        `_walk_forward_exit` -- assert via the call args it's invoked with,
+        rather than re-deriving an end-to-end price scenario."""
+        import scanner.calibration as calibration_module
+
+        df = self._history()
+        seen_tie_breaks: list[str] = []
+        real_walk_forward_exit = calibration_module._walk_forward_exit
+
+        def spy(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break="conservative"):
+            seen_tie_breaks.append(tie_break)
+            return real_walk_forward_exit(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break)
+
+        monkeypatch.setattr(calibration_module, "_walk_forward_exit", spy)
+        calibration_module.backtest_symbol(
+            "TESTUSDT", "1h", horizons=(4,), history=df, min_history=60, sl_tp_tie_break="optimistic"
+        )
+        assert seen_tie_breaks, "expected _walk_forward_exit to have been called at least once"
+        assert all(tb == "optimistic" for tb in seen_tie_breaks)
+
+

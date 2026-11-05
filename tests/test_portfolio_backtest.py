@@ -351,7 +351,104 @@ class TestPointInTimeUniverseFilter:
         assert result.point_in_time_filtered_count > 0
 
 
-class TestMetrics:
+class TestCostTierAndFundingWiring:
+    """Phase 8 Korak 5: per-symbol liquidity cost tiers and (opt-in) funding
+    cost, both wired into `run_portfolio_backtest`'s main loop."""
+
+    def _config(self, **overrides) -> PortfolioBacktestConfig:
+        base = {
+            "symbols": ("BTCUSDT",),
+            "timeframes": ("1h",),
+            "initial_capital": 10_000.0,
+            "risk_per_trade_pct": 1.0,
+            "max_concurrent_positions": 5,
+            "max_concurrent_per_direction": 5,
+            "round_trip_cost_pct": 0.0,
+            "extra_slippage_pct": 0.0,
+            "warmup_candles": 0,
+            "horizon_candles": 1,
+        }
+        base.update(overrides)
+        return PortfolioBacktestConfig(**base)
+
+    def test_tier1_symbol_pays_no_surcharge_by_default(self, monkeypatch):
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0, symbol="BTCUSDT") for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        result = run_portfolio_backtest(self._config(symbols=("BTCUSDT",)))
+        assert result.trades
+        assert all(t.net_return_pct == pytest.approx(5.0) for t in result.trades)
+
+    def test_tier3_symbol_pays_surcharge_by_default(self, monkeypatch):
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0, symbol="SOMEALTUSDT") for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        result = run_portfolio_backtest(self._config(symbols=("SOMEALTUSDT",)))
+        assert result.trades
+        # Tier-3 surcharge is 0.05 pp on top of the 0.0 base configured here.
+        assert all(t.net_return_pct == pytest.approx(5.0 - 0.05) for t in result.trades)
+
+    def test_use_symbol_cost_tiers_false_reverts_to_flat_cost(self, monkeypatch):
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0, symbol="SOMEALTUSDT") for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        result = run_portfolio_backtest(
+            self._config(symbols=("SOMEALTUSDT",), use_symbol_cost_tiers=False)
+        )
+        assert result.trades
+        assert all(t.net_return_pct == pytest.approx(5.0) for t in result.trades)
+
+    def test_include_funding_cost_false_never_calls_fetch_or_passes_kwarg(self, monkeypatch):
+        """Default (off) behaviour must stay compatible with old-style
+        monkeypatched `backtest_symbol` lambdas that don't accept a
+        `funding_events` kwarg at all -- this would raise a TypeError if
+        the wiring always passed it unconditionally."""
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        fetch_called = []
+        monkeypatch.setattr(
+            module, "fetch_funding_history", lambda symbol, limit=1000: fetch_called.append(symbol) or []
+        )
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        result = run_portfolio_backtest(self._config())
+
+        assert result.trades
+        assert fetch_called == []
+
+    def test_include_funding_cost_true_fetches_once_per_symbol_and_forwards_it(self, monkeypatch):
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+        from scanner.backtesting.funding_simulator import FundingEvent
+
+        fetch_calls = []
+        sentinel_events = [FundingEvent(timestamp=_T0, rate=0.0001)]
+
+        def fake_fetch(symbol, limit=1000):
+            fetch_calls.append(symbol)
+            return sentinel_events
+
+        received_funding_events = []
+
+        def fake_backtest_symbol(symbol, timeframe, horizons, limit, funding_events=None):
+            received_funding_events.append(funding_events)
+            return warm_up
+
+        monkeypatch.setattr(module, "fetch_funding_history", fake_fetch)
+        monkeypatch.setattr(module, "backtest_symbol", fake_backtest_symbol)
+        config = self._config(timeframes=("1h", "4h"), include_funding_cost=True)
+        run_portfolio_backtest(config)
+
+        # One fetch per symbol, cached/reused across every timeframe -- not
+        # one fetch per (symbol, timeframe) pair.
+        assert fetch_calls == ["BTCUSDT"]
+        assert received_funding_events == [sentinel_events, sentinel_events]
+
+
+
     def test_known_trades_produce_expected_net_profit_and_win_rate(self):
         from scanner.backtesting.portfolio_backtest import Trade
 
