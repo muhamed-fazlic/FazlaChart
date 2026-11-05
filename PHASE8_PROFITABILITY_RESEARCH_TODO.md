@@ -840,6 +840,36 @@ tuninga/izmjene parametara u odnosu na konfiguraciju iznad.
   taj test bi bio buduci jednokratni pogled na zakljucane posljednje
   sedmice, uz unaprijed definisan kriterij: neto expectancy po trejdu > 0 I
   donja granica block-bootstrap CI za prosjecan povrat po trejdu > 0.
+
+### Rezultat frozen baseline runa i FINALNO zatvaranje (5.11.2026., commit `4366cb0` + ovaj zapis)
+
+Frozen baseline run (train period, do `2026-09-24T12:43:40Z`, `dataset_hash:
+f364c250520d5027`, identican kod/troskovi/dedup kao svi puni-period runovi —
+provjereno `git diff` + poredjenjem `sl_tp_config_json` iz registra, id 14 vs
+id 16) dao je za inverted varijantu:
+
+- n = 187 trejdova (103 nezavisna dogadjaja), `net_profit_pct = +3.66%`,
+  `win_rate_pct = 61.5%`.
+- **Ali block-bootstrap CI za prosjecan povrat po trejdu: `observed_pct =
+  -0.0624%`, 95% CI `[-0.7293%, +0.3423%]`, `edge_survives_lower_bound:
+  false`.** Sirovi (block-bootstrap) prosjek po trejdu je zapravo blago
+  NEGATIVAN — u suprotnosti sa equity-curve mjerom
+  (`expectancy_pct_of_equity = +0.021%`), sto samo po sebi pokazuje da je
+  +3.66% unutar suma i da se dvije razlicite mjere istog "expectancy-ja"
+  cak ni ne slazu po predznaku kad je efekat ovako mali.
+- **Vec zapisani kriterij (CI donja granica > 0) NE PROLAZI ni na ovom,
+  povoljnijem (train) periodu** — sto znaci da je odluka vec donesena i BEZ
+  potrebe da se otvori zakljucani holdout (koji bi, uz puni-period rezultat
+  od -21% do -22%, ionako pokazao jos gori rezultat za zadnjih 6 sedmica).
+
+**FINALNA ODLUKA:** Porodica trend/anomaly signala (original i inverted
+varijanta, 5m-4h timeframe-ovi) se **zatvara kao "nema dokazane edge nakon
+troskova"**. Zakljucani holdout (zadnjih 6 sedmica, `end_timestamp_ms >
+1790253820000`) **ostaje NEDIRNUT** i rezervisan za sljedecu, buducu
+pre-registrovanu hipotezu (ne za ovu, koja je vec zatvorena bez potrebe da
+ga koristi). Sljedeci korak: pre-registracija za funding/OI porodicu
+hipoteza (vidi sljedeci Korak).
+
      u `tests/test_statistical_validation.py` + 4 wiring testa u
      `tests/test_portfolio_backtest.py`. Pure re-computation na vec
      izracunatim trejdovima (bez mrezhnih poziva), pa je ukey po
