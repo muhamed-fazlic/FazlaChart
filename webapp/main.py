@@ -429,6 +429,132 @@ def _refresh_in_progress(status: dict[str, Any]) -> bool:
     return status.get("state") == "running" and isinstance(status.get("pid"), int) and _pid_is_running(status["pid"])
 
 
+# --- Generic "what's running right now" introspection ----------------------
+#
+# Covers ANY research/backtest subprocess on this host -- not just the ones
+# launched through /api/backtest/refresh -- including ad-hoc scripts someone
+# runs by hand over SSH (e.g. an exploratory multi-family scan). New ad-hoc
+# scripts never need to be individually wired in here: anything whose
+# command line contains one of _BACKGROUND_JOB_CMD_MARKERS is picked up
+# automatically. Reads /proc directly (Linux-only, matches the VPS
+# deployment target) instead of adding a psutil dependency; degrades to an
+# empty list everywhere else (local Windows dev) rather than erroring.
+
+_BACKGROUND_JOB_CMD_MARKERS = ("scanner.backtesting", "scanner.mining", "strategy_lab")
+
+
+def _scanner_data_dir() -> Path:
+    return Path(os.environ.get("SCANNER_DATA_DIR", "scanner_data"))
+
+
+def _system_boot_time() -> float | None:
+    try:
+        with open("/proc/stat", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except OSError:
+        return None
+    return None
+
+
+def _summarize_job_cmdline(cmdline: list[str]) -> dict[str, str | None]:
+    """Pulls out the handful of flags that matter for "what is this and
+    which report will it eventually write", generically -- works for any
+    script built on the shared ``argparse`` conventions used across
+    ``scanner.backtesting.*`` and ``scanner.mining.*``, not just Korak 10's
+    one-off scripts."""
+    module = None
+    for i, token in enumerate(cmdline):
+        if token == "-m" and i + 1 < len(cmdline):
+            module = cmdline[i + 1]
+            break
+    wanted_flags = ("--experiment-family", "--report-json", "--strategy-variant")
+    flags: dict[str, str | None] = dict.fromkeys(wanted_flags)
+    for i, token in enumerate(cmdline):
+        if token in wanted_flags and i + 1 < len(cmdline):
+            flags[token] = cmdline[i + 1]
+    return {"module": module, **{k.lstrip("-").replace("-", "_"): v for k, v in flags.items()}}
+
+
+def _list_background_jobs() -> list[dict[str, Any]]:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    boot_time = _system_boot_time()
+    clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    now = datetime.now(UTC).timestamp()
+    jobs: list[dict[str, Any]] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline_raw = (entry / "cmdline").read_bytes()
+            cmdline = [part for part in cmdline_raw.decode("utf-8", errors="replace").split("\x00") if part]
+            joined = " ".join(cmdline)
+            if not any(marker in joined for marker in _BACKGROUND_JOB_CMD_MARKERS):
+                continue
+            stat_fields = (entry / "stat").read_text(encoding="utf-8").split()
+            utime, stime, starttime_ticks = int(stat_fields[13]), int(stat_fields[14]), int(stat_fields[21])
+            elapsed_seconds = None
+            if boot_time is not None:
+                started_at = boot_time + (starttime_ticks / clk_tck)
+                elapsed_seconds = round(max(0.0, now - started_at), 1)
+            cpu_seconds = round((utime + stime) / clk_tck, 1)
+            avg_cpu_pct = round(100.0 * cpu_seconds / elapsed_seconds, 1) if elapsed_seconds else None
+            jobs.append(
+                {
+                    "pid": int(entry.name),
+                    "elapsed_seconds": elapsed_seconds,
+                    "cpu_seconds_used": cpu_seconds,
+                    "avg_cpu_pct_since_start": avg_cpu_pct,
+                    **_summarize_job_cmdline(cmdline),
+                }
+            )
+        except (OSError, ValueError, IndexError):
+            # Process exited between listdir() and read(), or /proc layout
+            # surprised us -- either way, just skip it rather than failing
+            # the whole endpoint.
+            continue
+    jobs.sort(key=lambda j: -(j["elapsed_seconds"] or 0))
+    return jobs
+
+
+def _tail_lines(path: Path, max_lines: int) -> list[str]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        return [line.rstrip("\n") for line in lines[-max_lines:]]
+    except OSError:
+        return []
+
+
+def _list_recent_logs(max_age_seconds: float, tail_lines: int) -> list[dict[str, Any]]:
+    data_dir = _scanner_data_dir()
+    if not data_dir.is_dir():
+        return []
+    now = datetime.now(UTC).timestamp()
+    logs: list[dict[str, Any]] = []
+    for path in sorted(data_dir.glob("*.log")):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        age = now - mtime
+        if age > max_age_seconds:
+            continue
+        logs.append(
+            {
+                "path": str(path),
+                "modified_at": datetime.fromtimestamp(mtime, tz=UTC).isoformat(),
+                "age_seconds": round(age, 1),
+                "tail": _tail_lines(path, tail_lines),
+            }
+        )
+    logs.sort(key=lambda entry: entry["age_seconds"])
+    return logs
+
+
 def _get_conn() -> sqlite3.Connection:
     # A short-lived connection per request is simplest and safe for SQLite's
     # single-writer/many-reader model; the scanner process holds its own
@@ -1040,6 +1166,23 @@ def backtest_refresh_status(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]
         status["finished_at"] = datetime.now(UTC).isoformat()
         _write_refresh_status(status, variant)
     return status
+
+
+@app.get("/api/system/jobs")
+def system_jobs() -> dict[str, Any]:
+    """Generic, read-only "what is actually running on this server right
+    now" view — covers both jobs launched through this webapp
+    (``/api/backtest/refresh``) AND any ad-hoc research/backtest script
+    someone runs by hand over SSH (e.g. an exploratory multi-family scan),
+    without needing to be individually wired in per-script. Lets a human
+    confirm from the dashboard alone (no SSH needed) that a long-running
+    background process is alive, how long it's been running, and its
+    recent log output — rather than having to take that on faith."""
+    return {
+        "jobs": _list_background_jobs(),
+        "recent_logs": _list_recent_logs(max_age_seconds=6 * 3600, tail_lines=12),
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
 
 
 @app.get("/api/forward-tracking/summary")

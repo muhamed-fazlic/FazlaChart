@@ -658,6 +658,70 @@ async function saveBacktestCpuLimit(pct) {
   }
 }
 
+// --- Generic "what's running right now on the server" panel ---------------
+// Polls GET /api/system/jobs, which scans /proc on the server directly --
+// shows ANY backtest/mining subprocess, including ones launched by hand
+// over SSH (e.g. an exploratory scan), not just the ones started via the
+// "🔄 Osvježi" button above. Lets you confirm a long-running job is really
+// alive (elapsed time, avg CPU since it started) and see its recent log
+// output without needing SSH access at all.
+let systemJobsPollTimer = null;
+
+function formatElapsed(seconds) {
+  if (seconds === null || seconds === undefined) return "?";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return h > 0 ? `${h}h ${m}m ${s}s` : `${m}m ${s}s`;
+}
+
+function renderSystemJobs(data) {
+  const el = document.getElementById("system-jobs-content");
+  if (!el) return;
+  const jobs = data.jobs || [];
+  const logs = data.recent_logs || [];
+  let html = "";
+  if (jobs.length === 0) {
+    html += `<p class="muted">Trenutno nijedan backtest/mining proces ne radi na serveru.</p>`;
+  } else {
+    html += `<table class="bucket-breakdown-table"><thead><tr><th>PID</th><th>Posao</th><th>Varijanta / grupa</th><th>Trajanje</th><th>Prosj. CPU</th></tr></thead><tbody>`;
+    for (const job of jobs) {
+      const label = job.module ? job.module.split(".").pop() : "?";
+      const extra = job.experiment_family || job.strategy_variant || "—";
+      html += `<tr><td>${job.pid}</td><td>${label}</td><td>${extra}</td><td>${formatElapsed(job.elapsed_seconds)}</td><td>${job.avg_cpu_pct_since_start ?? "?"}%</td></tr>`;
+    }
+    html += `</tbody></table>`;
+  }
+  if (logs.length > 0) {
+    html += `<p class="muted" style="margin-top:8px;">Zadnji log zapisi (posljednjih 6h):</p>`;
+    for (const log of logs) {
+      html += `<details style="margin-top:4px;"><summary>${log.path} (prije ${formatElapsed(log.age_seconds)})</summary><pre style="white-space:pre-wrap; font-size:0.8em; max-height:200px; overflow-y:auto;">${(log.tail || []).map(escapeHtml).join("\n")}</pre></details>`;
+    }
+  }
+  el.innerHTML = html;
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+async function loadSystemJobs() {
+  try {
+    const res = await fetch("/api/system/jobs");
+    renderSystemJobs(await res.json());
+  } catch (err) {
+    console.error("Could not load system jobs:", err);
+    const el = document.getElementById("system-jobs-content");
+    if (el) el.textContent = `Greška: ${err.message}`;
+  }
+}
+
+function startSystemJobsPolling() {
+  if (systemJobsPollTimer) return;
+  loadSystemJobs();
+  systemJobsPollTimer = setInterval(loadSystemJobs, 15000);
+}
+
 async function loadBacktestTab() {
   if (!backtestVariantsLoaded) {
     await loadBacktestVariantsDropdown();
@@ -665,6 +729,7 @@ async function loadBacktestTab() {
   if (!backtestCpuLimitLoaded) {
     await loadBacktestCpuLimit();
   }
+  startSystemJobsPolling();
   try {
     const res = await fetch(`/api/backtest/report?variant=${encodeURIComponent(currentBacktestVariant)}`);
     const report = await res.json();
