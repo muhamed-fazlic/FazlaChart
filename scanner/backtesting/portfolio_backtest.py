@@ -113,6 +113,13 @@ from scanner.validation.independence import (
     summarize_with_independence,
 )
 from scanner.validation.statistical_validation import deflated_sharpe_ratio
+from scanner.validation.walk_forward import (
+    WALK_FORWARD_MIN_FOLDS_EVALUATED,
+    WALK_FORWARD_MIN_TEST_N,
+    WALK_FORWARD_N_FOLDS,
+    WalkForwardResult,
+    validate_walk_forward,
+)
 from tradingagents.dataflows.errors import VendorError
 
 
@@ -232,6 +239,21 @@ class PortfolioBacktestConfig:
     # docstring for the full method and its deliberately bounded scope.
     include_independence_validation: bool = True
     independence_min_n: int = MIN_INDEPENDENT_EVENTS_N
+    # Phase 8 Korak 7 Test 2: walk-forward (multi-period) validation -- does
+    # a label's apparent edge hold up consistently across SEVERAL different
+    # chronological test windows, not just the single 70/30 split
+    # include_oos_validation above checks. Pure re-computation on cases
+    # already fetched for the backtest (no extra network calls), so safe to
+    # default to True, same as the other two validation passes above. See
+    # scanner.validation.walk_forward's module docstring for the full
+    # method, its "every evaluated fold must hold up" strictness choice, and
+    # its deliberately bounded scope (raw case counts per fold, not
+    # independence-corrected -- complementary to, not a replacement for,
+    # include_independence_validation above).
+    include_walk_forward_validation: bool = True
+    walk_forward_n_folds: int = WALK_FORWARD_N_FOLDS
+    walk_forward_min_test_n: int = WALK_FORWARD_MIN_TEST_N
+    walk_forward_min_folds_evaluated: int = WALK_FORWARD_MIN_FOLDS_EVALUATED
     # Phase 8 Korak 4 (survivorship-bias fix): when set, any candidate event
     # whose symbol was NOT in the point-in-time top-N universe at its own
     # entry_time is dropped before the portfolio simulation runs -- i.e. a
@@ -267,6 +289,12 @@ class PortfolioBacktestResult:
     # config.include_independence_validation is False or there were no
     # cases at all.
     independence_validation: list[IndependenceClusterStats] = field(default_factory=list)
+    # Phase 8 Korak 7 Test 2: walk-forward verdict, one entry per
+    # (label, horizon) seen across every symbol/timeframe in this run, same
+    # pooling convention as oos_validation/independence_validation above.
+    # Empty if config.include_walk_forward_validation is False or there
+    # were no cases at all (incl. too little history for even one fold).
+    walk_forward_validation: list[WalkForwardResult] = field(default_factory=list)
 
 
 def _parse_time(iso_timestamp: str) -> datetime:
@@ -622,6 +650,10 @@ def build_dashboard_report(
             "oos_min_test_n": config.oos_min_test_n,
             "include_independence_validation": config.include_independence_validation,
             "independence_min_n": config.independence_min_n,
+            "include_walk_forward_validation": config.include_walk_forward_validation,
+            "walk_forward_n_folds": config.walk_forward_n_folds,
+            "walk_forward_min_test_n": config.walk_forward_min_test_n,
+            "walk_forward_min_folds_evaluated": config.walk_forward_min_folds_evaluated,
             "point_in_time_universe_cache_path": config.point_in_time_universe_cache_path,
         },
         "metrics": result.metrics,
@@ -663,6 +695,31 @@ def build_dashboard_report(
                 "warning": r.warning,
             }
             for r in result.independence_validation
+        ],
+        "walk_forward_validation": [
+            {
+                "label": r.label,
+                "direction": r.direction,
+                "horizon_candles": r.horizon_candles,
+                "n_folds_total": r.n_folds_total,
+                "n_folds_evaluated": r.n_folds_evaluated,
+                "n_folds_holding_up": r.n_folds_holding_up,
+                "holds_up_walk_forward": r.holds_up_walk_forward,
+                "warning": r.warning,
+                "folds": [
+                    {
+                        "fold_index": f.fold_index,
+                        "train_n": f.train_n,
+                        "test_n": f.test_n,
+                        "test_win_rate_pct": f.test_win_rate_pct,
+                        "test_win_rate_ci_low_pct": f.test_win_rate_ci_low_pct,
+                        "evaluated": f.evaluated,
+                        "holds_up": f.holds_up,
+                    }
+                    for f in r.folds
+                ],
+            }
+            for r in result.walk_forward_validation
         ],
         "point_in_time_universe": (
             {
@@ -847,6 +904,21 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
             1 for r in independence_validation if r.holds_up_independent
         )
         metrics["labels_total_independent_check"] = len(independence_validation)
+
+    walk_forward_validation: list[WalkForwardResult] = []
+    if config.include_walk_forward_validation and all_cases:
+        walk_forward_validation = validate_walk_forward(
+            all_cases,
+            cost_pct=config.round_trip_cost_pct,
+            n_folds=config.walk_forward_n_folds,
+            min_test_n=config.walk_forward_min_test_n,
+            min_folds_evaluated=config.walk_forward_min_folds_evaluated,
+        )
+        # Same "rides along in metrics" pattern as the two blocks above.
+        metrics["walk_forward_labels_holding_up"] = sum(
+            1 for r in walk_forward_validation if r.holds_up_walk_forward
+        )
+        metrics["walk_forward_labels_total"] = len(walk_forward_validation)
     return PortfolioBacktestResult(
         trades=trades,
         equity_curve=equity_curve,
@@ -855,6 +927,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
         point_in_time_filtered_count=point_in_time_filtered_count,
         oos_validation=oos_validation,
         independence_validation=independence_validation,
+        walk_forward_validation=walk_forward_validation,
     )
 
 
@@ -943,6 +1016,34 @@ def _main() -> None:
         f"(default {MIN_INDEPENDENT_EVENTS_N}).",
     )
     parser.add_argument(
+        "--no-walk-forward-validation",
+        action="store_true",
+        help="Phase 8 Korak 7 Test 2: skip the walk-forward (multi-period) validation (scanner.validation."
+        "walk_forward) that checks whether a label's edge holds up across SEVERAL chronological test windows, "
+        "not just the single split --no-oos-validation controls. On by default -- it's pure re-computation on "
+        "cases already fetched, no extra network calls.",
+    )
+    parser.add_argument(
+        "--walk-forward-n-folds",
+        type=int,
+        default=WALK_FORWARD_N_FOLDS,
+        help=f"Number of expanding-window walk-forward folds to split history into (default {WALK_FORWARD_N_FOLDS}).",
+    )
+    parser.add_argument(
+        "--walk-forward-min-test-n",
+        type=int,
+        default=WALK_FORWARD_MIN_TEST_N,
+        help=f"Minimum held-out test cases required for a single fold to count toward the verdict (default "
+        f"{WALK_FORWARD_MIN_TEST_N}).",
+    )
+    parser.add_argument(
+        "--walk-forward-min-folds-evaluated",
+        type=int,
+        default=WALK_FORWARD_MIN_FOLDS_EVALUATED,
+        help="Minimum number of folds that must clear --walk-forward-min-test-n before a walk-forward verdict is "
+        f"given at all, rather than defaulting to no-verdict (default {WALK_FORWARD_MIN_FOLDS_EVALUATED}).",
+    )
+    parser.add_argument(
         "--point-in-time-universe-cache",
         help="Phase 8 Korak 4: path to a cache produced by "
         "'python -m scanner.backtesting.historical_universe'. When given, any trade whose symbol was not in "
@@ -992,6 +1093,10 @@ def _main() -> None:
         oos_min_test_n=args.oos_min_test_n,
         include_independence_validation=not args.no_independence_validation,
         independence_min_n=args.independence_min_n,
+        include_walk_forward_validation=not args.no_walk_forward_validation,
+        walk_forward_n_folds=args.walk_forward_n_folds,
+        walk_forward_min_test_n=args.walk_forward_min_test_n,
+        walk_forward_min_folds_evaluated=args.walk_forward_min_folds_evaluated,
         point_in_time_windows=point_in_time_windows,
         point_in_time_universe_cache_path=args.point_in_time_universe_cache,
     )
@@ -1058,6 +1163,10 @@ def _main() -> None:
                     "oos_min_test_n": config.oos_min_test_n,
                     "include_independence_validation": config.include_independence_validation,
                     "independence_min_n": config.independence_min_n,
+                    "include_walk_forward_validation": config.include_walk_forward_validation,
+                    "walk_forward_n_folds": config.walk_forward_n_folds,
+                    "walk_forward_min_test_n": config.walk_forward_min_test_n,
+                    "walk_forward_min_folds_evaluated": config.walk_forward_min_folds_evaluated,
                 },
                 n_trades=result.metrics.get("n_trades"),
                 sharpe_ratio=result.metrics.get("sharpe_ratio"),

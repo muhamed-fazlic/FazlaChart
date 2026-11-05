@@ -649,6 +649,97 @@ class TestIndependenceValidationWiring:
         assert received == {"cost_pct": 0.2, "min_independent_n": 5}
 
 
+class TestWalkForwardValidationWiring:
+    """Phase 8 Korak 7 Test 2: walk-forward (multi-period) validation is
+    pure re-computation on cases already fetched for the backtest (same cost
+    category as OOS/independence validation above), so it is wired on by
+    default, with its pooled summary riding along in `result.metrics` for
+    the experiment registry, and its full per-label detail in
+    `result.walk_forward_validation` for the dashboard report."""
+
+    def _config(self, **overrides) -> PortfolioBacktestConfig:
+        base = {
+            "symbols": ("BTCUSDT",),
+            "timeframes": ("1h",),
+            "initial_capital": 10_000.0,
+            "risk_per_trade_pct": 1.0,
+            "max_concurrent_positions": 5,
+            "max_concurrent_per_direction": 5,
+            "round_trip_cost_pct": 0.0,
+            "extra_slippage_pct": 0.0,
+            "warmup_candles": 0,
+            "horizon_candles": 1,
+        }
+        base.update(overrides)
+        return PortfolioBacktestConfig(**base)
+
+    def test_default_calls_validate_walk_forward_and_merges_summary_into_metrics(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+        from scanner.validation.walk_forward import WalkForwardResult
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        fake_walk_forward = [
+            WalkForwardResult(
+                label="trend:bullish",
+                direction="long",
+                horizon_candles=1,
+                n_folds_total=4,
+                n_folds_evaluated=4,
+                n_folds_holding_up=2,
+                holds_up_walk_forward=False,
+                folds=[],
+                warning="test",
+            )
+        ]
+        monkeypatch.setattr(module, "validate_walk_forward", lambda *a, **kw: fake_walk_forward)
+
+        result = run_portfolio_backtest(self._config())
+
+        assert result.walk_forward_validation == fake_walk_forward
+        assert result.metrics["walk_forward_labels_total"] == 1
+        assert result.metrics["walk_forward_labels_holding_up"] == 0
+
+    def test_include_walk_forward_validation_false_skips_it_entirely(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        called = []
+        monkeypatch.setattr(module, "validate_walk_forward", lambda *a, **kw: called.append(1) or [])
+
+        result = run_portfolio_backtest(self._config(include_walk_forward_validation=False))
+
+        assert called == []
+        assert result.walk_forward_validation == []
+        assert "walk_forward_labels_total" not in result.metrics
+
+    def test_walk_forward_params_are_forwarded(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        received = {}
+
+        def fake_validate(cases, cost_pct, n_folds, min_test_n, min_folds_evaluated):
+            received["cost_pct"] = cost_pct
+            received["n_folds"] = n_folds
+            received["min_test_n"] = min_test_n
+            received["min_folds_evaluated"] = min_folds_evaluated
+            return []
+
+        monkeypatch.setattr(module, "validate_walk_forward", fake_validate)
+        config = self._config(
+            round_trip_cost_pct=0.2,
+            walk_forward_n_folds=3,
+            walk_forward_min_test_n=10,
+            walk_forward_min_folds_evaluated=1,
+        )
+        run_portfolio_backtest(config)
+
+        assert received == {"cost_pct": 0.2, "n_folds": 3, "min_test_n": 10, "min_folds_evaluated": 1}
+
+
 class TestMetricsComputation:
     def test_known_trades_produce_expected_net_profit_and_win_rate(self):
         from scanner.backtesting.portfolio_backtest import Trade
@@ -787,6 +878,31 @@ class TestDashboardReport:
                 warning="test",
             )
         ]
+        from scanner.validation.walk_forward import WalkForwardFold, WalkForwardResult
+
+        walk_forward_validation = [
+            WalkForwardResult(
+                label="trend:bullish",
+                direction="long",
+                horizon_candles=1,
+                n_folds_total=4,
+                n_folds_evaluated=4,
+                n_folds_holding_up=4,
+                holds_up_walk_forward=True,
+                folds=[
+                    WalkForwardFold(
+                        fold_index=1,
+                        train_n=10,
+                        test_n=10,
+                        test_win_rate_pct=60.0,
+                        test_win_rate_ci_low_pct=55.0,
+                        evaluated=True,
+                        holds_up=True,
+                    )
+                ],
+                warning=None,
+            )
+        ]
         result = PortfolioBacktestResult(
             trades=trades,
             equity_curve=equity_curve,
@@ -794,6 +910,7 @@ class TestDashboardReport:
             skipped_symbols=["BADUSDT"],
             oos_validation=oos_validation,
             independence_validation=independence_validation,
+            walk_forward_validation=walk_forward_validation,
         )
 
         report = build_dashboard_report(config, result)
@@ -803,6 +920,7 @@ class TestDashboardReport:
         assert report["config"]["sl_tp_tie_break"] == "conservative"
         assert report["config"]["include_oos_validation"] is True
         assert report["config"]["include_independence_validation"] is True
+        assert report["config"]["include_walk_forward_validation"] is True
         assert report["oos_validation"] == [
             {
                 "label": "trend:bullish",
@@ -830,6 +948,29 @@ class TestDashboardReport:
                 "win_rate_independent_ci_low_pct": 30.0,
                 "holds_up_independent": False,
                 "warning": "test",
+            }
+        ]
+        assert report["walk_forward_validation"] == [
+            {
+                "label": "trend:bullish",
+                "direction": "long",
+                "horizon_candles": 1,
+                "n_folds_total": 4,
+                "n_folds_evaluated": 4,
+                "n_folds_holding_up": 4,
+                "holds_up_walk_forward": True,
+                "warning": None,
+                "folds": [
+                    {
+                        "fold_index": 1,
+                        "train_n": 10,
+                        "test_n": 10,
+                        "test_win_rate_pct": 60.0,
+                        "test_win_rate_ci_low_pct": 55.0,
+                        "evaluated": True,
+                        "holds_up": True,
+                    }
+                ],
             }
         ]
         assert report["metrics"]["n_trades"] == 2

@@ -596,6 +596,7 @@ async function loadBacktestTab() {
       renderStatisticalValidation(report.statistical_validation);
       renderOosValidation(report.oos_validation);
       renderIndependenceValidation(report.independence_validation);
+      renderWalkForwardValidation(report.walk_forward_validation);
     }
   } catch (err) {
     console.error("Could not load backtest report:", err);
@@ -826,6 +827,64 @@ function renderIndependenceValidation(independence) {
     </table>`;
 }
 
+// Phase 8 Korak 7 Test 2: walk-forward verdict per (label, horizon) --
+// expands the single train/test split above (renderOosValidation) into
+// several chronological folds, requiring EVERY evaluated fold to confirm
+// the edge, not just one lucky (or unlucky) split. Deliberately operates on
+// raw case counts per fold, same as the OOS check -- not independence-
+// corrected (see scanner/validation/walk_forward.py's module docstring),
+// so it is complementary to, not a replacement for, the independence check
+// above.
+function renderWalkForwardValidation(walkForward) {
+  const el = document.getElementById("backtest-walk-forward-validation");
+  if (!walkForward || !walkForward.length) {
+    el.className = "bucket-breakdown muted";
+    el.textContent =
+      "Nema walk-forward provjere u ovom izvještaju (isključena preko --no-walk-forward-validation, " +
+      "ili nema dovoljno slučajeva/historije za foldove, ili je izvještaj generisan prije dodavanja ove funkcije).";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = walkForward
+    .map((r) => {
+      const badge = r.holds_up_walk_forward
+        ? '<span class="pos">drži se u svim foldovima</span>'
+        : `<span class="neg">${r.warning ? "ne drži se konzistentno" : "slabije kroz vrijeme"}</span>`;
+      const foldsSummary = (r.folds || [])
+        .map((f) => {
+          const foldBadge = !f.evaluated ? "—" : f.holds_up ? "✅" : "❌";
+          const winPct = f.test_win_rate_pct != null ? fmt(f.test_win_rate_pct, 1) + "%" : "—";
+          return `#${f.fold_index}: n=${f.test_n}, ${winPct} ${foldBadge}`;
+        })
+        .join(" &middot; ");
+      return `
+    <tr>
+      <td><b>${r.label}</b></td>
+      <td>${r.direction ?? "—"}</td>
+      <td>${r.horizon_candles}</td>
+      <td>${r.n_folds_holding_up}/${r.n_folds_evaluated} (od ${r.n_folds_total} ukupno)</td>
+      <td class="muted">${foldsSummary}</td>
+      <td>${badge}</td>
+      <td class="muted">${r.warning ?? ""}</td>
+    </tr>`;
+    })
+    .join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">
+      📆 Walk-forward provjera (po label-u) — da li se edge drži konzistentno kroz VIŠE uzastopnih vremenskih perioda
+    </div>
+    <p class="dsr-explainer muted">
+      Historija je podijeljena u nekoliko uzastopnih foldova (expanding/anchored train prozor, svaki sljedeći fold
+      trenira na svemu prije njega). Edge "drži se" samo ako SVAKI ocijenjeni fold pojedinačno potvrdi 95% CI donju
+      granicu iznad 50% — jedan dobar fold ne znači ništa ako su ostali loši. Ovo je stroža, višeperiodna verzija
+      gornje in/out-of-sample provjere, ali i dalje koristi sirovo N po foldu (bez korekcije nezavisnosti uzorka).
+    </p>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Label</th><th>Smjer</th><th>Horizon</th><th>Foldova drži se</th><th>Po foldu (N, win%, status)</th><th>Status</th><th>Napomena</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 // Deliberately a separate fetch from loadBacktestTab's try/catch -- the
 // experiment registry can be populated (and interesting to see) even when
 // no dashboard report has been generated yet, and vice versa, so one
@@ -892,6 +951,8 @@ function renderBacktestUnavailable() {
   document.getElementById("backtest-oos-validation").textContent = "";
   document.getElementById("backtest-independence-validation").className = "bucket-breakdown muted";
   document.getElementById("backtest-independence-validation").textContent = "";
+  document.getElementById("backtest-walk-forward-validation").className = "bucket-breakdown muted";
+  document.getElementById("backtest-walk-forward-validation").textContent = "";
 }
 
 function renderBacktestMeta(report) {
@@ -959,6 +1020,12 @@ function renderBacktestFullConfig(cfg) {
       "Provjera nezavisnosti uzorka",
       cfg.include_independence_validation
         ? `<span class="pos">uključena</span> (preklapajući trejdovi bilo kog simbola broje se kao jedan događaj; min. ${cfg.independence_min_n ?? "—"} nezavisnih događaja za pouzdanost)`
+        : '<span class="muted">isključena</span>',
+    ],
+    [
+      "Walk-forward provjera",
+      cfg.include_walk_forward_validation
+        ? `<span class="pos">uključena</span> (${cfg.walk_forward_n_folds ?? "—"} uzastopnih foldova, min. ${cfg.walk_forward_min_test_n ?? "—"} po foldu, min. ${cfg.walk_forward_min_folds_evaluated ?? "—"} ocijenjenih foldova za verdikt)`
         : '<span class="muted">isključena</span>',
     ],
   ];
