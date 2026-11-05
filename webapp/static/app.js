@@ -601,6 +601,89 @@ async function loadBacktestTab() {
     document.getElementById("backtest-meta").textContent = `Greška: ${err.message}`;
   }
   await loadExperimentHistory();
+  // Only reflects current state in the button/status text -- does NOT
+  // itself re-trigger a reload on completion, since this same function is
+  // what a completed refresh calls to re-render (see
+  // startBacktestRefreshPolling()). Re-triggering here would recurse.
+  await renderBacktestRefreshStatus();
+}
+
+// --- Manual "🔄 Osvježi cijeli test" button -------------------------------
+// Fires POST /api/backtest/refresh (detached background job on the server,
+// see webapp/main.py), then polls GET /api/backtest/refresh/status every
+// 15s until it leaves the "running" state, at which point it reloads this
+// whole tab once. A plain page load / tab switch also calls
+// renderBacktestRefreshStatus() (via loadBacktestTab() above) so the
+// button correctly shows "already running" if a refresh triggered from
+// another tab/session (or from the VPS shell directly) is still going.
+
+let backtestRefreshPollTimer = null;
+
+function applyBacktestRefreshStatus(status) {
+  const btn = document.getElementById("backtest-refresh-btn");
+  const statusEl = document.getElementById("backtest-refresh-status");
+  if (!btn || !statusEl) return;
+  if (status.state === "running") {
+    btn.disabled = true;
+    statusEl.textContent = "⏳ Test u toku (obično 30-60+ min s funding cost + point-in-time fetch-om)…";
+  } else if (status.state === "done") {
+    btn.disabled = false;
+    statusEl.textContent = "✅ Posljednji test završen uspješno.";
+  } else if (status.state === "error") {
+    btn.disabled = false;
+    statusEl.textContent = "⚠️ Posljednji test je završio bez validnog izvještaja — provjeri log na serveru.";
+  } else {
+    btn.disabled = false;
+    statusEl.textContent = "";
+  }
+}
+
+async function renderBacktestRefreshStatus() {
+  try {
+    const res = await fetch("/api/backtest/refresh/status");
+    applyBacktestRefreshStatus(await res.json());
+  } catch (err) {
+    console.error("Could not read backtest refresh status:", err);
+  }
+}
+
+async function pollBacktestRefreshUntilDone() {
+  try {
+    const res = await fetch("/api/backtest/refresh/status");
+    const status = await res.json();
+    applyBacktestRefreshStatus(status);
+    if (status.state === "running") return;
+    if (backtestRefreshPollTimer) {
+      clearInterval(backtestRefreshPollTimer);
+      backtestRefreshPollTimer = null;
+    }
+    if (status.state === "done") {
+      await loadBacktestTab();
+    }
+  } catch (err) {
+    console.error("Could not poll backtest refresh status:", err);
+  }
+}
+
+async function triggerBacktestRefresh() {
+  const btn = document.getElementById("backtest-refresh-btn");
+  const statusEl = document.getElementById("backtest-refresh-status");
+  btn.disabled = true;
+  statusEl.textContent = "Pokrećem test na serveru…";
+  try {
+    const res = await fetch("/api/backtest/refresh", { method: "POST" });
+    const data = await res.json();
+    if (!data.started && data.reason === "already_running") {
+      statusEl.textContent = "Test je već u toku (pokrenut ranije).";
+    }
+    if (!backtestRefreshPollTimer) {
+      backtestRefreshPollTimer = setInterval(pollBacktestRefreshUntilDone, 15000);
+    }
+    await pollBacktestRefreshUntilDone();
+  } catch (err) {
+    statusEl.textContent = `Greška: ${err.message}`;
+    btn.disabled = false;
+  }
 }
 
 // --- Phase 8 Korak 3: Deflated Sharpe Ratio + experiment registry --------
@@ -1651,6 +1734,7 @@ document.getElementById("detail-modal").addEventListener("click", (e) => {
   if (e.target.id === "detail-modal") hideDetail();
 });
 document.getElementById("analyze-btn").addEventListener("click", analyzeSymbol);
+document.getElementById("backtest-refresh-btn").addEventListener("click", triggerBacktestRefresh);
 
 async function loadHealth() {
   const el = document.getElementById("health-banner");

@@ -9,16 +9,21 @@ or:
 This process never calls Binance or an LLM on its own — it only reads what
 the scanner (``python -m scanner``, running separately) has already written
 to disk, so it is safe to start/stop/restart independently of the scanner
-itself. The one exception is ``POST /api/analyze/{symbol}``, which is only
-ever triggered by an explicit user click (the "Analyze with AI" button) and
-calls the Derivatives/Risk agent (live Binance snapshot + local LLM).
+itself. Two exceptions, both only ever triggered by an explicit user click:
+``POST /api/analyze/{symbol}`` (the "Analyze with AI" button; calls the
+Derivatives/Risk agent — live Binance snapshot + local LLM), and
+``POST /api/backtest/refresh`` (the "🔄 Osvježi" button on the Backtest tab;
+launches ``tool/run_full_portfolio_backtest.sh`` as a detached, nice+cpulimit
+throttled background process and returns immediately — never runs it inline).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -290,6 +295,56 @@ def _experiment_registry_path() -> str:
     ``python -m scanner.backtesting.portfolio_backtest --experiment-family ...``;
     this webapp process only ever reads it."""
     return os.environ.get("EXPERIMENT_REGISTRY_PATH", "scanner_data/experiment_registry.db")
+
+
+def _backtest_refresh_status_path() -> str:
+    """Mirrors ``_backtest_report_path()``'s env-var convention. Tracks the
+    state of the background job launched by ``POST /api/backtest/refresh``
+    so a page reload / a second browser tab can see whether a refresh is
+    already in progress, instead of this webapp process holding that state
+    only in memory (which a restart would silently lose while the backtest
+    keeps running)."""
+    return os.environ.get("BACKTEST_REFRESH_STATUS_PATH", "scanner_data/backtest_refresh_status.json")
+
+
+def _backtest_refresh_log_path() -> str:
+    return os.environ.get("BACKTEST_REFRESH_LOG_PATH", "scanner_data/backtest_refresh.log")
+
+
+def _backtest_refresh_script_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "tool" / "run_full_portfolio_backtest.sh"
+
+
+def _read_refresh_status() -> dict[str, Any]:
+    path = Path(_backtest_refresh_status_path())
+    if not path.exists():
+        return {"state": "idle"}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"state": "idle"}
+
+
+def _write_refresh_status(status: dict[str, Any]) -> None:
+    path = Path(_backtest_refresh_status_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    except AttributeError:
+        # os.kill(pid, 0) isn't available on Windows -- this whole feature
+        # is VPS-only in practice, but don't hard-crash local dev.
+        return True
+    return True
+
+
+def _refresh_in_progress(status: dict[str, Any]) -> bool:
+    return status.get("state") == "running" and isinstance(status.get("pid"), int) and _pid_is_running(status["pid"])
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -662,6 +717,96 @@ def backtest_experiments(limit: int = 50) -> dict[str, Any]:
     except sqlite3.Error as exc:
         raise HTTPException(status_code=500, detail=f"Could not read experiment registry: {exc}") from None
     return {"available": True, "experiments": experiments}
+
+
+@app.post("/api/backtest/refresh")
+def backtest_refresh() -> dict[str, Any]:
+    """Explicit, on-demand only (same spirit as ``/api/analyze/{symbol}``):
+    launches ``tool/run_full_portfolio_backtest.sh`` -- the one canonical
+    command that combines the point-in-time universe filter, real funding
+    cost, per-symbol cost tiers, and OOS validation together (see that
+    script and PHASE8_PROFITABILITY_RESEARCH_TODO.md for why this one
+    command exists instead of hand-typed flags) -- as a detached background
+    process and returns immediately. ``nice``+``cpulimit`` throttle it to
+    ~30% of one CPU so it doesn't starve the scanner/dashboard on the VPS's
+    limited vCPU budget; falls back to un-throttled (nice only) if
+    ``cpulimit`` isn't installed, rather than failing the request.
+
+    Refuses to start a second run while one is already in progress (checked
+    via the PID recorded in ``_backtest_refresh_status_path()``). The
+    frontend polls ``GET /api/backtest/refresh/status`` for progress and
+    reloads the report once the state flips to "done"."""
+    status = _read_refresh_status()
+    if _refresh_in_progress(status):
+        return {"started": False, "reason": "already_running", "status": status}
+
+    script_path = _backtest_refresh_script_path()
+    if not script_path.exists():
+        raise HTTPException(status_code=500, detail=f"Backtest script not found: {script_path}")
+
+    log_path = Path(_backtest_refresh_log_path())
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(UTC).isoformat()
+
+    with open(log_path, "a", encoding="utf-8") as log_fh:
+        log_fh.write(f"\n=== refresh triggered via dashboard button {started_at} ===\n")
+        log_fh.flush()
+        try:
+            proc = subprocess.Popen(
+                ["nice", "-n", "19", "bash", str(script_path)],
+                cwd=str(script_path.parent.parent),
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not launch backtest: {exc}") from None
+
+        cpulimit_bin = shutil.which("cpulimit")
+        if cpulimit_bin:
+            subprocess.Popen(
+                [cpulimit_bin, "-p", str(proc.pid), "-l", "30", "-b"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+    status = {
+        "state": "running",
+        "pid": proc.pid,
+        "started_at": started_at,
+        "finished_at": None,
+        "log_path": str(log_path),
+    }
+    _write_refresh_status(status)
+    return {"started": True, "status": status}
+
+
+@app.get("/api/backtest/refresh/status")
+def backtest_refresh_status() -> dict[str, Any]:
+    """Polled by the "🔄 Osvježi" button's status text while a refresh is
+    running. There's no separate watcher process -- the transition out of
+    "running" happens lazily, the first time anyone calls this endpoint
+    after the backgrounded process has actually exited. Distinguishes
+    "done" from "error" by checking whether ``report.json``'s mtime moved
+    forward after the run started (the script can exit 0 having skipped
+    writing the report on, e.g., every symbol failing to fetch)."""
+    status = _read_refresh_status()
+    if status.get("state") == "running" and isinstance(status.get("pid"), int) and not _pid_is_running(status["pid"]):
+        report_path = Path(_backtest_report_path())
+        succeeded = False
+        started_at = status.get("started_at")
+        if report_path.exists() and started_at:
+            try:
+                started_dt = datetime.fromisoformat(started_at)
+                mtime = datetime.fromtimestamp(report_path.stat().st_mtime, tz=UTC)
+                succeeded = mtime >= started_dt
+            except (OSError, ValueError):
+                succeeded = False
+        status["state"] = "done" if succeeded else "error"
+        status["finished_at"] = datetime.now(UTC).isoformat()
+        _write_refresh_status(status)
+    return status
 
 
 @app.get("/api/forward-tracking/summary")
