@@ -408,3 +408,35 @@ def block_bootstrap_confidence_interval(
         "n_resamples": n_resamples,
         "n_observations": n,
     }
+
+
+def safe_block_bootstrap(
+    returns: Sequence[float], n_resamples: int, confidence_pct: float
+) -> dict[str, Any] | None:
+    """Wraps :func:`block_bootstrap_confidence_interval`, returning ``None``
+    (rather than raising) when there are too few observations (< 4) for it
+    to run, and renaming/rounding the raw result into the dashboard/report
+    shape every backtest engine wants (``*_pct`` keys, rounded to 4 decimal
+    places, plus ``edge_survives_lower_bound``).
+
+    Extracted here because ``funding_extreme_backtest.py`` and
+    ``cross_sectional_momentum_backtest.py`` each defined a byte-for-byte
+    identical private copy of this function -- having it live once next to
+    the primitive it wraps means any future change to the report shape (or
+    to how "too few observations" is handled) only needs to happen once.
+    """
+    try:
+        result = block_bootstrap_confidence_interval(
+            returns, n_resamples=n_resamples, confidence_pct=confidence_pct
+        )
+    except ValueError:
+        return None
+    return {
+        "observed_pct": round(result["observed"], 4),
+        "ci_low_pct": round(result["ci_low"], 4),
+        "ci_high_pct": round(result["ci_high"], 4),
+        "confidence_pct": result["confidence_pct"],
+        "block_size": result["block_size"],
+        "n_resamples": result["n_resamples"],
+        "edge_survives_lower_bound": bool(result["ci_low"] > 0.0),
+    }

@@ -74,7 +74,7 @@ from scanner.calibration import DEFAULT_ROUND_TRIP_COST_PCT, round_trip_cost_pct
 from scanner.validation.statistical_validation import (
     BLOCK_BOOTSTRAP_CONFIDENCE_PCT,
     BLOCK_BOOTSTRAP_N_RESAMPLES,
-    block_bootstrap_confidence_interval,
+    safe_block_bootstrap,
 )
 from tradingagents.dataflows.errors import VendorError
 
@@ -347,29 +347,12 @@ def build_trade(
     )
 
 
-def _safe_block_bootstrap(
-    returns: list[float], n_resamples: int, confidence_pct: float
-) -> dict[str, Any] | None:
-    """Wraps ``block_bootstrap_confidence_interval``, returning ``None``
-    (rather than raising) when there are too few trades (< 4) for it to
-    run -- this run's realistic expectation, per the pre-registration
-    doc's section 5, is "a few dozen events at most", so this is not a
-    hypothetical edge case."""
-    try:
-        result = block_bootstrap_confidence_interval(
-            returns, n_resamples=n_resamples, confidence_pct=confidence_pct
-        )
-    except ValueError:
-        return None
-    return {
-        "observed_pct": round(result["observed"], 4),
-        "ci_low_pct": round(result["ci_low"], 4),
-        "ci_high_pct": round(result["ci_high"], 4),
-        "confidence_pct": result["confidence_pct"],
-        "block_size": result["block_size"],
-        "n_resamples": result["n_resamples"],
-        "edge_survives_lower_bound": bool(result["ci_low"] > 0.0),
-    }
+# ``_safe_block_bootstrap`` used to be defined here as a private copy;
+# it now lives once as ``scanner.validation.statistical_validation.safe_block_bootstrap``
+# (this run's realistic expectation, per the pre-registration doc's
+# section 5, is "a few dozen events at most", so the <4-observations guard
+# in that shared helper is not a hypothetical edge case here either).
+_safe_block_bootstrap = safe_block_bootstrap
 
 
 def run_backtest(
