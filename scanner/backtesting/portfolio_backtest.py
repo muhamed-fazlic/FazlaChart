@@ -1351,7 +1351,12 @@ def _main() -> None:
         )
 
     if args.trades_json:
-        with open(args.trades_json, "w", encoding="utf-8") as fh:
+        # Suffix by variant the same way --report-json is (see
+        # report_path_for_variant()) -- without this, refreshing "inverted"
+        # silently overwrote "original"'s trades file (both resolved to the
+        # same unsuffixed path), since only the report path was variant-aware.
+        trades_json_path = report_path_for_variant(args.trades_json, config.strategy_variant)
+        with open(trades_json_path, "w", encoding="utf-8") as fh:
             json.dump(
                 [
                     {
@@ -1375,7 +1380,7 @@ def _main() -> None:
                 indent=2,
                 default=_json_default,
             )
-        print(f"Wrote {len(result.trades)} trades to {args.trades_json}")
+        print(f"Wrote {len(result.trades)} trades to {trades_json_path}")
 
     if args.report_json:
         report_json_path = report_path_for_variant(args.report_json, config.strategy_variant)

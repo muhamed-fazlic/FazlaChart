@@ -1097,6 +1097,63 @@ class TestStrategyVariantWiring:
         assert report["config"]["strategy_variant"] == "inverted"
 
 
+class TestCliTradesJsonVariantSuffixing:
+    """Regression test for a bug found in production: `--trades-json` was
+    written to the literal path given on the command line, unlike
+    `--report-json` which goes through `report_path_for_variant()`. Since
+    the dashboard's refresh endpoint always passes the same unsuffixed
+    `--trades-json` path regardless of `--strategy-variant`, refreshing the
+    "inverted" variant silently overwrote the "original" variant's trades
+    file (and vice versa), while the two variants' `--report-json` files
+    correctly stayed separate. `_main()` must suffix both the same way."""
+
+    def test_trades_json_gets_variant_suffix(self, monkeypatch, tmp_path):
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, **kwargs: [])
+        trades_path = tmp_path / "portfolio_backtest_trades.json"
+        argv = [
+            "portfolio_backtest.py",
+            "--symbols",
+            "BTCUSDT",
+            "--timeframes",
+            "1h",
+            "--warmup-candles",
+            "0",
+            "--trades-json",
+            str(trades_path),
+            "--strategy-variant",
+            "inverted",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        module._main()
+
+        suffixed_path = tmp_path / "portfolio_backtest_trades__inverted.json"
+        assert suffixed_path.exists()
+        assert not trades_path.exists()
+
+    def test_original_variant_trades_json_keeps_unsuffixed_path(self, monkeypatch, tmp_path):
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, **kwargs: [])
+        trades_path = tmp_path / "portfolio_backtest_trades.json"
+        argv = [
+            "portfolio_backtest.py",
+            "--symbols",
+            "BTCUSDT",
+            "--timeframes",
+            "1h",
+            "--warmup-candles",
+            "0",
+            "--trades-json",
+            str(trades_path),
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        module._main()
+
+        assert trades_path.exists()
+
+
 class TestMetricsComputation:
     def test_known_trades_produce_expected_net_profit_and_win_rate(self):
         from scanner.backtesting.portfolio_backtest import Trade
