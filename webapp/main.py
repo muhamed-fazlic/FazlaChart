@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from scanner import strategy_lab_storage
 from scanner.backtesting.strategy_variants import (
     DEFAULT_VARIANT_ID,
     STRATEGY_VARIANTS,
@@ -852,6 +853,49 @@ def research_registry() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=500, detail=f"Could not read research registry: {exc}") from None
     return {"available": True, **registry}
+
+
+def _strategy_lab_db_path() -> str:
+    """Read lazily so tests can point this at a throwaway file via the
+    STRATEGY_LAB_DB_PATH env var — mirrors ``_research_registry_path()``'s
+    convention."""
+    return os.environ.get("STRATEGY_LAB_DB_PATH", strategy_lab_storage.DEFAULT_STRATEGY_LAB_DB_PATH)
+
+
+@app.get("/api/strategy-lab/overview")
+def strategy_lab_overview() -> dict[str, Any]:
+    """Read-only overview for the "⚒️ Strategy Lab" tab: current best
+    confirmed strategy (if any), the Layer 1 leaderboard, weekly snapshot
+    history, Layer 2 confirmation history, and the rolling-holdout status.
+    Never triggers a mining/snapshot/confirmation run itself — purely
+    reads what ``scanner.strategy_lab_scheduler`` has already produced.
+
+    Returns ``{"available": False}`` rather than a 404/500 if
+    ``scanner_data/strategy_lab.db`` doesn't exist yet (e.g. the scheduler
+    has never run), mirroring ``research_registry()`` above."""
+    db_path = _strategy_lab_db_path()
+    if not strategy_lab_storage.database_exists(db_path):
+        return {"available": False}
+    try:
+        conn = strategy_lab_storage.connect_for_reads(db_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not open Strategy Lab database: {exc}") from None
+    try:
+        leaderboard = strategy_lab_storage.fetch_leaderboard(conn, limit=10)
+        weekly_snapshots = strategy_lab_storage.fetch_weekly_snapshots(conn, limit=52)
+        confirmations = strategy_lab_storage.fetch_confirmations(conn, limit=100)
+        current_best = strategy_lab_storage.fetch_current_best(conn)
+        holdout_state = strategy_lab_storage.fetch_rolling_holdout_state(conn)
+    finally:
+        conn.close()
+    return {
+        "available": True,
+        "current_best": current_best,
+        "leaderboard": leaderboard,
+        "weekly_snapshots": weekly_snapshots,
+        "confirmations": confirmations,
+        "rolling_holdout_state": holdout_state,
+    }
 
 
 @app.get("/api/backtest/cpu-limit")

@@ -308,12 +308,15 @@ function switchTab(tab) {
   document.getElementById("tab-trades").classList.toggle("active", tab === "trades");
   document.getElementById("tab-backtest").classList.toggle("active", tab === "backtest");
   document.getElementById("tab-research").classList.toggle("active", tab === "research");
+  document.getElementById("tab-strategy-lab").classList.toggle("active", tab === "strategy-lab");
   if (tab === "trades") {
     loadTradesTab();
   } else if (tab === "backtest") {
     loadBacktestTab();
   } else if (tab === "research") {
     loadResearchTab();
+  } else if (tab === "strategy-lab") {
+    loadStrategyLabTab();
   }
 }
 
@@ -2239,3 +2242,172 @@ function renderResearchFamilies(families) {
   }
   el.innerHTML = families.map(renderResearchFamilyCard).join("");
 }
+
+// --- Strategy Lab: read-only overview of the continuous, two-layer -------
+// strategy-mining pipeline (see STRATEGY_LAB_DESIGN.md). One-time fetch on
+// first tab click, same convention as loadResearchTab() above -- this tab
+// never triggers a mining cycle, weekly snapshot, or Layer 2 confirmation
+// itself; it only displays what scanner.strategy_lab_scheduler has already
+// produced into scanner_data/strategy_lab.db.
+
+let strategyLabLoaded = false;
+
+async function loadStrategyLabTab() {
+  if (strategyLabLoaded) return;
+  strategyLabLoaded = true;
+  try {
+    const res = await fetch("/api/strategy-lab/overview");
+    const data = await res.json();
+    if (!data.available) {
+      renderStrategyLabUnavailable();
+    } else {
+      document.getElementById("strategy-lab-unavailable").classList.add("hidden");
+      document.getElementById("strategy-lab-content").classList.remove("hidden");
+      renderStrategyLabCurrentBest(data.current_best);
+      renderStrategyLabLeaderboard(data.leaderboard || []);
+      renderStrategyLabSnapshots(data.weekly_snapshots || []);
+      renderStrategyLabConfirmations(data.confirmations || []);
+      renderStrategyLabHoldoutStatus(data.rolling_holdout_state, data.confirmations || []);
+    }
+  } catch (err) {
+    console.error("Could not load Strategy Lab overview:", err);
+    strategyLabLoaded = false; // allow a retry on the next tab click
+    renderStrategyLabUnavailable(`Greška: ${err.message}`);
+  }
+}
+
+function renderStrategyLabUnavailable(message) {
+  const el = document.getElementById("strategy-lab-unavailable");
+  el.textContent =
+    message ||
+    "Strategy Lab baza (scanner_data/strategy_lab.db) još ne postoji — scheduler još nije pokrenuo nijedan mining ciklus.";
+  el.classList.remove("hidden");
+  document.getElementById("strategy-lab-content").classList.add("hidden");
+}
+
+function strategyLabCiRangeHtml(low, high, survives) {
+  if (low === null || low === undefined || high === null || high === undefined) return "";
+  const badge = survives ? `<span class="research-badge research-badge-confirmed">CI &gt; 0</span>` : `<span class="research-badge research-badge-noedge">CI uključuje 0</span>`;
+  return `[${fmt(low)}%, ${fmt(high)}%] ${badge}`;
+}
+
+function renderStrategyLabCurrentBest(best) {
+  const el = document.getElementById("strategy-lab-current-best");
+  if (!best) {
+    el.innerHTML = `<p class="no-best-yet">Još nijedna strategija nije prošla Layer 2 potvrdu — ovo polje će ostati prazno dok se to zaista ne desi. Prazno ovdje je potpuno normalno i očekivano stanje, ne greška.</p>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="strategy-lab-best-card">
+      <div>
+        <div class="strategy-lab-best-title">${best.template} / ${best.tercile} / ${best.variant_label}</div>
+        <div class="muted">Potvrđeno: ${best.attempted_at ? new Date(best.attempted_at).toLocaleDateString("bs-BA") : "—"}</div>
+      </div>
+      <div>Neto povrat: <b>${fmt(best.net_observed_pct)}%</b> ${strategyLabCiRangeHtml(best.net_ci_low_pct, best.net_ci_high_pct, best.edge_survives_lower_bound)}</div>
+      <div>n = ${best.n_independent ?? "—"} (potrebno ${best.n_required ?? "—"})</div>
+      <div>Telegram poslat: ${best.telegram_sent ? "da" : "ne"}</div>
+    </div>`;
+}
+
+function renderStrategyLabLeaderboard(leaderboard) {
+  const el = document.getElementById("strategy-lab-leaderboard");
+  if (!leaderboard.length) {
+    el.innerHTML = `<p class="muted">Layer 1 još nije izvršio nijedan mining ciklus.</p>`;
+    return;
+  }
+  const rows = leaderboard
+    .map(
+      (c, i) => `
+      <tr>
+        <td>#${i + 1}</td>
+        <td>${c.template}</td>
+        <td>${c.tercile}</td>
+        <td>${c.variant_label}</td>
+        <td>${c.net_observed_pct === null || c.net_observed_pct === undefined ? "—" : `${fmt(c.net_observed_pct)}%`}</td>
+        <td>${c.gross_observed_pct === null || c.gross_observed_pct === undefined ? "—" : `${fmt(c.gross_observed_pct)}%`}</td>
+        <td>${c.n_independent ?? "—"}</td>
+        <td>${c.stability_score === null || c.stability_score === undefined ? "—" : fmt(c.stability_score)}</td>
+        <td>${fmt(c.composite_score)}</td>
+      </tr>`
+    )
+    .join("");
+  el.innerHTML = `
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Rang</th><th>Template</th><th>Tercil</th><th>Varijanta</th><th>Neto</th><th>Bruto</th><th>n</th><th>Stabilnost</th><th>Kompozitni skor</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderStrategyLabSnapshots(snapshots) {
+  const el = document.getElementById("strategy-lab-snapshots");
+  if (!snapshots.length) {
+    el.innerHTML = `<p class="muted">Još nema sedmičnih snapshotova.</p>`;
+    return;
+  }
+  const rows = snapshots
+    .map(
+      (s) => `
+      <tr>
+        <td>${s.snapshot_at ? new Date(s.snapshot_at).toLocaleDateString("bs-BA") : "—"}</td>
+        <td>${s.template} / ${s.tercile} / ${s.variant_label}</td>
+        <td>${s.net_observed_pct === null || s.net_observed_pct === undefined ? "—" : `${fmt(s.net_observed_pct)}%`}</td>
+        <td>${strategyLabCiRangeHtml(s.net_ci_low_pct, s.net_ci_high_pct, false) || "—"}</td>
+        <td>${s.n_independent ?? "—"}</td>
+        <td>${s.win_rate_pct === null || s.win_rate_pct === undefined ? "—" : `${fmt(s.win_rate_pct)}%`}</td>
+        <td>${s.telegram_sent ? "✅" : "—"}</td>
+      </tr>`
+    )
+    .join("");
+  el.innerHTML = `
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Datum</th><th>Kandidat</th><th>Neto</th><th>CI</th><th>n</th><th>Win rate</th><th>Telegram</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderStrategyLabConfirmations(confirmations) {
+  const el = document.getElementById("strategy-lab-confirmations");
+  if (!confirmations.length) {
+    el.innerHTML = `<p class="muted">Još nema Layer 2 pokušaja potvrde.</p>`;
+    return;
+  }
+  const rows = confirmations
+    .map((c) => {
+      const verdictBadge = c.edge_survives_lower_bound
+        ? `<span class="research-badge research-badge-confirmed">✅ edge preživio</span>`
+        : `<span class="research-badge research-badge-noedge">❌ nema edge-a</span>`;
+      const start = c.fresh_window_start_ms ? new Date(c.fresh_window_start_ms).toLocaleDateString("bs-BA") : "—";
+      const end = c.fresh_window_end_ms ? new Date(c.fresh_window_end_ms).toLocaleDateString("bs-BA") : "—";
+      return `
+      <tr>
+        <td>${c.attempted_at ? new Date(c.attempted_at).toLocaleDateString("bs-BA") : "—"}</td>
+        <td>${c.template} / ${c.tercile} / ${c.variant_label}</td>
+        <td>${start} → ${end}</td>
+        <td>${c.net_observed_pct === null || c.net_observed_pct === undefined ? "—" : `${fmt(c.net_observed_pct)}%`} ${strategyLabCiRangeHtml(c.net_ci_low_pct, c.net_ci_high_pct, c.edge_survives_lower_bound)}</td>
+        <td>${c.n_independent ?? "—"} / ${c.n_required ?? "—"}</td>
+        <td>${verdictBadge}</td>
+        <td>${c.telegram_sent ? "✅" : "—"}</td>
+      </tr>`;
+    })
+    .join("");
+  el.innerHTML = `
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Datum</th><th>Kandidat</th><th>Svježi prozor</th><th>Neto (CI)</th><th>n / potrebno</th><th>Verdikt</th><th>Telegram</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderStrategyLabHoldoutStatus(state, confirmations) {
+  const el = document.getElementById("strategy-lab-holdout-status");
+  if (!state) {
+    el.innerHTML = `<p class="muted">Rolling holdout još nije inicijalizovan (Layer 2 provjera se još nije pokrenula).</p>`;
+    return;
+  }
+  const boundaryDate = new Date(state.boundary_timestamp_ms).toLocaleString("bs-BA");
+  const confirmationCount = confirmations.length;
+  el.innerHTML = `
+    <div class="research-mt-row">Granica rolling holdout-a (svježe vrijeme počinje odavde): <b>${boundaryDate}</b></div>
+    <div class="research-mt-row">Ukupno Layer 2 pokušaja potvrde do sada: <b>${confirmationCount}</b></div>
+    <div class="research-mt-note muted">Svaki pokušaj potvrde pomjera ovu granicu unaprijed i troši tačno taj prozor — nikad se ne ponovo koristi isti svježi period.</div>`;
+}
+

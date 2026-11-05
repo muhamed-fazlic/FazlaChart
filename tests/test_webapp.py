@@ -917,6 +917,84 @@ def test_forward_tracking_trades_time_range_filters_by_logged_at(tmp_path, monke
     assert resp_custom.json()["count"] == 1
 
 
+def test_strategy_lab_overview_reports_unavailable_when_no_db_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRATEGY_LAB_DB_PATH", str(tmp_path / "no_such_strategy_lab.db"))
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/strategy-lab/overview")
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False}
+
+
+def test_strategy_lab_overview_returns_populated_sections(tmp_path, monkeypatch):
+    from scanner import strategy_lab_storage as storage
+
+    db_path = tmp_path / "strategy_lab.db"
+    conn = storage.init_db(str(db_path))
+    candidate_id = storage.insert_mining_candidate(
+        conn,
+        as_of_timestamp_ms=1_790_000_000_000,
+        template="funding_extreme_reversion",
+        tercile="unsliced",
+        variant_label="baseline",
+        params={"hold_hours": 8},
+        n_independent=120,
+        gross_observed_pct=0.5,
+        net_observed_pct=0.3,
+        stability_score=0.67,
+        composite_score=0.2,
+        report={"n_independent": 120},
+    )
+    storage.insert_weekly_snapshot(
+        conn,
+        candidate_id=candidate_id,
+        template="funding_extreme_reversion",
+        tercile="unsliced",
+        variant_label="baseline",
+        n_independent=120,
+        net_observed_pct=0.3,
+        net_ci_low_pct=-0.1,
+        net_ci_high_pct=0.7,
+        gross_observed_pct=0.5,
+        win_rate_pct=52.0,
+        telegram_sent=False,
+        report={},
+    )
+    storage.insert_confirmation(
+        conn,
+        candidate_id=candidate_id,
+        template="funding_extreme_reversion",
+        tercile="unsliced",
+        variant_label="baseline",
+        fresh_window_start_ms=1_790_000_000_000,
+        fresh_window_end_ms=1_793_000_000_000,
+        n_independent=400,
+        n_required=371,
+        net_observed_pct=0.4,
+        net_ci_low_pct=0.05,
+        net_ci_high_pct=0.75,
+        edge_survives_lower_bound=True,
+        telegram_sent=False,
+        report={},
+    )
+    storage.save_rolling_holdout_state(conn, 1_793_000_000_000)
+    conn.close()
+
+    monkeypatch.setenv("STRATEGY_LAB_DB_PATH", str(db_path))
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/strategy-lab/overview")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert len(body["leaderboard"]) == 1
+    assert body["leaderboard"][0]["template"] == "funding_extreme_reversion"
+    assert len(body["weekly_snapshots"]) == 1
+    assert len(body["confirmations"]) == 1
+    assert body["current_best"]["edge_survives_lower_bound"] == 1
+    assert body["rolling_holdout_state"]["boundary_timestamp_ms"] == 1_793_000_000_000
+
+
 class TestPidIsRunning:
     """``_pid_is_running()`` backs the /api/backtest/refresh "already
     running" guard and the /status "has it finished" check. A real

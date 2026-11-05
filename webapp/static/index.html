@@ -29,6 +29,7 @@
     <button type="button" class="tab-btn" data-tab="trades">📊 Analitika trejdova</button>
     <button type="button" class="tab-btn" data-tab="backtest">🧪 Backtest</button>
     <button type="button" class="tab-btn" data-tab="research">🔬 Istraživanje</button>
+    <button type="button" class="tab-btn" data-tab="strategy-lab">⚒️ Strategy Lab</button>
   </nav>
 
   <div id="tab-scanner" class="tab-panel active">
@@ -204,6 +205,63 @@
 
     <section id="research-overall-note" class="trades-summary muted"></section>
   </div>
+
+  <div id="tab-strategy-lab" class="tab-panel">
+    <section id="strategy-lab-disclaimer" class="backtest-disclaimer">
+      ⚒️ <strong>Strategy Lab</strong> je kontinuirani, dvoslojni sistem za traganje za edge-om: Layer 1 (neograničeno,
+      opisno rudarenje na trening podacima — <em>trag za buduću potvrdu, ne nalaz</em>) i Layer 2 (rijetka, power-gated
+      potvrda na rolling holdout-u koji nikad ne dira zaključani 6-sedmični holdout iz Phase 8 istraživanja). Read-only
+      prikaz — ne pokreće nove runove niti troši holdout prilikom učitavanja/osvježavanja stranice.
+      <br>
+      ❌ "nema edge-a" je ovdje normalan, očekivan ishod — ne greška. Ni jedna potvrđena strategija ovdje NIKAD se ne
+      pušta automatski na stvarni novac — prolazak je samo kandidat za dalji ljudski pregled (execution layer,
+      forward/paper test).
+    </section>
+
+    <section id="strategy-lab-unavailable" class="backtest-meta muted hidden">
+      Strategy Lab baza (scanner_data/strategy_lab.db) još ne postoji — scheduler još nije pokrenuo nijedan mining
+      ciklus.
+    </section>
+
+    <div id="strategy-lab-content" class="hidden">
+      <section class="backtest-meta">
+        <h3>🏆 Trenutno najbolja potvrđena strategija</h3>
+        <p class="muted-caption">Jedina "potvrda" sa pravim pass/fail jezikom u cijelom Strategy Lab-u — rezultat tačno
+          jednog Layer 2 confirmatory runa čiji je donji CI prag iznad nule.</p>
+        <div id="strategy-lab-current-best"></div>
+      </section>
+
+      <section class="bucket-breakdown">
+        <h3>📋 Layer 1 rang-lista (top 10)</h3>
+        <p class="muted-caption">Eksploratorno — trag za buduću potvrdu, ne nalaz. Rangirano po kompozitnom skoru
+          (opisni neto efekat × stabilnost kroz pod-periode), bez CI i bez pass/fail jezika.</p>
+        <div id="strategy-lab-leaderboard"></div>
+      </section>
+
+      <section class="bucket-breakdown">
+        <h3>📈 Istorija sedmičnih snapshotova</h3>
+        <p class="muted-caption">Ponovno pokretanje punog backtest motora na #1 kandidatu svake sedmice, i dalje samo
+          na trening podacima — pokazuje da li kandidat ostaje stabilan ili se mijenja kroz vrijeme. Selection bias
+          postoji (kandidat je biran gledanjem u Layer 1 rang-listu), zato nikad nije "potvrda".</p>
+        <div id="strategy-lab-snapshots"></div>
+      </section>
+
+      <section class="bucket-breakdown">
+        <h3>🧪 Istorija Layer 2 potvrda</h3>
+        <p class="muted-caption">Svaki pokušaj: datum, kandidat, svježi prozor podataka koji je potrošen, CI, i
+          jedini pravi pass/fail verdikt u Strategy Lab-u.</p>
+        <div id="strategy-lab-confirmations"></div>
+      </section>
+
+      <section class="bucket-breakdown muted">
+        <h3>⏳ Rolling holdout / multiple-testing status</h3>
+        <p class="muted-caption">Koliko je rolling holdout-a već potrošeno i otkad se broji svježe (nikad ranije
+          korišteno) vrijeme za sljedeću potvrdu.</p>
+        <div id="strategy-lab-holdout-status"></div>
+      </section>
+    </div>
+  </div>
+
 
 
   <div id="detail-modal" class="modal hidden">

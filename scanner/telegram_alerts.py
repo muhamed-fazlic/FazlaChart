@@ -142,6 +142,56 @@ def format_drift_unmute_message(stats: Any) -> str:
     )
 
 
+def format_strategy_lab_weekly_report(snapshot: dict[str, Any]) -> str:
+    """Plain-text Telegram message for Strategy Lab's weekly snapshot (see
+    ``scanner.backtesting.strategy_miner``/``run_weekly_snapshot``). Always
+    carries the "eksploratorno, nije potvrđeno" disclaimer -- the snapshot
+    candidate was selected by looking at Layer 1's own ranking (selection
+    bias), so it must never read like a confirmed finding, matching
+    :func:`format_alert_message`'s tone of never overstating the edge."""
+    ci_low = snapshot.get("net_ci_low_pct")
+    ci_high = snapshot.get("net_ci_high_pct")
+    ci_text = f" CI [{ci_low:.2f}%, {ci_high:.2f}%]" if ci_low is not None and ci_high is not None else ""
+    lines = [
+        "🔬 Strategy Lab — sedmični snapshot",
+        f"Kandidat: {snapshot['template']} / {snapshot['tercile']} / {snapshot['variant_label']}",
+        f"Neto povrat: {snapshot.get('net_observed_pct', 'n/a')}%{ci_text} (n={snapshot.get('n_independent', 'n/a')})",
+    ]
+    if snapshot.get("win_rate_pct") is not None:
+        lines.append(f"Win rate: {snapshot['win_rate_pct']:.1f}%")
+    lines.append(
+        "⚠️ Eksploratorno, nije potvrđeno — ovaj kandidat je izabran gledanjem u Layer 1 rang-listu "
+        "(selection bias), ne pre-registrovana potvrđena hipoteza."
+    )
+    return "\n".join(lines)
+
+
+def format_strategy_lab_confirmation_report(confirmation: dict[str, Any]) -> str:
+    """Plain-text Telegram message for a Layer 2 confirmation attempt — the
+    ONLY place in Strategy Lab allowed to report a genuine pass/fail
+    verdict (``edge_survives_lower_bound``)."""
+    passed = bool(confirmation.get("edge_survives_lower_bound"))
+    verdict_word = "✅ EDGE PREŽIVIO CI DONJU GRANICU" if passed else "❌ Nema edge-a (CI ne prelazi nulu)"
+    ci_low = confirmation.get("net_ci_low_pct")
+    ci_high = confirmation.get("net_ci_high_pct")
+    ci_text = f"[{ci_low:.2f}%, {ci_high:.2f}%]" if ci_low is not None and ci_high is not None else "n/a"
+    lines = [
+        "🧪 Strategy Lab — Layer 2 potvrda (confirmatory run)",
+        f"Kandidat: {confirmation['template']} / {confirmation['tercile']} / {confirmation['variant_label']}",
+        f"Svježi prozor: {confirmation.get('fresh_window_start_iso', 'n/a')} → {confirmation.get('fresh_window_end_iso', 'n/a')}",
+        f"Neto povrat: {confirmation.get('net_observed_pct', 'n/a')}% CI {ci_text} (n={confirmation.get('n_independent', 'n/a')}, potrebno={confirmation.get('n_required', 'n/a')})",
+        verdict_word,
+    ]
+    if not passed:
+        lines.append("Ovo je normalan, neutralan ishod (kao i prethodne tri zatvorene porodice) — nije greška.")
+    else:
+        lines.append(
+            "Kandidat za dalji ljudski pregled (execution layer, forward/paper test) — NIJE automatski "
+            "pokretanje stvarnog novca."
+        )
+    return "\n".join(lines)
+
+
 def maybe_send_drift_alert(stats: Any, config: TelegramAlertConfig, *, muted: bool) -> bool:
     """Best-effort push of a drift mute/unmute notice. Unlike
     :func:`maybe_send_alert`, this ignores the quality thresholds (

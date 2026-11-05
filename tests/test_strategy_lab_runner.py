@@ -1,0 +1,228 @@
+"""Tests for scanner.backtesting.strategy_lab_runner -- the weekly
+snapshot and Layer 2 confirmation gate orchestration.
+
+Network-free and backtest-free: monkeypatches ``miner.evaluate_variant``
+directly (one seam, since both ``run_weekly_snapshot`` and
+``run_layer2_check`` call through it) so these tests exercise the
+orchestration logic (storage round-trips, power gating, rolling-holdout
+boundary advancement, Telegram send wiring) without touching any frozen
+backtest module.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from scanner import strategy_lab_storage as storage
+from scanner.backtesting import strategy_lab_runner as runner, strategy_miner as miner
+from scanner.telegram_alerts import TelegramAlertConfig
+
+SHARED_HOLDOUT_END_MS = 1_790_253_820_000
+DAY_MS = 86_400_000
+
+
+@pytest.fixture
+def db_path(tmp_path: Path) -> str:
+    return str(tmp_path / "strategy_lab_test.db")
+
+
+def _seed_boundary(db_path: str, boundary_timestamp_ms: int) -> None:
+    """Pre-seeds the rolling holdout boundary to a FIXED point in the past,
+    simulating "this feature started a while ago" so a later ``now_ms`` in
+    a test genuinely represents accumulated fresh time -- ``now_ms``
+    passed to ``run_layer2_check`` is a simulated clock, not real wall
+    time, so it must not be conflated with ``initial_boundary_ms``'s own
+    ``max(shared_holdout_end_ms, now)`` seeding logic."""
+    conn = storage.init_db(db_path)
+    try:
+        storage.save_rolling_holdout_state(conn, boundary_timestamp_ms)
+    finally:
+        conn.close()
+
+
+def _seed_candidate(db_path: str, *, net_observed_pct: float = 1.0, n_independent: int = 50) -> int:
+    conn = storage.init_db(db_path)
+    try:
+        variant = miner.FUNDING_EXTREME_VARIANTS[0]
+        candidate_id = storage.insert_mining_candidate(
+            conn,
+            as_of_timestamp_ms=SHARED_HOLDOUT_END_MS - 180 * DAY_MS,
+            template=variant.template,
+            tercile="unsliced",
+            variant_label=variant.variant_label,
+            params=variant.params,
+            n_independent=n_independent,
+            gross_observed_pct=net_observed_pct + 0.2,
+            net_observed_pct=net_observed_pct,
+            stability_score=1.0,
+            composite_score=net_observed_pct,
+            report={"n_independent": n_independent},
+        )
+        return candidate_id
+    finally:
+        conn.close()
+
+
+class TestRunWeeklySnapshot:
+    def test_returns_none_when_no_candidates_yet(self, db_path: str) -> None:
+        result = runner.run_weekly_snapshot(db_path=db_path, end_timestamp_ms=SHARED_HOLDOUT_END_MS)
+        assert result is None
+
+    def test_stores_and_returns_snapshot(self, db_path: str, monkeypatch) -> None:
+        _seed_candidate(db_path)
+
+        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path):
+            return miner.VariantEvaluation(
+                report={
+                    "net_block_bootstrap": {"ci_low_pct": -0.2, "ci_high_pct": 1.8, "edge_survives_lower_bound": False},
+                    "win_rate_pct": 55.0,
+                },
+                event_net_returns=[1.0] * 10,
+                n_independent=55,
+                net_observed_pct=1.1,
+                gross_observed_pct=1.3,
+            )
+
+        monkeypatch.setattr(miner, "evaluate_variant", fake_evaluate)
+        result = runner.run_weekly_snapshot(
+            db_path=db_path, end_timestamp_ms=SHARED_HOLDOUT_END_MS, symbols=("BTCUSDT", "ETHUSDT")
+        )
+
+        assert result is not None
+        assert result["net_observed_pct"] == 1.1
+        assert result["telegram_sent"] is False  # no telegram_config passed
+
+        conn = storage.connect_for_reads(db_path)
+        try:
+            snapshots = storage.fetch_weekly_snapshots(conn)
+        finally:
+            conn.close()
+        assert len(snapshots) == 1
+        assert snapshots[0]["n_independent"] == 55
+
+    def test_sends_telegram_when_configured_and_enabled(self, db_path: str, monkeypatch) -> None:
+        _seed_candidate(db_path)
+
+        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path):
+            return miner.VariantEvaluation(
+                report={"net_block_bootstrap": None, "win_rate_pct": None},
+                event_net_returns=[],
+                n_independent=55,
+                net_observed_pct=1.1,
+                gross_observed_pct=None,
+            )
+
+        sent_messages = []
+        monkeypatch.setattr(miner, "evaluate_variant", fake_evaluate)
+        monkeypatch.setattr(runner, "send_telegram_message", lambda token, chat, text: sent_messages.append(text) or True)
+
+        config = TelegramAlertConfig(bot_token="t", chat_id="c")
+        result = runner.run_weekly_snapshot(
+            db_path=db_path,
+            end_timestamp_ms=SHARED_HOLDOUT_END_MS,
+            symbols=("BTCUSDT",),
+            telegram_config=config,
+        )
+        assert result["telegram_sent"] is True
+        assert len(sent_messages) == 1
+        assert "eksploratorno" in sent_messages[0].lower()
+
+
+class TestRunLayer2Check:
+    def test_returns_waiting_when_no_candidate(self, db_path: str) -> None:
+        result = runner.run_layer2_check(
+            db_path=db_path, shared_holdout_end_ms=SHARED_HOLDOUT_END_MS, now_ms=SHARED_HOLDOUT_END_MS + 5 * DAY_MS
+        )
+        assert result.ran_confirmation is False
+        assert result.confirmation is None
+
+    def test_waits_when_insufficient_fresh_power(self, db_path: str) -> None:
+        # Small net effect -> large sigma assumption -> huge n_required,
+        # while only 5 days have passed -> clearly insufficient.
+        _seed_candidate(db_path, net_observed_pct=10.0, n_independent=100)
+        _seed_boundary(db_path, SHARED_HOLDOUT_END_MS)
+        result = runner.run_layer2_check(
+            db_path=db_path, shared_holdout_end_ms=SHARED_HOLDOUT_END_MS, now_ms=SHARED_HOLDOUT_END_MS + 5 * DAY_MS
+        )
+        assert result.ran_confirmation is False
+        assert result.n_required is not None
+        assert result.estimated_days_needed is not None and result.estimated_days_needed > 0
+
+        # Boundary must have been initialized but NOT advanced (nothing consumed).
+        conn = storage.connect_for_reads(db_path)
+        try:
+            state = storage.fetch_rolling_holdout_state(conn)
+        finally:
+            conn.close()
+        assert state is not None
+        assert state["boundary_timestamp_ms"] == SHARED_HOLDOUT_END_MS
+
+    def test_runs_confirmation_and_advances_boundary_when_power_sufficient(self, db_path: str, monkeypatch) -> None:
+        # Large effect/high event rate in training -> small n_required,
+        # easily met by a long fresh window.
+        _seed_candidate(db_path, net_observed_pct=5.0, n_independent=2000)
+        _seed_boundary(db_path, SHARED_HOLDOUT_END_MS)
+        now_ms = SHARED_HOLDOUT_END_MS + 400 * DAY_MS
+
+        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path):
+            return miner.VariantEvaluation(
+                report={"net_block_bootstrap": {"ci_low_pct": 0.5, "ci_high_pct": 2.0, "edge_survives_lower_bound": True}},
+                event_net_returns=[1.0] * 500,
+                n_independent=500,
+                net_observed_pct=1.2,
+                gross_observed_pct=1.4,
+            )
+
+        monkeypatch.setattr(miner, "evaluate_variant", fake_evaluate)
+        result = runner.run_layer2_check(
+            db_path=db_path,
+            shared_holdout_end_ms=SHARED_HOLDOUT_END_MS,
+            now_ms=now_ms,
+            symbols=("BTCUSDT", "ETHUSDT"),
+        )
+
+        assert result.ran_confirmation is True
+        assert result.confirmation is not None
+        assert result.confirmation["edge_survives_lower_bound"] is True
+
+        conn = storage.connect_for_reads(db_path)
+        try:
+            confirmations = storage.fetch_confirmations(conn)
+            state = storage.fetch_rolling_holdout_state(conn)
+            best = storage.fetch_current_best(conn)
+        finally:
+            conn.close()
+        assert len(confirmations) == 1
+        assert state["boundary_timestamp_ms"] == now_ms
+        assert best is not None
+        assert best["edge_survives_lower_bound"] == 1
+
+    def test_second_confirmation_cannot_reuse_consumed_window(self, db_path: str, monkeypatch) -> None:
+        _seed_candidate(db_path, net_observed_pct=5.0, n_independent=2000)
+        _seed_boundary(db_path, SHARED_HOLDOUT_END_MS)
+        now_ms = SHARED_HOLDOUT_END_MS + 400 * DAY_MS
+
+        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path):
+            return miner.VariantEvaluation(
+                report={"net_block_bootstrap": {"ci_low_pct": 0.5, "ci_high_pct": 2.0, "edge_survives_lower_bound": True}},
+                event_net_returns=[1.0] * 500,
+                n_independent=500,
+                net_observed_pct=1.2,
+                gross_observed_pct=1.4,
+            )
+
+        monkeypatch.setattr(miner, "evaluate_variant", fake_evaluate)
+        first = runner.run_layer2_check(
+            db_path=db_path, shared_holdout_end_ms=SHARED_HOLDOUT_END_MS, now_ms=now_ms, symbols=("BTCUSDT",)
+        )
+        assert first.ran_confirmation is True
+
+        # Calling again at the SAME now_ms must not re-run a confirmation
+        # over an already-fully-consumed (zero-length) fresh window.
+        second = runner.run_layer2_check(
+            db_path=db_path, shared_holdout_end_ms=SHARED_HOLDOUT_END_MS, now_ms=now_ms, symbols=("BTCUSDT",)
+        )
+        assert second.ran_confirmation is False
+        assert second.fresh_days_available == 0.0

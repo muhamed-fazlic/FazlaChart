@@ -305,6 +305,39 @@ h1 .subtitle {
   flex: 0 0 auto;
 }
 
+/* Strategy Lab tab -- reuses the same disclaimer/meta/bucket-breakdown
+   visual language already established for the Istraživanje tab, plus a
+   couple of small generic helpers (.hidden, .muted-caption) used only by
+   this tab's graceful "database not built yet" state and per-section
+   one-line captions. */
+.hidden { display: none; }
+
+.muted-caption {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 2px 0 10px;
+  line-height: 1.4;
+}
+
+#strategy-lab-current-best .no-best-yet {
+  font-size: 13px;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.strategy-lab-best-card {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+  padding: 10px 0;
+}
+
+.strategy-lab-best-card .strategy-lab-best-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
 .backtest-equity-curve {
   margin: 0 20px 10px;
   padding: 12px 16px;
