@@ -55,14 +55,17 @@ if [ "$#" -eq 0 ]; then
     else
         PIT_ARGS=(--point-in-time-universe-cache "$PIT_CACHE")
     fi
+    # Always the plain (unsuffixed) canonical names here -- the python CLI's
+    # own _main() already suffixes --report-json/--trades-json and the
+    # experiment family by --strategy-variant (see report_path_for_variant()/
+    # family_suffix() in scanner/backtesting/strategy_variants.py). Suffixing
+    # here too would double it up (e.g. "..._report__inverted__inverted.json"),
+    # which is exactly the bug this comment replaced.
     REPORT_JSON="scanner_data/portfolio_backtest_report.json"
     TRADES_JSON="scanner_data/portfolio_backtest_trades.json"
     EXPERIMENT_FAMILY="portfolio_backtest_20symbol_warmup1500_full"
     VARIANT_ARGS=()
     if [ "$STRATEGY_VARIANT" != "original" ]; then
-        REPORT_JSON="scanner_data/portfolio_backtest_report__${STRATEGY_VARIANT}.json"
-        TRADES_JSON="scanner_data/portfolio_backtest_trades__${STRATEGY_VARIANT}.json"
-        EXPERIMENT_FAMILY="portfolio_backtest_20symbol_warmup1500_full__${STRATEGY_VARIANT}"
         VARIANT_ARGS=(--strategy-variant "$STRATEGY_VARIANT")
     fi
     set -- \

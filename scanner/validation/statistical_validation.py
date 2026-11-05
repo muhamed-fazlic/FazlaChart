@@ -89,8 +89,14 @@ class DeflatedSharpeResult:
     def likely_skill(self) -> bool:
         """True if DSR > 0.95 -- the conventional threshold at which the
         observed edge is considered unlikely to be explained by having
-        tried ``n_trials`` variants and gotten lucky with this one."""
-        return self.probabilistic_sharpe_ratio > 0.95
+        tried ``n_trials`` variants and gotten lucky with this one.
+
+        Explicitly cast to native ``bool`` -- ``probabilistic_sharpe_ratio``
+        can be a numpy scalar if it was derived from pandas/numpy arithmetic
+        upstream, and a bare ``>`` comparison on one yields ``numpy.bool_``,
+        which ``json.dump`` cannot serialize (and which, confusingly,
+        reports its type name as plain "bool" in newer numpy versions)."""
+        return bool(self.probabilistic_sharpe_ratio > 0.95)
 
 
 def _skewness(values: Sequence[float]) -> float:

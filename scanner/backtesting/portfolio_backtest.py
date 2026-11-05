@@ -135,6 +135,21 @@ from scanner.validation.walk_forward import (
 from tradingagents.dataflows.errors import VendorError
 
 
+def _json_default(obj: Any) -> Any:
+    """Fallback for ``json.dump``/``json.dumps`` calls below, for values
+    that turn out to be numpy scalars (e.g. ``numpy.bool_``/``numpy.float64``)
+    rather than native Python types -- these can silently creep in from
+    pandas/numpy arithmetic upstream (e.g. a ``>`` comparison on a value
+    derived from a pandas column) and would otherwise crash a run that can
+    take 30-90+ minutes, at the very last step of writing the report, after
+    all the real work is already done. numpy scalar types all expose a
+    stdlib-free ``.item()`` method that converts to the equivalent native
+    Python type; anything without one is a genuine serialization error."""
+    if hasattr(obj, "item"):
+        return obj.item()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 @dataclass
 class CandidateEvent:
     """One point in time where the live ranking logic would have surfaced a
@@ -663,7 +678,7 @@ def _build_statistical_validation(
                 "confidence_pct": block_bootstrap["confidence_pct"],
                 "block_size": block_bootstrap["block_size"],
                 "n_resamples": block_bootstrap["n_resamples"],
-                "edge_survives_lower_bound": block_bootstrap["ci_low"] > 0.0,
+                "edge_survives_lower_bound": bool(block_bootstrap["ci_low"] > 0.0),
             }
             if block_bootstrap is not None
             else None
@@ -1224,7 +1239,7 @@ def _main() -> None:
     )
     result = run_portfolio_backtest(config)
 
-    print(json.dumps(result.metrics, indent=2))
+    print(json.dumps(result.metrics, indent=2, default=_json_default))
     if result.skipped_symbols:
         print(f"\nSkipped (vendor error): {', '.join(result.skipped_symbols)}")
     if config.point_in_time_windows is not None:
@@ -1253,6 +1268,7 @@ def _main() -> None:
                 ],
                 fh,
                 indent=2,
+                default=_json_default,
             )
         print(f"Wrote {len(result.trades)} trades to {args.trades_json}")
 
@@ -1316,7 +1332,7 @@ def _main() -> None:
 
         report = build_dashboard_report(config, result, n_trials=n_trials, trial_sharpe_ratios=trial_sharpe_ratios)
         with open(report_json_path, "w", encoding="utf-8") as fh:
-            json.dump(report, fh, indent=2)
+            json.dump(report, fh, indent=2, default=_json_default)
         print(f"Wrote dashboard report to {report_json_path}")
 
 
