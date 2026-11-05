@@ -28,6 +28,7 @@
     <button type="button" class="tab-btn active" data-tab="scanner">📡 Scanner</button>
     <button type="button" class="tab-btn" data-tab="trades">📊 Analitika trejdova</button>
     <button type="button" class="tab-btn" data-tab="backtest">🧪 Backtest</button>
+    <button type="button" class="tab-btn" data-tab="research">🔬 Istraživanje</button>
   </nav>
 
   <div id="tab-scanner" class="tab-panel active">
@@ -183,6 +184,20 @@
     <section id="backtest-walk-forward-validation" class="bucket-breakdown muted">Učitavam walk-forward provjeru…</section>
 
     <section id="backtest-experiments" class="bucket-breakdown muted">Učitavam historiju eksperimenata…</section>
+  </div>
+
+  <div id="tab-research" class="tab-panel">
+    <section id="research-disclaimer" class="backtest-disclaimer">
+      🔬 Ovo je <strong>pregled istraživačkog registra</strong> — sažetak svih zatvorenih/trenutnih pre-registrovanih
+      hipoteza iz Phase 8 rigoroznog backtest istraživačkog programa. Read-only, ne osvježava se automatski niti
+      pokreće nove testove; brojevi se mijenjaju samo kad čovjek ručno zatvori novu hipotezu.
+    </section>
+
+    <section id="research-holdout-banner" class="backtest-meta muted">Učitavam istraživački registar…</section>
+
+    <div id="research-families"></div>
+
+    <section id="research-overall-note" class="trades-summary muted"></section>
   </div>
 
 

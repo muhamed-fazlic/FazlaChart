@@ -303,6 +303,16 @@ def _experiment_registry_path() -> str:
     return os.environ.get("EXPERIMENT_REGISTRY_PATH", "scanner_data/experiment_registry.db")
 
 
+def _research_registry_path() -> str:
+    """Read lazily so tests can point this at a throwaway file via the
+    RESEARCH_REGISTRY_PATH env var — mirrors ``_experiment_registry_path()``'s
+    convention. This is the curated Phase 8 "research registry" JSON
+    (closed/ongoing pre-registered hypothesis-testing families), hand
+    maintained by a human after each hypothesis is closed; this webapp
+    process only ever reads it."""
+    return os.environ.get("RESEARCH_REGISTRY_PATH", "scanner_data/research_registry.json")
+
+
 def _backtest_refresh_status_path(variant: str = DEFAULT_VARIANT_ID) -> str:
     """Mirrors ``_backtest_report_path()``'s env-var convention. Tracks the
     state of the background job launched by ``POST /api/backtest/refresh``
@@ -822,6 +832,26 @@ def backtest_experiments(limit: int = 50) -> dict[str, Any]:
     except sqlite3.Error as exc:
         raise HTTPException(status_code=500, detail=f"Could not read experiment registry: {exc}") from None
     return {"available": True, "experiments": experiments}
+
+
+@app.get("/api/research/registry")
+def research_registry() -> dict[str, Any]:
+    """Reads the curated Phase 8 research registry JSON (see
+    ``_research_registry_path()``) for the read-only "🔬 Istraživanje" tab —
+    a human-maintained summary of every closed/ongoing pre-registered
+    hypothesis-testing family, distinct from the live "🧪 Backtest" tab.
+
+    Returns ``{"available": False}`` rather than a 404/500 if the file
+    doesn't exist yet (mirrors ``backtest_experiments()`` above)."""
+    path = Path(_research_registry_path())
+    if not path.exists():
+        return {"available": False}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            registry = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read research registry: {exc}") from None
+    return {"available": True, **registry}
 
 
 @app.get("/api/backtest/cpu-limit")

@@ -307,10 +307,13 @@ function switchTab(tab) {
   document.getElementById("tab-scanner").classList.toggle("active", tab === "scanner");
   document.getElementById("tab-trades").classList.toggle("active", tab === "trades");
   document.getElementById("tab-backtest").classList.toggle("active", tab === "backtest");
+  document.getElementById("tab-research").classList.toggle("active", tab === "research");
   if (tab === "trades") {
     loadTradesTab();
   } else if (tab === "backtest") {
     loadBacktestTab();
+  } else if (tab === "research") {
+    loadResearchTab();
   }
 }
 
@@ -2032,3 +2035,171 @@ setInterval(loadHealth, 60000); // check more often than the data refresh itself
 setInterval(() => {
   if (document.getElementById("tab-trades").classList.contains("active")) loadTradesTab();
 }, REFRESH_MS);
+
+// --- Istraživanje: read-only summary of the Phase 8 research registry -----
+// Distinct from the live "🧪 Backtest" tab: this renders the curated,
+// human-maintained scanner_data/research_registry.json — a report card of
+// every closed/ongoing pre-registered hypothesis-testing family. One-time
+// fetch on first click (mirrors how loadBacktestTab() is only triggered by
+// switchTab()); the backing file only changes when a human closes a new
+// hypothesis, so there's no auto-refresh and no refresh button here.
+
+let researchLoaded = false;
+
+async function loadResearchTab() {
+  if (researchLoaded) return;
+  researchLoaded = true;
+  try {
+    const res = await fetch("/api/research/registry");
+    const data = await res.json();
+    if (!data.available) {
+      renderResearchUnavailable();
+    } else {
+      renderResearchHoldoutBanner(data.shared_holdout);
+      renderResearchFamilies(data.families || []);
+      renderResearchOverallNote(data.overall_note);
+    }
+  } catch (err) {
+    console.error("Could not load research registry:", err);
+    researchLoaded = false; // allow a retry on the next tab click
+    document.getElementById("research-holdout-banner").textContent = `Greška: ${err.message}`;
+  }
+}
+
+function renderResearchUnavailable() {
+  document.getElementById("research-holdout-banner").textContent = "Istraživački registar još nije dostupan.";
+  document.getElementById("research-holdout-banner").className = "backtest-meta muted";
+  document.getElementById("research-families").innerHTML = "";
+  document.getElementById("research-overall-note").textContent = "";
+  document.getElementById("research-overall-note").className = "trades-summary muted";
+}
+
+function renderResearchHoldoutBanner(sharedHoldout) {
+  const el = document.getElementById("research-holdout-banner");
+  if (!sharedHoldout) {
+    el.textContent = "";
+    el.className = "backtest-meta muted";
+    return;
+  }
+  el.className = "backtest-meta";
+  const endIso = sharedHoldout.end_timestamp_iso || "—";
+  const note = sharedHoldout.note || "";
+  el.innerHTML = `📅 Zajednička holdout granica: <b>${endIso}</b>${note ? ` — ${note}` : ""}`;
+}
+
+function renderResearchOverallNote(note) {
+  const el = document.getElementById("research-overall-note");
+  if (!note) {
+    el.textContent = "";
+    el.className = "trades-summary muted";
+    return;
+  }
+  el.className = "trades-summary";
+  el.innerHTML = `<b>Zaključak:</b> ${note}`;
+}
+
+// "no_edge"/"no_edge_decisive" render as a neutral/red "closed, no edge"
+// badge; anything else (not yet seen in today's data, but the schema
+// allows e.g. a future "edge_confirmed") falls back to a green "edge
+// potvrđen" style so new decisions don't need a code change to render
+// sensibly instead of falling into the closed-red bucket by default.
+const RESEARCH_DECISION_BADGES = {
+  no_edge: { label: "Zatvoreno — nema edge-a", cls: "research-badge-noedge" },
+  no_edge_decisive: { label: "Zatvoreno — odlučno nema edge-a", cls: "research-badge-noedge" },
+};
+
+function researchDecisionBadgeHtml(decision) {
+  const known = RESEARCH_DECISION_BADGES[decision];
+  if (known) return `<span class="research-badge ${known.cls}">${known.label}</span>`;
+  if (!decision) return `<span class="research-badge research-badge-unknown">U toku</span>`;
+  return `<span class="research-badge research-badge-confirmed">${decision}</span>`;
+}
+
+function researchCiRangeHtml(low, high, survives) {
+  if (low === null || low === undefined || high === null || high === undefined) return "—";
+  const indicator = survives === true ? " ✅" : survives === false ? " ❌" : "";
+  return `[${fmt(low)}%, ${fmt(high)}%]${indicator}`;
+}
+
+// Renders a labeled stat only if the value is actually present — the
+// variants array (family 1) deliberately has null fields per variant
+// (e.g. a frozen_baseline with no n_independent), and printing
+// "null"/"N/A" for every one of those would be noisier than just omitting
+// the row, per the task's "skip null fields gracefully" requirement.
+function researchStatRow(label, value) {
+  if (value === null || value === undefined || value === "") return "";
+  return `<tr><td class="muted">${label}</td><td>${value}</td></tr>`;
+}
+
+function renderResearchFlatFamilyStats(family) {
+  const rows = [
+    researchStatRow("Nezavisnih uzoraka (n)", family.n_independent),
+    researchStatRow("Potreban n (pre-registrovano)", family.n_required),
+    researchStatRow(
+      "Neto povrat (observed / CI)",
+      family.net_observed_pct !== null && family.net_observed_pct !== undefined
+        ? `${fmt(family.net_observed_pct)}% &nbsp; ${researchCiRangeHtml(family.net_ci_low_pct, family.net_ci_high_pct, family.net_edge_survives_lower_bound)}`
+        : null
+    ),
+    researchStatRow(
+      "Bruto povrat (observed / CI)",
+      family.gross_observed_pct !== null && family.gross_observed_pct !== undefined
+        ? `${fmt(family.gross_observed_pct)}% &nbsp; ${researchCiRangeHtml(family.gross_ci_low_pct, family.gross_ci_high_pct, family.gross_edge_survives_lower_bound)}`
+        : null
+    ),
+    researchStatRow("Mjerena sigma", family.measured_sigma_pct !== null && family.measured_sigma_pct !== undefined ? `${fmt(family.measured_sigma_pct)}%` : null),
+    researchStatRow("Win rate", family.win_rate_pct !== null && family.win_rate_pct !== undefined ? `${fmt(family.win_rate_pct)}%` : null),
+    researchStatRow("Prosječan dnevni turnover", family.avg_daily_turnover_pct !== null && family.avg_daily_turnover_pct !== undefined ? `${fmt(family.avg_daily_turnover_pct)}%` : null),
+    researchStatRow("BTC beta korelacija", family.btc_beta_correlation !== null && family.btc_beta_correlation !== undefined ? fmt(family.btc_beta_correlation, 4) : null),
+    researchStatRow("Nedecidirano?", family.undecidable === true ? "Da" : family.undecidable === false ? "Ne" : null),
+  ].join("");
+  if (!rows) return "";
+  return `<table class="bucket-breakdown-table research-stats-table"><tbody>${rows}</tbody></table>`;
+}
+
+function renderResearchVariant(variant) {
+  const rows = [
+    researchStatRow("n (nezavisni)", variant.n_independent),
+    researchStatRow(
+      "Neto povrat (observed / CI)",
+      variant.net_observed_pct !== null && variant.net_observed_pct !== undefined
+        ? `${fmt(variant.net_observed_pct)}% ${variant.net_ci_low_pct == null && variant.net_ci_high_pct == null ? "" : researchCiRangeHtml(variant.net_ci_low_pct, variant.net_ci_high_pct, variant.edge_survives_lower_bound)}`
+        : variant.net_ci_low_pct !== null && variant.net_ci_low_pct !== undefined
+          ? researchCiRangeHtml(variant.net_ci_low_pct, variant.net_ci_high_pct, variant.edge_survives_lower_bound)
+          : null
+    ),
+    researchStatRow("OOS pass count", variant.oos_pass_count),
+    researchStatRow("Independence pass count", variant.independence_pass_count),
+    researchStatRow("Walk-forward pass count", variant.walk_forward_pass_count),
+  ].join("");
+  return `
+    <div class="research-variant-card">
+      <div class="research-variant-name">${variant.name}</div>
+      <table class="bucket-breakdown-table research-stats-table"><tbody>${rows}</tbody></table>
+    </div>`;
+}
+
+function renderResearchFamilyCard(family) {
+  const statsHtml = Array.isArray(family.variants)
+    ? `<div class="research-variants-grid">${family.variants.map(renderResearchVariant).join("")}</div>`
+    : renderResearchFlatFamilyStats(family);
+  return `
+    <section class="bucket-breakdown research-family-card">
+      <div class="research-family-header">
+        <span class="bucket-breakdown-title">#${family.id} ${family.name}</span>
+        ${researchDecisionBadgeHtml(family.decision)}
+      </div>
+      <div class="muted research-family-doc">${family.doc || ""}</div>
+      ${statsHtml}
+      <p class="research-decision-text">${family.decision_text || ""}</p>
+    </section>`;
+}
+
+function renderResearchFamilies(families) {
+  const el = document.getElementById("research-families");
+  if (!families.length) {
+    el.innerHTML = `<p class="muted">Nema zabilježenih porodica u registru.</p>`;
+    return;
+  }
+  el.innerHTML = families.map(renderResearchFamilyCard).join("");
+}
