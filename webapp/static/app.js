@@ -2056,6 +2056,7 @@ async function loadResearchTab() {
       renderResearchUnavailable();
     } else {
       renderResearchHoldoutBanner(data.shared_holdout);
+      renderResearchMultipleTestingCounter(data.multiple_testing_counter);
       renderResearchFamilies(data.families || []);
       renderResearchOverallNote(data.overall_note);
     }
@@ -2096,6 +2097,30 @@ function renderResearchOverallNote(note) {
   }
   el.className = "trades-summary";
   el.innerHTML = `<b>Zaključak:</b> ${note}`;
+}
+
+// Keeps the project's running multiple-testing tally visible on the
+// dashboard itself, not just buried in markdown docs — explicitly counts
+// exploratory scans (Korak 10+) as "looks" even though they are not
+// pass/fail confirmatory tests, per the pre-registration discipline this
+// whole registry exists to enforce.
+function renderResearchMultipleTestingCounter(counter) {
+  const el = document.getElementById("research-multiple-testing");
+  if (!counter) {
+    el.innerHTML = "";
+    el.className = "bucket-breakdown muted";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const list = Array.isArray(counter.confirmatory_families_list)
+    ? counter.confirmatory_families_list.join(", ")
+    : "";
+  el.innerHTML = `
+    <span class="bucket-breakdown-title">🔢 Multiple-testing brojač</span>
+    <div class="research-mt-row">Konfirmatorne (pre-registrovane) porodice testirane: <b>${counter.confirmatory_families_tested ?? "—"}</b>${list ? ` (${list})` : ""}</div>
+    <div class="research-mt-row">Eksploratorni skenovi na čekanju/u toku: <b>${counter.exploratory_scans_pending ?? 0}</b></div>
+    ${counter.note ? `<div class="research-mt-note muted">${counter.note}</div>` : ""}
+  `;
 }
 
 // "no_edge"/"no_edge_decisive" render as a neutral/red "closed, no edge"
@@ -2147,6 +2172,7 @@ function renderResearchFlatFamilyStats(family) {
         ? `${fmt(family.gross_observed_pct)}% &nbsp; ${researchCiRangeHtml(family.gross_ci_low_pct, family.gross_ci_high_pct, family.gross_edge_survives_lower_bound)}`
         : null
     ),
+    family.gross_note ? `<tr><td class="muted">⚠️ napomena</td><td class="research-caveat">${family.gross_note}</td></tr>` : "",
     researchStatRow("Mjerena sigma", family.measured_sigma_pct !== null && family.measured_sigma_pct !== undefined ? `${fmt(family.measured_sigma_pct)}%` : null),
     researchStatRow("Win rate", family.win_rate_pct !== null && family.win_rate_pct !== undefined ? `${fmt(family.win_rate_pct)}%` : null),
     researchStatRow("Prosječan dnevni turnover", family.avg_daily_turnover_pct !== null && family.avg_daily_turnover_pct !== undefined ? `${fmt(family.avg_daily_turnover_pct)}%` : null),
@@ -2158,7 +2184,13 @@ function renderResearchFlatFamilyStats(family) {
 }
 
 function renderResearchVariant(variant) {
+  const metricTypeLabel = {
+    raw_full_period_net_pct: "sirovi, pun period (raw, nije block-bootstrap)",
+    block_bootstrap_per_trade_pct: "block-bootstrap prosjek po trejdu (primarna mjera)",
+  }[variant.metric_type];
   const rows = [
+    metricTypeLabel ? `<tr><td class="muted">mjera</td><td class="research-caveat">${metricTypeLabel}</td></tr>` : "",
+    researchStatRow("n (sirovi trejdovi)", variant.n_raw_trades),
     researchStatRow("n (nezavisni)", variant.n_independent),
     researchStatRow(
       "Neto povrat (observed / CI)",
@@ -2168,6 +2200,10 @@ function renderResearchVariant(variant) {
           ? researchCiRangeHtml(variant.net_ci_low_pct, variant.net_ci_high_pct, variant.edge_survives_lower_bound)
           : null
     ),
+    researchStatRow("Equity net profit % (NE primarna mjera)", variant.equity_net_profit_pct !== null && variant.equity_net_profit_pct !== undefined ? `${fmt(variant.equity_net_profit_pct)}%` : null),
+    variant.equity_vs_bootstrap_mismatch_note
+      ? `<tr><td class="muted">⚠️ napomena</td><td class="research-caveat">${variant.equity_vs_bootstrap_mismatch_note}</td></tr>`
+      : "",
     researchStatRow("OOS pass count", variant.oos_pass_count),
     researchStatRow("Independence pass count", variant.independence_pass_count),
     researchStatRow("Walk-forward pass count", variant.walk_forward_pass_count),

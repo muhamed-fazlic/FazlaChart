@@ -12,12 +12,13 @@
       "doc": "PHASE8_PROFITABILITY_RESEARCH_TODO.md (Korak 7)",
       "status": "closed",
       "decision": "no_edge",
-      "decision_text": "Nema dokazane edge nakon troskova. Original: 38 trejdova, -13.5%, 0/10 na sva tri testa. Inverted: -21 do -22%, win rate 53%, OOS 4/10 ali dijeli ~95% istih svijeca sa drugim runom (nije nezavisna replikacija); walk-forward 1/10.",
+      "decision_text": "Nema dokazane edge nakon troskova. Original (cist post-fix run, exp #13): 38 raw trejdova, -13.47%, 0/10 na sva tri nezavisna testa. Inverted (dva cista post-fix runa, exp #12 i #14, raw full-period): -22.11% i -21.10%, win rate ~53%, OOS 4/10 ali dijeli ~95% istih svijeca izmedju ta dva runa (nije nezavisna replikacija), walk-forward 1/10. Frozen-baseline run (train period, inverted): sirovi equity +3.66% preko 187 trejdova/103 nezavisna dogadjaja, ALI block-bootstrap prosjek po trejdu je -0.06% sa CI koji ne prelazi nulu - +3.66% je artefakt mjere, ne dokaz edge-a.",
       "variants": [
         {
-          "name": "original",
-          "n_independent": 38,
-          "net_observed_pct": -13.5,
+          "name": "original (exp #13, cist post-fix run, raw full-period)",
+          "metric_type": "raw_full_period_net_pct",
+          "n_raw_trades": 38,
+          "net_observed_pct": -13.47,
           "net_ci_low_pct": null,
           "net_ci_high_pct": null,
           "edge_survives_lower_bound": false,
@@ -26,21 +27,39 @@
           "walk_forward_pass_count": "0/10"
         },
         {
-          "name": "inverted",
-          "n_independent": 37,
-          "net_observed_pct": -12.1,
+          "name": "inverted (exp #12, cist post-fix run, raw full-period)",
+          "metric_type": "raw_full_period_net_pct",
+          "n_raw_trades": 225,
+          "net_observed_pct": -22.11,
           "net_ci_low_pct": null,
           "net_ci_high_pct": null,
           "edge_survives_lower_bound": false,
-          "oos_pass_count": "4/10 (nije nezavisno - ~95% istih svijeca)",
-          "independence_pass_count": null,
+          "oos_pass_count": "4/10 (dijeli ~95% istih svijeca sa exp #14 - nije nezavisna replikacija)",
+          "independence_pass_count": "3/10",
           "walk_forward_pass_count": "1/10"
         },
         {
-          "name": "frozen_baseline",
-          "net_observed_pct": null,
-          "net_ci_low_pct": -0.73,
-          "net_ci_high_pct": 0.34,
+          "name": "inverted (exp #14, cist post-fix run, raw full-period)",
+          "metric_type": "raw_full_period_net_pct",
+          "n_raw_trades": 220,
+          "net_observed_pct": -21.1,
+          "net_ci_low_pct": null,
+          "net_ci_high_pct": null,
+          "edge_survives_lower_bound": false,
+          "oos_pass_count": "4/10 (dijeli ~95% istih svijeca sa exp #12 - nije nezavisna replikacija)",
+          "independence_pass_count": "3/10",
+          "walk_forward_pass_count": "1/10"
+        },
+        {
+          "name": "inverted (frozen-baseline run, train period, block-bootstrap per-trade)",
+          "metric_type": "block_bootstrap_per_trade_pct",
+          "n_raw_trades": 187,
+          "n_independent": 103,
+          "equity_net_profit_pct": 3.66,
+          "equity_vs_bootstrap_mismatch_note": "Equity-krivulja pokazuje +3.66%, ali block-bootstrap prosjek po trejdu (ispravnija mjera) je blago negativan (-0.06%) - dvije mjere se ne slazu cak ni po predznaku, sto samo po sebi pokazuje da je efekat unutar suma.",
+          "net_observed_pct": -0.0624,
+          "net_ci_low_pct": -0.7293,
+          "net_ci_high_pct": 0.3423,
           "edge_survives_lower_bound": false
         }
       ]
@@ -64,6 +83,7 @@
       "gross_ci_low_pct": -0.3358,
       "gross_ci_high_pct": 0.0426,
       "gross_edge_survives_lower_bound": false,
+      "gross_note": "Bruto -0.1264% je tehnicki negativan, ali CI sadrzi nulu ([-0.3358%, +0.0426%]) - nula unutar suma, ne dokazan negativan bruto edge.",
       "measured_sigma_pct": 2.0614,
       "win_rate_pct": 45.76
     },
@@ -86,6 +106,7 @@
       "gross_ci_low_pct": -0.0246,
       "gross_ci_high_pct": 0.1872,
       "gross_edge_survives_lower_bound": false,
+      "gross_note": "Bruto +0.076% je tehnicki pozitivan, ali CI sadrzi nulu ([-0.0246%, +0.1872%]) - ovo NIJE tih dokaz edge-a, nego nula unutar suma.",
       "measured_sigma_pct": 1.1838,
       "win_rate_pct": 42.47,
       "avg_daily_turnover_pct": 72.71,
@@ -93,5 +114,12 @@
       "btc_beta_flag_triggered": false
     }
   ],
-  "overall_note": "Sve tri testirane porodice (direkcione i market-neutral) zatvorene su bez dokaza edge-a nakon troskova na 20-simbol Binance futures univerzumu, ~8-mjesecni period, 5m-24h horizonti. Sljedeca faza: eksploratorni sken (Korak 10) na prosirenom univerzumu (170 simbola, 3 tercila likvidnosti), obiljezen kao eksploratoran, ne konfirmatoran - rezultati ce biti dodani ovdje kada se zavrse."
+  "multiple_testing_counter": {
+    "confirmatory_families_tested": 3,
+    "confirmatory_families_list": ["#1 trend/anomaly", "#2 funding-extreme reversion", "#3 cross-sectional momentum"],
+    "exploratory_scans_pending": 1,
+    "note": "Porodica #4 (Korak 10, eksploratorni sken 170 simbola / 3 tercila) NE racuna se kao testirana konfirmatorna hipoteza - ulazi u sken, ne u pass/fail brojanje - ALI ulazi u ukupan broj 'pogleda' na iste trening podatke za svrhu multiple-testing racunovodstva. Bilo koja buduca pre-registrovana potvrda izvedena iz tog skena mora koristiti NOVE podatke koje sken nije vec vidio na train strani; trosenje postojeceg zakljucanog holdout-a na tu potvrdu je odvojena odluka o resursu, ne automatski default."
+  },
+  "exploratory_scans": [],
+  "overall_note": "Sve tri testirane porodice (direkcione i market-neutral) zatvorene su bez dokaza edge-a nakon troskova na 20-simbol Binance futures univerzumu, ~8-mjesecni period, 5m-24h horizonti. Sljedeca faza: eksploratorni sken (Korak 10) na prosirenom univerzumu (170 simbola, 3 tercila likvidnosti), obiljezen kao eksploratoran, ne konfirmatoran - rezultati ce biti dodani u exploratory_scans kada se zavrse (ciji izlaz je 'gdje traziti', ne 'sta radi')."
 }

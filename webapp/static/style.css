@@ -275,9 +275,28 @@ h1 .subtitle {
   white-space: nowrap;
 }
 
-.research-badge-noedge { background: rgba(248, 81, 73, 0.15); color: var(--red); border: 1px solid rgba(248, 81, 73, 0.4); }
+.research-badge-noedge { background: rgba(139, 148, 158, 0.15); color: var(--muted); border: 1px solid rgba(139, 148, 158, 0.4); }
 .research-badge-confirmed { background: rgba(63, 185, 80, 0.15); color: var(--green); border: 1px solid rgba(63, 185, 80, 0.4); }
 .research-badge-unknown { background: rgba(210, 153, 34, 0.15); color: var(--yellow); border: 1px solid rgba(210, 153, 34, 0.4); }
+
+.research-caveat {
+  font-style: italic;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  max-width: 480px;
+}
+
+.research-mt-row {
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+.research-mt-note {
+  font-size: 12px;
+  margin-top: 6px;
+  line-height: 1.5;
+}
 
 .backtest-meta {
   margin: 10px 20px 0;
