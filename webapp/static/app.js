@@ -586,6 +586,7 @@ async function loadBacktestTab() {
       renderBacktestUnavailable();
     } else {
       renderBacktestMeta(report);
+      renderBacktestFullConfig(report.config);
       renderBacktestSummary(report.metrics);
       renderBacktestEquityCurve(report.equity_curve, report.config ? report.config.initial_capital : 10000);
       const breakdown = report.breakdown || {};
@@ -593,6 +594,7 @@ async function loadBacktestTab() {
       renderBacktestBreakdownTable("backtest-breakdown-direction", "Po smjeru", breakdown.by_direction, "Smjer");
       renderBacktestBreakdownTable("backtest-breakdown-label", "Po label-u (setup tipu)", breakdown.by_label, "Label");
       renderStatisticalValidation(report.statistical_validation);
+      renderOosValidation(report.oos_validation);
     }
   } catch (err) {
     console.error("Could not load backtest report:", err);
@@ -641,6 +643,52 @@ function renderStatisticalValidation(dsr) {
       <div class="trades-summary-card"><span class="label">Skewness</span><span class="value">${fmt(dsr.skewness, 3)}</span></div>
       <div class="trades-summary-card"><span class="label">Kurtosis</span><span class="value">${fmt(dsr.kurtosis, 3)}</span></div>
     </div>`;
+}
+
+// Phase 8 Korak 6 (audit follow-up): per (label, horizon) check of whether
+// the win rate measured on the most-recent held-out test window still
+// clears 50% -- a label can look great pooled over the whole history and
+// still be a pure in-sample artifact. This is a check ON individual labels'
+// edges, same spirit as the DSR check above being a check on the portfolio
+// Sharpe as a whole.
+function renderOosValidation(oos) {
+  const el = document.getElementById("backtest-oos-validation");
+  if (!oos || !oos.length) {
+    el.className = "bucket-breakdown muted";
+    el.textContent =
+      "Nema in/out-of-sample provjere u ovom izvještaju (isključena preko --no-oos-validation, ili nema dovoljno slučajeva).";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = oos
+    .map((r) => {
+      const badge = r.holds_up
+        ? '<span class="pos">drži se</span>'
+        : `<span class="neg">${r.warning ? "ne drži se" : "slabije na test prozoru"}</span>`;
+      return `
+    <tr>
+      <td><b>${r.label}</b></td>
+      <td>${r.direction ?? "—"}</td>
+      <td>${r.horizon_candles}</td>
+      <td>${r.train_n} (${r.train_win_rate_pct != null ? fmt(r.train_win_rate_pct, 1) + "%" : "—"})</td>
+      <td>${r.test_n} (${r.test_win_rate_pct != null ? fmt(r.test_win_rate_pct, 1) + "%" : "—"}, CI low ${r.test_win_rate_ci_low_pct != null ? fmt(r.test_win_rate_ci_low_pct, 1) + "%" : "—"})</td>
+      <td>${badge}</td>
+      <td class="muted">${r.warning ?? ""}</td>
+    </tr>`;
+    })
+    .join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">
+      🔁 In/Out-of-sample provjera (po label-u) — da li se edge drži i na najnovijim, do sada neviđenim slučajevima
+    </div>
+    <p class="dsr-explainer muted">
+      "Train" je sve osim posljednjeg test prozora; "Test" je samo taj najnoviji, nikad-korišten dio. Ako je
+      train win rate dobar a test loš, taj label je vjerovatno in-sample artefakt, ne pravi edge.
+    </p>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Label</th><th>Smjer</th><th>Horizon</th><th>Train N (win%)</th><th>Test N (win%, CI low)</th><th>Status</th><th>Napomena</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 // Deliberately a separate fetch from loadBacktestTab's try/catch -- the
@@ -703,6 +751,10 @@ function renderBacktestUnavailable() {
   });
   document.getElementById("backtest-statistical-validation").className = "trades-summary muted";
   document.getElementById("backtest-statistical-validation").textContent = "";
+  document.getElementById("backtest-full-config").className = "bucket-breakdown muted";
+  document.getElementById("backtest-full-config").textContent = "";
+  document.getElementById("backtest-oos-validation").className = "bucket-breakdown muted";
+  document.getElementById("backtest-oos-validation").textContent = "";
 }
 
 function renderBacktestMeta(report) {
@@ -720,6 +772,59 @@ function renderBacktestMeta(report) {
     html += ` &middot; <span class="muted">point-in-time univerzum: nije korišten (simboli birani unazad na osnovu današnje likvidnosti — survivorship bias nije ispravljen)</span>`;
   }
   el.innerHTML = html;
+}
+
+// Full execution-assumption transparency: every config value that actually
+// affects the simulated numbers above, not just the headline few (symbols/
+// timeframes/warmup/cost) shown in the compact meta line. Anything added to
+// `build_dashboard_report()`'s config dict in portfolio_backtest.py should
+// also get a row here, or it's silently unauditable from the dashboard.
+function renderBacktestFullConfig(cfg) {
+  const el = document.getElementById("backtest-full-config");
+  if (!cfg) {
+    el.className = "bucket-breakdown muted";
+    el.textContent = "";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = [
+    ["Početni kapital", `$${fmt(cfg.initial_capital, 0)}`],
+    ["Rizik po trejdu", `${cfg.risk_per_trade_pct ?? "—"}%`],
+    ["Max konkurentnih pozicija", cfg.max_concurrent_positions ?? "—"],
+    ["Max isti smjer odjednom", cfg.max_concurrent_per_direction ?? "—"],
+    ["Broj svijeća po simbolu (kline_limit)", cfg.kline_limit ?? "—"],
+    ["Dodatni slippage", `${cfg.extra_slippage_pct ?? 0}%`],
+    [
+      "Per-simbol cost tier-ovi",
+      cfg.use_symbol_cost_tiers
+        ? '<span class="pos">uključeno</span> (tier-1 majori po base trošku, ostali s nadoplatom)'
+        : '<span class="muted">isključeno</span> (svaki simbol plaća isti flat trošak)',
+    ],
+    [
+      "Funding cost (perpetual swap)",
+      cfg.include_funding_cost
+        ? '<span class="pos">uključen</span> (stvarna historija funding rate-a naplaćena po trejdu)'
+        : '<span class="muted">isključen</span> (trošak finansiranja pozicije nije uračunat)',
+    ],
+    [
+      "SL/TP tie-break",
+      cfg.sl_tp_tie_break === "optimistic"
+        ? '<span class="neg">optimistic</span> (pretpostavlja da je TP pogođen prvi kad su oba u istoj svijeći — gornja granica)'
+        : '<span class="pos">conservative</span> (pretpostavlja da je SL pogođen prvi kad su oba u istoj svijeći — nikad ne precjenjuje edge)',
+    ],
+    [
+      "In/out-of-sample provjera",
+      cfg.include_oos_validation
+        ? `<span class="pos">uključena</span> (test prozor: posljednjih ${Math.round((cfg.oos_test_fraction ?? 0) * 100)}% slučajeva, min. ${cfg.oos_min_test_n ?? "—"} za pouzdanost)`
+        : '<span class="muted">isključena</span>',
+    ],
+  ];
+  const tableRows = rows.map(([label, value]) => `<tr><td>${label}</td><td>${value}</td></tr>`).join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">⚙️ Puna konfiguracija ovog backtest-a (sve pretpostavke koje utiču na brojeve iznad)</div>
+    <table class="bucket-breakdown-table">
+      <tbody>${tableRows}</tbody>
+    </table>`;
 }
 
 function renderBacktestSummary(metrics) {

@@ -90,10 +90,14 @@ from scanner.backtesting.historical_universe import (
 from scanner.calibration import (
     DEFAULT_ROUND_TRIP_COST_PCT,
     LABEL_DIRECTION,
+    OOS_MIN_TEST_N,
+    OOS_TEST_FRACTION,
     LabeledCase,
+    OutOfSampleResult,
     backtest_symbol,
     load_extended_history,
     round_trip_cost_pct_for,
+    validate_out_of_sample,
     wilson_score_interval,
 )
 from scanner.signal_tracking import TIMEFRAME_MINUTES
@@ -187,6 +191,26 @@ class PortfolioBacktestConfig:
     # backtest_symbol without a funding_events kwarg are unaffected unless
     # they opt in.
     include_funding_cost: bool = False
+    # Phase 8 Korak 5 (execution realism): how to resolve a single candle
+    # whose high/low range touches BOTH the stop and the target -- OHLC data
+    # alone can't say which was hit first. "conservative" (default,
+    # unchanged behaviour) assumes the stop hit first, never overstating a
+    # label's edge. "optimistic" assumes the target hit first -- run the
+    # same backtest with both and compare: if the win rate swings wildly,
+    # that label's apparent edge is mostly an artifact of this ambiguity,
+    # not a real signal. See scanner.calibration._walk_forward_exit's
+    # docstring for the full explanation (incl. why a true higher-
+    # resolution fix is NOT implemented).
+    sl_tp_tie_break: str = "conservative"
+    # Phase 8 Korak 6 (audit follow-up): in-sample/out-of-sample split check
+    # (scanner.calibration.validate_out_of_sample) -- flags labels whose
+    # apparent edge only held up on the data used to measure it, not on the
+    # held-out most-recent `oos_test_fraction` of cases. Pure re-computation
+    # on cases already fetched for the backtest (no extra network calls), so
+    # unlike include_funding_cost this is safe to default to True.
+    include_oos_validation: bool = True
+    oos_test_fraction: float = OOS_TEST_FRACTION
+    oos_min_test_n: int = OOS_MIN_TEST_N
     # Phase 8 Korak 4 (survivorship-bias fix): when set, any candidate event
     # whose symbol was NOT in the point-in-time top-N universe at its own
     # entry_time is dropped before the portfolio simulation runs -- i.e. a
@@ -209,6 +233,12 @@ class PortfolioBacktestResult:
     # their symbol was not in the point-in-time universe at entry_time (0 if
     # config.point_in_time_windows was None, i.e. the filter was off).
     point_in_time_filtered_count: int = 0
+    # Phase 8 Korak 6 (audit follow-up): in/out-of-sample split check, one
+    # entry per (label, horizon) seen across every symbol/timeframe in this
+    # run -- pooled across the whole universe since OutOfSampleResult groups
+    # by label, not by symbol. Empty if config.include_oos_validation is
+    # False or there were no cases at all.
+    oos_validation: list[OutOfSampleResult] = field(default_factory=list)
 
 
 def _parse_time(iso_timestamp: str) -> datetime:
@@ -558,6 +588,11 @@ def build_dashboard_report(
             "extra_slippage_pct": config.extra_slippage_pct,
             "use_symbol_cost_tiers": config.use_symbol_cost_tiers,
             "include_funding_cost": config.include_funding_cost,
+            "sl_tp_tie_break": config.sl_tp_tie_break,
+            "include_oos_validation": config.include_oos_validation,
+            "oos_test_fraction": config.oos_test_fraction,
+            "oos_min_test_n": config.oos_min_test_n,
+            "point_in_time_universe_cache_path": config.point_in_time_universe_cache_path,
         },
         "metrics": result.metrics,
         "skipped_symbols": result.skipped_symbols,
@@ -568,6 +603,21 @@ def build_dashboard_report(
         },
         "equity_curve": equity_curve,
         "statistical_validation": _build_statistical_validation(result, n_trials, trial_sharpe_ratios),
+        "oos_validation": [
+            {
+                "label": r.label,
+                "direction": r.direction,
+                "horizon_candles": r.horizon_candles,
+                "train_n": r.train_n,
+                "train_win_rate_pct": r.train_win_rate_pct,
+                "test_n": r.test_n,
+                "test_win_rate_pct": r.test_win_rate_pct,
+                "test_win_rate_ci_low_pct": r.test_win_rate_ci_low_pct,
+                "holds_up": r.holds_up,
+                "warning": r.warning,
+            }
+            for r in result.oos_validation
+        ],
         "point_in_time_universe": (
             {
                 "enabled": True,
@@ -587,6 +637,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
     trading them subject to concurrency/direction caps and fixed-fractional
     position sizing."""
     all_events: list[CandidateEvent] = []
+    all_cases: list[LabeledCase] = []
     skipped: list[str] = []
 
     for symbol in config.symbols:
@@ -610,16 +661,21 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
                     kwargs: dict[str, Any] = {"history": history}
                     if config.include_funding_cost:
                         kwargs["funding_events"] = funding_events
+                    if config.sl_tp_tie_break != "conservative":
+                        kwargs["sl_tp_tie_break"] = config.sl_tp_tie_break
                     cases = backtest_symbol(symbol, timeframe, horizons=(config.horizon_candles,), **kwargs)
                 else:
                     decision_start_time = None
                     kwargs = {"limit": config.kline_limit}
                     if config.include_funding_cost:
                         kwargs["funding_events"] = funding_events
+                    if config.sl_tp_tie_break != "conservative":
+                        kwargs["sl_tp_tie_break"] = config.sl_tp_tie_break
                     cases = backtest_symbol(symbol, timeframe, horizons=(config.horizon_candles,), **kwargs)
             except VendorError:
                 skipped.append(f"{symbol}:{timeframe}")
                 continue
+            all_cases.extend(cases)
             min_n = BEST_SIGNAL_MIN_SAMPLE_SIZE.get(timeframe, _DEFAULT_MIN_SAMPLE_SIZE)
             all_events.extend(
                 _build_candidate_events(
@@ -715,12 +771,26 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
         _close(position)
 
     metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples)
+    oos_validation: list[OutOfSampleResult] = []
+    if config.include_oos_validation and all_cases:
+        oos_validation = validate_out_of_sample(
+            all_cases,
+            cost_pct=config.round_trip_cost_pct,
+            test_fraction=config.oos_test_fraction,
+            min_test_n=config.oos_min_test_n,
+        )
+        # Pooled summary rides along in `metrics` so it also lands "for free"
+        # in the experiment registry's result_json (see record_experiment
+        # below), not just in this run's own report.
+        metrics["oos_labels_holding_up"] = sum(1 for r in oos_validation if r.holds_up)
+        metrics["oos_labels_total"] = len(oos_validation)
     return PortfolioBacktestResult(
         trades=trades,
         equity_curve=equity_curve,
         metrics=metrics,
         skipped_symbols=skipped,
         point_in_time_filtered_count=point_in_time_filtered_count,
+        oos_validation=oos_validation,
     )
 
 
@@ -766,6 +836,35 @@ def _main() -> None:
         "because it requires one network call per symbol.",
     )
     parser.add_argument(
+        "--sl-tp-tie-break",
+        choices=["conservative", "optimistic"],
+        default="conservative",
+        help="Phase 8 Korak 5: how to resolve a candle whose range touches both SL and TP in the same bar. "
+        "'conservative' (default) assumes the stop hit first, never overstating a label's edge. 'optimistic' "
+        "assumes the target hit first -- run both and compare win rates to see how much of a label's apparent "
+        "edge depends on this ambiguity.",
+    )
+    parser.add_argument(
+        "--no-oos-validation",
+        action="store_true",
+        help="Phase 8 Korak 6: skip the in-sample/out-of-sample split check (scanner.calibration."
+        "validate_out_of_sample). On by default -- it's pure re-computation on cases already fetched, no extra "
+        "network calls.",
+    )
+    parser.add_argument(
+        "--oos-test-fraction",
+        type=float,
+        default=OOS_TEST_FRACTION,
+        help="Most-recent fraction of each (label, horizon)'s cases held out as the out-of-sample test window "
+        f"(default {OOS_TEST_FRACTION}).",
+    )
+    parser.add_argument(
+        "--oos-min-test-n",
+        type=int,
+        default=OOS_MIN_TEST_N,
+        help=f"Minimum held-out test cases required before an OOS result is trusted (default {OOS_MIN_TEST_N}).",
+    )
+    parser.add_argument(
         "--point-in-time-universe-cache",
         help="Phase 8 Korak 4: path to a cache produced by "
         "'python -m scanner.backtesting.historical_universe'. When given, any trade whose symbol was not in "
@@ -809,6 +908,10 @@ def _main() -> None:
         extra_slippage_pct=args.extra_slippage_pct,
         use_symbol_cost_tiers=not args.no_symbol_cost_tiers,
         include_funding_cost=args.include_funding_cost,
+        sl_tp_tie_break=args.sl_tp_tie_break,
+        include_oos_validation=not args.no_oos_validation,
+        oos_test_fraction=args.oos_test_fraction,
+        oos_min_test_n=args.oos_min_test_n,
         point_in_time_windows=point_in_time_windows,
         point_in_time_universe_cache_path=args.point_in_time_universe_cache,
     )
@@ -869,6 +972,10 @@ def _main() -> None:
                     "warmup_candles": config.warmup_candles,
                     "use_symbol_cost_tiers": config.use_symbol_cost_tiers,
                     "include_funding_cost": config.include_funding_cost,
+                    "sl_tp_tie_break": config.sl_tp_tie_break,
+                    "include_oos_validation": config.include_oos_validation,
+                    "oos_test_fraction": config.oos_test_fraction,
+                    "oos_min_test_n": config.oos_min_test_n,
                 },
                 n_trades=result.metrics.get("n_trades"),
                 sharpe_ratio=result.metrics.get("sharpe_ratio"),

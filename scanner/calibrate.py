@@ -13,6 +13,7 @@ import sys
 from rich.console import Console
 from rich.table import Table
 
+from scanner.backtesting.funding_simulator import fetch_funding_history
 from scanner.calibration import CalibrationStats, backtest_symbol, summarize
 
 console = Console(width=150)
@@ -25,6 +26,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--horizons", type=str, default="4,12,24", help="Forward horizons in candles, comma-separated")
     parser.add_argument("--limit", type=int, default=1500, help="Historical candles to fetch (Binance max 1500)")
     parser.add_argument("--cost-pct", type=float, default=0.10, help="Round-trip trading cost, in percent")
+    parser.add_argument(
+        "--sl-tp-tie-break",
+        choices=["conservative", "optimistic"],
+        default="conservative",
+        help="How to resolve a candle whose range touches both SL and TP in the same bar -- see "
+        "scanner.calibration._walk_forward_exit's docstring. 'conservative' (default) never overstates the "
+        "edge; 'optimistic' is an explicit upper-bound comparison.",
+    )
+    parser.add_argument(
+        "--include-funding-cost",
+        action="store_true",
+        help="Fetch this symbol's real Binance funding-rate settlement history and charge every case the "
+        "funding it would actually have accrued between entry and exit. Off by default (one network call "
+        "per symbol).",
+    )
     return parser.parse_args(argv)
 
 
@@ -64,7 +80,12 @@ def main(argv: list[str] | None = None) -> None:
 
     for symbol in symbols:
         console.print(f"[bold]Backtesting {symbol} ({args.timeframe}, last {args.limit} candles)...[/bold]")
-        cases = backtest_symbol(symbol, args.timeframe, horizons, limit=args.limit)
+        kwargs: dict = {}
+        if args.include_funding_cost:
+            kwargs["funding_events"] = fetch_funding_history(symbol)
+        if args.sl_tp_tie_break != "conservative":
+            kwargs["sl_tp_tie_break"] = args.sl_tp_tie_break
+        cases = backtest_symbol(symbol, args.timeframe, horizons, limit=args.limit, **kwargs)
         stats = summarize(cases, cost_pct=args.cost_pct)
         if not stats:
             console.print(f"[yellow]No cases produced for {symbol} — not enough history for the chosen horizons.[/yellow]")

@@ -447,8 +447,121 @@ class TestCostTierAndFundingWiring:
         assert fetch_calls == ["BTCUSDT"]
         assert received_funding_events == [sentinel_events, sentinel_events]
 
+    def test_default_tie_break_never_passes_kwarg_to_old_style_lambda(self, monkeypatch):
+        """Default ('conservative') must stay compatible with old-style
+        monkeypatched `backtest_symbol` lambdas that don't accept an
+        `sl_tp_tie_break` kwarg at all -- this would raise a TypeError if
+        the wiring always passed it unconditionally."""
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        result = run_portfolio_backtest(self._config())
+        assert result.trades
+
+    def test_optimistic_tie_break_is_forwarded_to_backtest_symbol(self, monkeypatch):
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        from scanner.backtesting import portfolio_backtest as module
+
+        received_tie_breaks = []
+
+        def fake_backtest_symbol(symbol, timeframe, horizons, limit, sl_tp_tie_break="conservative"):
+            received_tie_breaks.append(sl_tp_tie_break)
+            return warm_up
+
+        monkeypatch.setattr(module, "backtest_symbol", fake_backtest_symbol)
+        config = self._config(timeframes=("1h", "4h"), sl_tp_tie_break="optimistic")
+        run_portfolio_backtest(config)
+
+        assert received_tie_breaks == ["optimistic", "optimistic"]
 
 
+class TestOosValidationWiring:
+    """Phase 8 Korak 6 (audit follow-up): in/out-of-sample validation is
+    pure re-computation on cases already fetched for the backtest, so it is
+    wired on by default, with its pooled summary riding along in
+    `result.metrics` for the experiment registry, and its full per-label
+    detail in `result.oos_validation` for the dashboard report."""
+
+    def _config(self, **overrides) -> PortfolioBacktestConfig:
+        base = {
+            "symbols": ("BTCUSDT",),
+            "timeframes": ("1h",),
+            "initial_capital": 10_000.0,
+            "risk_per_trade_pct": 1.0,
+            "max_concurrent_positions": 5,
+            "max_concurrent_per_direction": 5,
+            "round_trip_cost_pct": 0.0,
+            "extra_slippage_pct": 0.0,
+            "warmup_candles": 0,
+            "horizon_candles": 1,
+        }
+        base.update(overrides)
+        return PortfolioBacktestConfig(**base)
+
+    def test_default_calls_validate_out_of_sample_and_merges_summary_into_metrics(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+        from scanner.calibration import OutOfSampleResult
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        fake_oos = [
+            OutOfSampleResult(
+                label="trend:bullish",
+                direction="long",
+                horizon_candles=1,
+                train_n=30,
+                train_win_rate_pct=60.0,
+                test_n=15,
+                test_win_rate_pct=55.0,
+                test_win_rate_ci_low_pct=48.0,
+                holds_up=False,
+                warning="test",
+            )
+        ]
+        monkeypatch.setattr(module, "validate_out_of_sample", lambda *a, **kw: fake_oos)
+
+        result = run_portfolio_backtest(self._config())
+
+        assert result.oos_validation == fake_oos
+        assert result.metrics["oos_labels_total"] == 1
+        assert result.metrics["oos_labels_holding_up"] == 0
+
+    def test_include_oos_validation_false_skips_it_entirely(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        called = []
+        monkeypatch.setattr(module, "validate_out_of_sample", lambda *a, **kw: called.append(1) or [])
+
+        result = run_portfolio_backtest(self._config(include_oos_validation=False))
+
+        assert called == []
+        assert result.oos_validation == []
+        assert "oos_labels_total" not in result.metrics
+
+    def test_oos_test_fraction_and_min_test_n_are_forwarded(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        received = {}
+
+        def fake_validate(cases, cost_pct, test_fraction, min_test_n):
+            received["cost_pct"] = cost_pct
+            received["test_fraction"] = test_fraction
+            received["min_test_n"] = min_test_n
+            return []
+
+        monkeypatch.setattr(module, "validate_out_of_sample", fake_validate)
+        config = self._config(round_trip_cost_pct=0.2, oos_test_fraction=0.25, oos_min_test_n=10)
+        run_portfolio_backtest(config)
+
+        assert received == {"cost_pct": 0.2, "test_fraction": 0.25, "min_test_n": 10}
+
+
+class TestMetricsComputation:
     def test_known_trades_produce_expected_net_profit_and_win_rate(self):
         from scanner.backtesting.portfolio_backtest import Trade
 
@@ -553,14 +666,50 @@ class TestDashboardReport:
         equity_curve = [(t1_res, 10_200.0), (t2_res, 10_098.0)]
         config = PortfolioBacktestConfig(symbols=("BTCUSDT", "ETHUSDT"), initial_capital=10_000.0)
         metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples=[1, 1])
+        from scanner.calibration import OutOfSampleResult
+
+        oos_validation = [
+            OutOfSampleResult(
+                label="trend:bullish",
+                direction="long",
+                horizon_candles=1,
+                train_n=30,
+                train_win_rate_pct=60.0,
+                test_n=25,
+                test_win_rate_pct=56.0,
+                test_win_rate_ci_low_pct=52.0,
+                holds_up=True,
+                warning=None,
+            )
+        ]
         result = PortfolioBacktestResult(
-            trades=trades, equity_curve=equity_curve, metrics=metrics, skipped_symbols=["BADUSDT"]
+            trades=trades,
+            equity_curve=equity_curve,
+            metrics=metrics,
+            skipped_symbols=["BADUSDT"],
+            oos_validation=oos_validation,
         )
 
         report = build_dashboard_report(config, result)
 
         assert "generated_at" in report
         assert report["config"]["symbols"] == ["BTCUSDT", "ETHUSDT"]
+        assert report["config"]["sl_tp_tie_break"] == "conservative"
+        assert report["config"]["include_oos_validation"] is True
+        assert report["oos_validation"] == [
+            {
+                "label": "trend:bullish",
+                "direction": "long",
+                "horizon_candles": 1,
+                "train_n": 30,
+                "train_win_rate_pct": 60.0,
+                "test_n": 25,
+                "test_win_rate_pct": 56.0,
+                "test_win_rate_ci_low_pct": 52.0,
+                "holds_up": True,
+                "warning": None,
+            }
+        ]
         assert report["metrics"]["n_trades"] == 2
         assert report["skipped_symbols"] == ["BADUSDT"]
 
