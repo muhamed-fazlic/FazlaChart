@@ -65,6 +65,49 @@ pozitivan nakon troskova.
   4h ili 24h) je ZASEBNA hipoteza i broji se kao zaseban pokusaj (trial) u
   multiple-testing racunovodstvu — ne "jos jedan pokusaj iste hipoteze".
 
+### 2a. Ispravka cinjenica o dubini funding podataka (dodano 2026-11-05, prije prvog runa)
+
+Ovo NIJE izmjena specifikacije (prag, prozor i izlaz ostaju isti kao gore),
+nego ispravka pogresne tehnicke pretpostavke otkrivene provjerom PRIJE
+pisanja signal-koda:
+
+- Binance `/fapi/v1/fundingRate` je DOKUMENTOVAN kao "max 1000" po upitu,
+  ali je EMPIRIJSKI izmjereno (direktan API poziv, 2026-11-05) da stvarno
+  vraca najvise **500** zapisa po upitu bez obzira na trazeni `limit` —
+  tj. jedan upit pokriva ~166.7 dana (500 * 8h), ne ~333 dana. Ovo je
+  ispravljeno u kodu (`fetch_full_funding_history`, paginacija preko
+  `endTime` istim obrascem kao za svijece).
+- Sa paginacijom, STVARNA funding istorija ide mnogo dalje unazad nego
+  nasa postojeca svijeca-istorija (~8 mjeseci): izmjereno 2026-11-05,
+  anchored na vec zamrznutu holdout granicu
+  (`end_timestamp_ms=1790253820000`), svih 20 simbola ima izmedju **805 i
+  2481 dana** upotrebljivog perioda (nakon 90-dnevnog warm-upa) funding
+  podataka — daleko vise od candle-podataka.
+- **Zakljucak:** funding istorija NIJE ogranicavajuci faktor. Stvarna
+  granica perioda signala ostaje dubina POSTOJECE candle-istorije
+  (~8 mjeseci, isti prozor koji je vec koristen za zatvorenu trend/anomaly
+  porodicu), jer je candle-podatak potreban za ulaz/izlaz po tacnom
+  vremenu i za troskove. Period signala = presjek (funding istorija) ∩
+  (candle istorija), do istog zamrznutog `end_timestamp_ms` za train period.
+  Realno ocekivanje ostaje ~5 mjeseci upotrebljivog train perioda nakon
+  90-dnevnog warm-upa (vidi sekciju 5) — i dalje malo, pa "neodlucivo"
+  ostaje najvjerovatniji ishod.
+- **ONDOUSDT i TAOUSDT:** cak i sa punom paginacijom imaju manje ukupne
+  istorije (977 i 895 dana ukupno od listinga) nego ostali simboli, ali i
+  dalje vise nego dovoljno za 90-dnevni warm-up + ~5-mjesecni train period
+  — ostaju u univerzumu bez izmjene (pravilo minimuma opservacija je vec
+  zamrznuto u sekciji 2 i prirodno ih propusta tek kad stignu do minimuma).
+- **Holdout:** paginacija sama po sebi moze povuci zapise i nakon
+  `end_timestamp_ms` ako se ne prosledi eksplicitno. Kod
+  (`fetch_full_funding_history(symbol, end_time_ms=...)`) STROGO filtrira
+  sve zapise nakon `end_time_ms` prije vracanja — holdout ne moze procuriti
+  kroz ovaj (funding) data-izvor.
+- **Dataset hash:** funding zapisi se sad kesiraju i hesiraju
+  (`cached_fetch_full_funding_history` / `funding_dataset_fingerprint` u
+  `scanner/backtesting/data_snapshot.py`), kombinovano sa postojecim
+  candle-hashom preko `combined_dataset_fingerprint`, tako da jedan
+  `dataset_hash` po trial-u pokriva OBA izvora podataka.
+
 ## 3. Zakljucani period / holdout
 
 - **Train/validation period:** sve dostupne svijece do
