@@ -870,7 +870,58 @@ pre-registrovanu hipotezu (ne za ovu, koja je vec zatvorena bez potrebe da
 ga koristi). Sljedeci korak: pre-registracija za funding/OI porodicu
 hipoteza (vidi sljedeci Korak).
 
-     u `tests/test_statistical_validation.py` + 4 wiring testa u
+## Korak 8 — "Funding-extreme reversion" hipoteza (trial/porodica #2) — ZAVRSENO, ZATVORENO
+
+Puna pre-registracija: `PREREGISTRATION_FUNDING_EXTREME_REVERSION.md` (hipoteza,
+zamrznuta specifikacija, zakljucani period, kriterij uspjeha, minimalni N,
+multiple-testing racunovodstvo — sve zapisano PRIJE prvog reda koda).
+
+**Infrastruktura dodana usput (ne tuniranje, cisto-tehnicke ispravke):**
+funding-rate istorija je ispravljena da koristi paginaciju preko `endTime`
+jer Binance stvarno vraca max 500 zapisa po upitu (ne 1000 kako je
+dokumentacija tvrdila) — `fetch_full_funding_history` i
+`cached_fetch_full_funding_history` sada pokrivaju punu dostupnu istoriju
+po simbolu, uz striktno postovanje zakljucane `end_timestamp_ms` granice
+(holdout ne moze procuriti kroz ovaj, odvojeni izvor podataka).
+
+**Implementacija:** novi samostalan modul
+`scanner/backtesting/funding_extreme_backtest.py` (namjerno odvojen od
+`portfolio_backtest.py`-evog SL/TP pipeline-a, jer je ovdje izlaz
+vremenski fiksiran, ne indikatorski) — rolling no-look-ahead funding
+percentil (270-opservacija/90-dana prozor, 90-opservacija minimum), ulaz
+na percentil>95/<5, fiksni 8h izlaz, 16h cooldown po (symbol, smjer),
+cross-symbol dedup (transitivno preklapanje po smjeru), postojeci cost
+model + stvarni funding trosak, block-bootstrap (neto I bruto), izmjerena
+sigma, kombinovani dataset hash. 28 novih testova, ruff cist, puna suita
+1737 prolazi (iste 8 ranije poznate, nepovezane greske). Commit `459721a`.
+
+**Rezultat jedinog runa** (train/validation, `end_timestamp_ms=1790253820000`,
+`dataset_hash: 1cdef092f543ed96`, 20/20 simbola):
+
+| Mjera | Vrijednost |
+|---|---|
+| n_independent (nakon cooldown + cross-symbol dedup) | **448** |
+| Net observed_pct / 95% CI | **-0.2418%** / `[-0.4519%, -0.0692%]` |
+| Net edge_survives_lower_bound | **false** |
+| Gross observed_pct / 95% CI | **-0.1264%** / `[-0.3358%, +0.0426%]` |
+| Gross edge_survives_lower_bound | **false** |
+| Izmjerena sigma (sample stdev, net) | 2.0614% |
+| Win rate | 45.76% |
+| n_required (d=0.3%, izmjerena sigma) vs n_independent | 371 vs 448 → **NIJE neodlucivo** |
+
+**FINALNA ODLUKA:** Hipoteza **odlucno pada** (dovoljno dogadjaja za
+donosenje odluke, ne "neodlucivo") — i neto i bruto povrat su negativni, sto
+znaci da problem NIJE (prvenstveno) trosak koji jede pravu edge, nego da
+sirovi signal sam po sebi ne pokazuje dokaz edge-a. Hipoteza "funding-extreme
+reversion" (percentil 95/5, 8h izlaz, 16h cooldown) se **zatvara**. Po
+pre-registrovanom pravilu: ovaj ishod NIJE povod za retuniranje praga
+(npr. 90/10) na istim podacima — svaka takva izmjena je NOVA, zasebna
+hipoteza. Zakljucani holdout (`end_timestamp_ms > 1790253820000`) ostaje
+nedirnut, rezervisan za sljedecu pre-registrovanu hipotezu. Puni detalji i
+8 zabiljezenih implementacionih odluka: `PREREGISTRATION_FUNDING_EXTREME_REVERSION.md`
+sekcije 9-10.
+
+
      `tests/test_portfolio_backtest.py`. Pure re-computation na vec
      izracunatim trejdovima (bez mrezhnih poziva), pa je ukey po
      defaultu, kao i OOS/independence/walk-forward provjere. Jos NIJE

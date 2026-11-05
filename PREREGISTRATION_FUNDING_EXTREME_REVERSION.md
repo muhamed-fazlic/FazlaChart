@@ -315,3 +315,45 @@ not silently made.
    `round_trip_cost_pct_for`'s existing per-symbol liquidity tiers, used
    as-is with no override — same base rate `portfolio_backtest.py` uses
    by default, per section 2's "isti cost model" instruction.
+
+## 10. Rezultat prvog (i jedinog) runa i FINALNO zatvaranje
+
+**Datum:** 2026-11-05. **Run:** jedan, train/validation period, `end_timestamp_ms=1790253820000`
+(isti holdout-granica kao zatvorena trend/anomaly porodica). Holdout ostaje
+netaknut. `dataset_hash: 1cdef092f543ed96`. 20/20 simbola koristeno, 0
+preskoceno.
+
+| Mjera | Vrijednost |
+|---|---|
+| n_raw_signals (prije cooldown-a) | 1 699 |
+| n nakon cooldown-a (16h) | 1 111 |
+| **n_independent** (nakon cross-symbol dedup) | **448** |
+| Net (nakon troskova) observed_pct | **-0.2418%** |
+| Net 95% CI | **[-0.4519%, -0.0692%]** |
+| Net edge_survives_lower_bound | **false** |
+| Gross (prije troskova) observed_pct | **-0.1264%** |
+| Gross 95% CI | **[-0.3358%, +0.0426%]** |
+| Gross edge_survives_lower_bound | **false** |
+| Izmjerena sigma (sample stdev, net) | **2.0614%** |
+| Win rate | 45.76% |
+| n_required (d=0.3%, izmjerena sigma) | 371 |
+| n_independent vs n_required | 448 > 371 → **NIJE neodlucivo** |
+
+**Interpretacija:** Ovo NIJE "neodlucivo" — sakupljeno je vise nezavisnih
+dogadjaja (448) nego sto je pre-registrovani power-racun trazio (371), pa
+je test imao dovoljno snage da donese odluku. Oba obavezna kriterija
+padaju: neto expectancy je negativan I donja granica CI-a je u potpunosti
+ispod nule. Bruto (prije troskova) povrat je takodjer negativan, sa CI-jem
+koji prelazi preko nule — sto znaci da problem NIJE prvenstveno u
+troskovima koji jedu pravu edge, nego da sirovi signal sam po sebi ne
+pokazuje dokaz edge-a prije ijednog troska.
+
+**Odluka:** Hipoteza "funding-extreme reversion" (percentil 95/5, 8h izlaz,
+16h cooldown, 20-simbol univerzum) se FORMALNO ZATVARA kao "nema edge-a,
+ni bruto ni neto". Po pravilu iz sekcije 5: ovaj ishod se NE smatra
+povodom da se prag percentila ublazi (npr. 90/10) ili parametri retuniraju
+na istim podacima — svaka takva izmjena bi bila NOVA, zasebna hipoteza.
+Holdout (`end_timestamp_ms > 1790253820000`) ostaje netaknut i rezervisan
+za sljedecu pre-registrovanu hipotezu. Trial/porodica #2 zatvorena,
+commit hash za ovaj zapis prati odmah uz commit koda (`459721a`) i ovaj
+dokument.
