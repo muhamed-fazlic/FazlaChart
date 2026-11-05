@@ -34,9 +34,11 @@ from pathlib import Path
 
 import pandas as pd
 
+from scanner.backtesting.funding_simulator import FundingEvent, fetch_full_funding_history
 from scanner.calibration import load_extended_history
 
 DEFAULT_KLINE_CACHE_DIR = "scanner_data/kline_cache"
+DEFAULT_FUNDING_CACHE_DIR = "scanner_data/funding_cache"
 
 
 def parse_end_timestamp(value: str) -> int:
@@ -106,3 +108,45 @@ def combined_dataset_fingerprint(fingerprints: list[str]) -> str:
     caller-chosen order) into one overall hash for the whole run."""
     joined = "|".join(sorted(fingerprints))
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def _funding_cache_path(cache_dir: str, symbol: str, end_timestamp_ms: int) -> Path:
+    return Path(cache_dir) / f"{symbol}_{end_timestamp_ms}.pkl"
+
+
+def cached_fetch_full_funding_history(
+    symbol: str,
+    end_timestamp_ms: int | None,
+    cache_dir: str = DEFAULT_FUNDING_CACHE_DIR,
+) -> list[FundingEvent]:
+    """Like :func:`scanner.backtesting.funding_simulator.fetch_full_funding_history`,
+    but anchored to a frozen ``end_timestamp_ms`` and cached to disk, same
+    reproducibility/speed rationale as :func:`cached_load_extended_history`
+    for candles. ``end_timestamp_ms=None`` bypasses the cache and always
+    fetches the freshest available funding history (live/ad-hoc use)."""
+    if end_timestamp_ms is None:
+        return fetch_full_funding_history(symbol, end_time_ms=None)
+
+    path = _funding_cache_path(cache_dir, symbol, end_timestamp_ms)
+    if path.exists():
+        with open(path, "rb") as fh:
+            return pickle.load(fh)
+
+    events = fetch_full_funding_history(symbol, end_time_ms=end_timestamp_ms)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as fh:
+        pickle.dump(events, fh)
+    return events
+
+
+def funding_dataset_fingerprint(events: list[FundingEvent]) -> str:
+    """A short, stable hash of the funding settlements actually used, so
+    two runs can be compared to confirm (or rule out) that they saw the
+    same funding data — same role as :func:`dataset_fingerprint` for
+    candles. Combine with candle fingerprints via
+    :func:`combined_dataset_fingerprint` to get one hash covering both
+    data sources for a run."""
+    if not events:
+        return hashlib.sha256(b"empty").hexdigest()[:16]
+    payload = "|".join(f"{e.timestamp.isoformat()}:{e.rate}" for e in events)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

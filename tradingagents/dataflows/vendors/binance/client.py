@@ -136,10 +136,26 @@ def get_mark_price_and_funding(symbol: Annotated[str, "futures symbol, e.g. BTCU
 
 def get_funding_rate_history(
     symbol: Annotated[str, "futures symbol, e.g. BTCUSDT"],
-    limit: Annotated[int, "number of funding settlements, max 1000"] = 8,
+    limit: Annotated[int, "number of funding settlements requested; Binance caps the actual response at 500 "
+    "regardless of this value"] = 8,
+    end_time: Annotated[int | None, "fetch settlements ending at or before this ms timestamp (Binance endTime)"]
+    = None,
 ) -> list[dict[str, Any]]:
-    """Historical (settled, every 8h) funding rate entries, oldest first."""
-    data = _get("/fapi/v1/fundingRate", {"symbol": symbol, "limit": limit})
+    """Historical (settled, every 8h) funding rate entries, oldest first.
+
+    Measured against the live Binance futures API: ``/fapi/v1/fundingRate``
+    returns at most **500** rows per request regardless of a higher
+    ``limit`` value (confirmed empirically; Binance's own docs say "max
+    1000" but the server silently caps at 500) -- i.e. a single call only
+    ever covers ~166.7 days (500 * 8h). ``end_time`` (Binance's ``endTime``
+    param) lets a caller page backwards past that cap the same way
+    ``get_klines`` pages backwards past its own per-request cap -- see
+    ``scanner.backtesting.funding_simulator.fetch_full_funding_history``.
+    """
+    params: dict[str, Any] = {"symbol": symbol, "limit": limit}
+    if end_time is not None:
+        params["endTime"] = end_time
+    data = _get("/fapi/v1/fundingRate", params)
     return data or []
 
 
