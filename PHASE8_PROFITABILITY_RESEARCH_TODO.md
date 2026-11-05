@@ -921,6 +921,75 @@ nedirnut, rezervisan za sljedecu pre-registrovanu hipotezu. Puni detalji i
 8 zabiljezenih implementacionih odluka: `PREREGISTRATION_FUNDING_EXTREME_REVERSION.md`
 sekcije 9-10.
 
+## Korak 9 — "Cross-sectional momentum" hipoteza (trial/porodica #3) — 
+ZAVRSENO, ZATVORENO
+
+Nakon dvije zatvorene direkcione porodice (trend/anomaly, funding-extreme),
+korisnik je potvrdio cilj (profit) i budzet (par dana, bez fiksnog roka) i
+odabrao trecu, ORTOGONALNU hipotezu: market-neutral cross-sectional momentum
+(long top-kvartil / short bottom-kvartil 24h povrata, unutar istog 20-simbol
+univerzuma), umjesto nastavka na istu klasu pristupa (jednostavni direkcioni
+signal na pojedinacnom simbolu).
+
+Zamrznuta specifikacija (`PREREGISTRATION_CROSS_SECTIONAL_MOMENTUM.md`,
+commit `6aca72f`, prije koda): 24h lookback, dnevni (24h) rebalans, N=5
+(kvartil), equal-weight dollar-neutral kosare, minimum 10 (2N) prihvatljivih
+simbola po rebalansu (inace se taj rebalans preskace), smjer zamrznut na
+MOMENTUM (reversion bi bio zaseban trial #4), troskovi turnover-bazirani
+(placa se samo na stvarno promijenjenim pozicijama), stvarni funding trosak
+tokom drzanja, primarna mjera = block-bootstrap CI na neto povratu po
+rebalansu (bez rucno biranog block_size), uz bruto i beta-provjeru (korelacija
+sa BTC) kao dijagnostiku. Holdout (`end_timestamp_ms > 1790253820000`) ostaje
+isti kao prethodne dvije porodice, netaknut.
+
+**Implementacija:** novi samostalan modul
+`scanner/backtesting/cross_sectional_momentum_backtest.py` (1h svijece,
+point-in-time univerzum filter, rebalans-mreza usidrena na najraniju
+dostupnu svijecu, cost model i funding simulator ponovo iskoristeni iz
+prethodne porodice). 22 nova testa (no-look-ahead rangiranje, min-10 pravilo,
+top/bottom formiranje kosare, turnover-cost tranzicije, beta provjera, ruff
+cist). Commit `9ceaced`.
+
+**Rezultat jedinog runa** (train/validation, `end_timestamp_ms=1790253820000`,
+`dataset_hash: 1cdef092f543ed96`, 20/20 simbola, 0 preskocenih rebalansa):
+
+| Mjera | Vrijednost |
+|---|---|
+| n_independent (broj formiranih dnevnih rebalans-perioda) | **332** |
+| Net observed_pct / 95% CI | **-0.0793%** / `[-0.1778%, +0.0282%]` |
+| Net edge_survives_lower_bound | **false** |
+| Gross observed_pct / 95% CI | **+0.0760%** / `[-0.0246%, +0.1872%]` |
+| Gross edge_survives_lower_bound | **false** |
+| Prosjecan dnevni turnover | 72.71% |
+| Beta-provjera (korelacija neto kosare sa BTC) | **-0.0012** (|r|<0.3) |
+| Izmjerena sigma (sample stdev, net) | 1.1838% |
+| Win rate | 42.47% |
+| n_required (d=0.3%, izmjerena sigma) vs n_independent | 123 vs 332 → **NIJE neodlucivo** |
+
+**FINALNA ODLUKA:** Hipoteza **odlucno pada** (dovoljno rebalans-perioda za
+donosenje odluke). Ni neto ni bruto CI ne prelaze nulu na pozitivnu stranu —
+cak je i sirovi (bruto) signal nula unutar suma, sto znaci da problem nije
+(samo) visoki turnover/troskovi, nego da sam signal (24h cross-sectional
+momentum) ne pokazuje dokaziv edge na ovom univerzumu i periodu. Beta-provjera
+POTVRDJUJE da je dizajn uspio u svom metodoloskom cilju (r≈0 naspram BTC,
+market-neutral izlozenost stvarno postignuta) — dakle negativan/nulti
+rezultat se ne moze pripisati zaostaloj BTC-beta izlozenosti. Hipoteza
+"cross-sectional momentum" se **zatvara**. Holdout ostaje nedirnut.
+
+**Sira slika nakon tri porodice:** sve tri testirane porodice (trend/anomaly
+direkciona, funding-extreme direkciona, cross-sectional momentum
+market-neutral) su zatvorene bez dokaza edge-a nakon troskova na ovom
+20-simbol Binance-futures univerzumu i ~8-mjesecnom periodu. Dvije su
+direkcione (ista siroka klasa), treca je namjerno ortogonalna (market-neutral
+cross-section) i takodjer pada — sto jaca hipotezu da problem nije u
+pojedinacnom signalu nego u kombinaciji (likvidni Binance perpetuali, ovaj
+raspon vremenskih okvira, velicina i trosak signala koje smo testirali), a ne
+u konkretnoj specifikaciji. Po korisnikovom ranijem planu ("par dana, pa ako
+ni to ne prodje — pauziramo/preusmjeravamo"), sljedeci korak NIJE automatski
+cetvrta hipoteza, nego eksplicitan razgovor o pauzi ili preusmjeravanju
+projekta (npr. risk-management/alat umjesto trazenja edge-a). Puni detalji:
+`PREREGISTRATION_CROSS_SECTIONAL_MOMENTUM.md` sekcije 9-10.
+
 
      `tests/test_portfolio_backtest.py`. Pure re-computation na vec
      izracunatim trejdovima (bez mrezhnih poziva), pa je ukey po
