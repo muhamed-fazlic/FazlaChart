@@ -143,6 +143,99 @@ def build_point_in_time_universe(config: PointInTimeUniverseConfig) -> list[Univ
     return windows
 
 
+@dataclass(frozen=True)
+class RankedUniverseWindow:
+    """Like :class:`UniverseWindow`, but preserves the full rank order
+    (best/highest-trailing-volume first) of the top-``top_n`` candidates
+    instead of discarding it into an unordered ``frozenset``.
+
+    Added for Korak 10 (exploratory liquidity-tercile scan): the original
+    ``UniverseWindow``/``build_point_in_time_universe`` only needed "is this
+    symbol in the top-N", so it dropped rank order. Slicing a wide universe
+    (e.g. top-170) into liquidity terciles (ranks 1-57 / 58-113 / 114-170)
+    needs that order preserved. This is purely additive -- it does not
+    change ``UniverseWindow``, ``build_point_in_time_universe``, or any of
+    their existing callers (``portfolio_backtest.py`` etc.)."""
+
+    start: datetime  # inclusive
+    end: datetime  # exclusive
+    ranked_symbols: tuple[str, ...]  # best (highest trailing volume) first
+
+
+def build_ranked_point_in_time_universe(config: PointInTimeUniverseConfig) -> list[RankedUniverseWindow]:
+    """Same ranking logic/no-look-ahead guarantees as
+    :func:`build_point_in_time_universe`, but keeps the full rank order of
+    the top-``config.top_n`` candidates per window instead of collapsing it
+    into an unordered set. Use this (plus :func:`windows_for_rank_range`)
+    when you need a liquidity-tiered slice (e.g. ranks 1-57) of one single
+    wide ranking pass, rather than running the ranking multiple times for
+    different ``top_n`` values."""
+    candidates = (
+        list(config.candidate_symbols) if config.candidate_symbols else client.get_usdt_perpetual_symbols()
+    )
+    candidates = sorted(set(candidates) | set(config.include_delisted))
+
+    windows: list[RankedUniverseWindow] = []
+    window_start = config.start
+    step = timedelta(days=config.rebalance_days)
+    while window_start < config.end:
+        window_end = min(window_start + step, config.end)
+        ranked: list[tuple[str, float]] = []
+        for symbol in candidates:
+            avg_volume = _avg_daily_quote_volume(
+                symbol, window_start, config.lookback_days, config.min_history_days
+            )
+            if avg_volume is not None:
+                ranked.append((symbol, avg_volume))
+        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        top_symbols = tuple(symbol for symbol, _volume in ranked[: config.top_n])
+        windows.append(RankedUniverseWindow(start=window_start, end=window_end, ranked_symbols=top_symbols))
+        window_start = window_end
+    return windows
+
+
+def windows_for_rank_range(
+    windows: list[RankedUniverseWindow], start_rank: int, end_rank: int
+) -> list[UniverseWindow]:
+    """Slices a ranked universe (see :func:`build_ranked_point_in_time_universe`)
+    into a liquidity-tier membership cache compatible with the existing
+    ``UniverseWindow``/``save_universe_cache``/``portfolio_backtest.py``
+    pipeline. ``start_rank``/``end_rank`` are 1-indexed and inclusive on
+    both ends (e.g. ``windows_for_rank_range(windows, 1, 57)`` is "the top
+    57 by trailing volume", ``windows_for_rank_range(windows, 58, 113)`` is
+    the next 56, etc.). A window with fewer than ``start_rank`` eligible
+    candidates that period simply contributes an empty tier membership for
+    it (same "insufficient eligible candidates -> excluded" principle used
+    elsewhere), not an error."""
+    if start_rank < 1 or end_rank < start_rank:
+        raise ValueError(f"invalid rank range: start_rank={start_rank}, end_rank={end_rank}")
+    sliced: list[UniverseWindow] = []
+    for window in windows:
+        tier_symbols = window.ranked_symbols[start_rank - 1 : end_rank]
+        sliced.append(UniverseWindow(start=window.start, end=window.end, symbols=frozenset(tier_symbols)))
+    return sliced
+
+
+def save_ranked_universe_cache(windows: list[RankedUniverseWindow], path: str | Path) -> None:
+    payload = [
+        {"start": w.start.isoformat(), "end": w.end.isoformat(), "ranked_symbols": list(w.ranked_symbols)}
+        for w in windows
+    ]
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_ranked_universe_cache(path: str | Path) -> list[RankedUniverseWindow]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return [
+        RankedUniverseWindow(
+            start=_parse_iso(entry["start"]),
+            end=_parse_iso(entry["end"]),
+            ranked_symbols=tuple(entry["ranked_symbols"]),
+        )
+        for entry in raw
+    ]
+
+
 def symbols_at(windows: list[UniverseWindow], timestamp: datetime) -> frozenset[str] | None:
     """Which symbols were in the point-in-time top-N at ``timestamp``, or
     ``None`` if ``timestamp`` falls outside every window (before the cache's
@@ -212,7 +305,30 @@ def _main() -> None:
         help="Manually add historically-relevant delisted symbols (best-effort, not auto-discovered)",
     )
     parser.add_argument("--cache-path", default="scanner_data/point_in_time_universe.json")
+    parser.add_argument(
+        "--preserve-rank",
+        action="store_true",
+        help="Korak 10: build the ranked variant instead (keeps full rank order within the top-N per window "
+        "rather than an unordered top-N set), written via --cache-path using the ranked JSON shape "
+        "('ranked_symbols' list instead of 'symbols'). Combine with --tier (repeatable) to additionally slice "
+        "the single ranking pass into liquidity-tier membership caches in the ORIGINAL (unordered-set) cache "
+        "shape, so existing consumers (portfolio_backtest.py et al.) need no changes.",
+    )
+    parser.add_argument(
+        "--tier",
+        action="append",
+        default=[],
+        metavar="START-END:OUTPUT_PATH",
+        help="Only valid with --preserve-rank. May be repeated. Each slices ranks START-END (1-indexed, "
+        "inclusive) of the single ranking pass into its own standard-format universe cache at OUTPUT_PATH, "
+        "e.g. --tier 1-57:scanner_data/universe_tier_high.json "
+        "--tier 58-113:scanner_data/universe_tier_mid.json "
+        "--tier 114-170:scanner_data/universe_tier_low.json",
+    )
     args = parser.parse_args()
+
+    if args.tier and not args.preserve_rank:
+        raise SystemExit("--tier requires --preserve-rank (tiers are sliced from a single ranked pass)")
 
     config = PointInTimeUniverseConfig(
         start=_parse_iso(args.start),
@@ -224,6 +340,24 @@ def _main() -> None:
         candidate_symbols=tuple(args.candidate_symbols) if args.candidate_symbols else None,
         include_delisted=tuple(args.include_delisted),
     )
+
+    if args.preserve_rank:
+        ranked_windows = build_ranked_point_in_time_universe(config)
+        save_ranked_universe_cache(ranked_windows, args.cache_path)
+        print(f"Built {len(ranked_windows)} ranked rebalance window(s), wrote cache to {args.cache_path}")
+        for window in ranked_windows:
+            print(f"  {window.start.date()} .. {window.end.date()}: {len(window.ranked_symbols)} ranked symbols")
+        for tier_spec in args.tier:
+            rank_range, _, output_path = tier_spec.partition(":")
+            start_str, _, end_str = rank_range.partition("-")
+            start_rank, end_rank = int(start_str), int(end_str)
+            tier_windows = windows_for_rank_range(ranked_windows, start_rank, end_rank)
+            save_universe_cache(tier_windows, output_path)
+            print(f"Tier ranks {start_rank}-{end_rank}: wrote {len(tier_windows)} window(s) to {output_path}")
+            for window in tier_windows:
+                print(f"    {window.start.date()} .. {window.end.date()}: {len(window.symbols)} symbols")
+        return
+
     windows = build_point_in_time_universe(config)
     save_universe_cache(windows, args.cache_path)
     print(f"Built {len(windows)} rebalance window(s), wrote cache to {args.cache_path}")

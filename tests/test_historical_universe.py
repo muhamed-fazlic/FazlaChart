@@ -14,12 +14,17 @@ import pytest
 from scanner.backtesting import historical_universe as module
 from scanner.backtesting.historical_universe import (
     PointInTimeUniverseConfig,
+    RankedUniverseWindow,
     UniverseWindow,
     build_point_in_time_universe,
+    build_ranked_point_in_time_universe,
     is_symbol_in_universe_at,
+    load_ranked_universe_cache,
     load_universe_cache,
+    save_ranked_universe_cache,
     save_universe_cache,
     symbols_at,
+    windows_for_rank_range,
 )
 from tradingagents.dataflows.errors import NoMarketDataError
 
@@ -189,5 +194,124 @@ class TestCacheRoundTrip:
                 "start": _T0.isoformat(),
                 "end": (_T0 + timedelta(days=30)).isoformat(),
                 "symbols": ["BTCUSDT"],
+            }
+        ]
+
+
+class TestBuildRankedPointInTimeUniverse:
+    """Korak 10: the rank-preserving builder (used to slice a wide top-N
+    universe, e.g. top-170, into liquidity terciles) must rank identically
+    to the unordered ``build_point_in_time_universe`` -- only the output
+    shape (ordered tuple vs. frozenset) differs."""
+
+    def test_preserves_full_rank_order_best_first(self, monkeypatch):
+        monkeypatch.setattr(
+            module.client, "get_usdt_perpetual_symbols", lambda: ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "ADAUSDT"]
+        )
+        volumes = {"BTCUSDT": 4000.0, "ETHUSDT": 3000.0, "DOGEUSDT": 2000.0, "ADAUSDT": 1000.0}
+
+        def fake_get_klines(symbol, interval, limit, end_time=None):
+            return _daily_klines(limit, volumes[symbol])
+
+        monkeypatch.setattr(module.client, "get_klines", fake_get_klines)
+
+        config = PointInTimeUniverseConfig(
+            start=_T0, end=_T0 + timedelta(days=30), top_n=3, rebalance_days=30, min_history_days=1
+        )
+        windows = build_ranked_point_in_time_universe(config)
+
+        assert len(windows) == 1
+        assert windows[0].ranked_symbols == ("BTCUSDT", "ETHUSDT", "DOGEUSDT")
+
+    def test_does_not_mutate_or_replace_existing_unordered_builder(self, monkeypatch):
+        """Backward-compat guard: the new ranked builder must not change
+        what the original unordered builder returns for the same config."""
+        monkeypatch.setattr(module.client, "get_usdt_perpetual_symbols", lambda: ["BTCUSDT", "ETHUSDT"])
+        monkeypatch.setattr(module.client, "get_klines", lambda *a, **kw: _daily_klines(10, 100.0))
+
+        config = PointInTimeUniverseConfig(
+            start=_T0, end=_T0 + timedelta(days=30), top_n=5, rebalance_days=30, min_history_days=1
+        )
+        unordered = build_point_in_time_universe(config)
+        ranked = build_ranked_point_in_time_universe(config)
+
+        assert unordered[0].symbols == frozenset(ranked[0].ranked_symbols)
+
+
+class TestWindowsForRankRange:
+    def _ranked_windows(self) -> list[RankedUniverseWindow]:
+        return [
+            RankedUniverseWindow(
+                start=_T0,
+                end=_T0 + timedelta(days=30),
+                ranked_symbols=("BTCUSDT", "ETHUSDT", "DOGEUSDT", "ADAUSDT", "SOLUSDT"),
+            )
+        ]
+
+    def test_slices_a_middle_tier_inclusive_1_indexed(self):
+        windows = self._ranked_windows()
+        tier = windows_for_rank_range(windows, 2, 4)
+        assert len(tier) == 1
+        assert isinstance(tier[0], UniverseWindow)
+        assert tier[0].symbols == frozenset({"ETHUSDT", "DOGEUSDT", "ADAUSDT"})
+        assert tier[0].start == _T0
+        assert tier[0].end == _T0 + timedelta(days=30)
+
+    def test_top_tier_matches_rank_1_to_n(self):
+        windows = self._ranked_windows()
+        tier = windows_for_rank_range(windows, 1, 2)
+        assert tier[0].symbols == frozenset({"BTCUSDT", "ETHUSDT"})
+
+    def test_rank_range_beyond_available_candidates_is_partial_not_error(self):
+        windows = self._ranked_windows()
+        tier = windows_for_rank_range(windows, 4, 10)
+        assert tier[0].symbols == frozenset({"ADAUSDT", "SOLUSDT"})
+
+    def test_invalid_rank_range_raises(self):
+        windows = self._ranked_windows()
+        with pytest.raises(ValueError):
+            windows_for_rank_range(windows, 0, 5)
+        with pytest.raises(ValueError):
+            windows_for_rank_range(windows, 5, 2)
+
+    def test_three_non_overlapping_tiers_partition_the_full_top_n(self):
+        windows = self._ranked_windows()
+        high = windows_for_rank_range(windows, 1, 2)
+        mid = windows_for_rank_range(windows, 3, 4)
+        low = windows_for_rank_range(windows, 5, 5)
+        union = high[0].symbols | mid[0].symbols | low[0].symbols
+        assert union == frozenset(windows[0].ranked_symbols)
+        assert not (high[0].symbols & mid[0].symbols)
+        assert not (mid[0].symbols & low[0].symbols)
+
+
+class TestRankedCacheRoundTrip:
+    def test_save_and_load_preserves_ranked_windows(self, tmp_path):
+        windows = [
+            RankedUniverseWindow(
+                start=_T0, end=_T0 + timedelta(days=30), ranked_symbols=("BTCUSDT", "ETHUSDT")
+            ),
+        ]
+        path = tmp_path / "ranked_cache.json"
+        save_ranked_universe_cache(windows, path)
+
+        loaded = load_ranked_universe_cache(path)
+        assert loaded == windows
+
+    def test_ranked_cache_file_is_human_readable_json_with_order_preserved(self, tmp_path):
+        windows = [
+            RankedUniverseWindow(
+                start=_T0, end=_T0 + timedelta(days=30), ranked_symbols=("ETHUSDT", "BTCUSDT")
+            )
+        ]
+        path = tmp_path / "ranked_cache.json"
+        save_ranked_universe_cache(windows, path)
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw == [
+            {
+                "start": _T0.isoformat(),
+                "end": (_T0 + timedelta(days=30)).isoformat(),
+                "ranked_symbols": ["ETHUSDT", "BTCUSDT"],
             }
         ]
