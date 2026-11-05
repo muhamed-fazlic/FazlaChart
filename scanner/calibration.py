@@ -338,6 +338,8 @@ def _walk_forward_exit(
     atr: float,
     max_horizon: int,
     tie_break: str = "conservative",
+    sl_atr_multiplier: float = DEFAULT_SL_ATR_MULTIPLIER,
+    tp_atr_multiplier: float = DEFAULT_TP_ATR_MULTIPLIER,
 ) -> tuple[int | None, float | None, str | None]:
     """Simulate the same SL/TP a live user would actually be shown (same ATR
     multipliers as :func:`agents_crypto.risk_calc.compute_risk_levels`) and
@@ -368,12 +370,18 @@ def _walk_forward_exit(
     is not implemented here — it would need a second, much larger set of
     kline fetches (one per ambiguous candle) and is left as documented
     future work, not silently assumed to be unnecessary.
+
+    ``sl_atr_multiplier``/``tp_atr_multiplier`` default to the live system's
+    constants, but a caller building a *strategy variant* (see
+    :func:`backtest_symbol`'s ``invert_signals``) can pass them swapped —
+    e.g. to walk a trade whose stop is the original signal's target
+    distance and vice versa.
     """
     if pd.isna(atr) or atr <= 0:
         return None, None, None
 
-    sl_distance = atr * DEFAULT_SL_ATR_MULTIPLIER
-    tp_distance = atr * DEFAULT_TP_ATR_MULTIPLIER
+    sl_distance = atr * sl_atr_multiplier
+    tp_distance = atr * tp_atr_multiplier
     if direction == "long":
         stop_loss = entry_close - sl_distance
         take_profit = entry_close + tp_distance
@@ -422,6 +430,7 @@ def backtest_symbol(
     history: pd.DataFrame | None = None,
     funding_events: list[FundingEvent] | None = None,
     sl_tp_tie_break: str = "conservative",
+    invert_signals: bool = False,
 ) -> list[LabeledCase]:
     """Walk every candle in ``symbol``'s history, label it the way the live
     scanner would (trend + anomalies, point-in-time), and record the outcome
@@ -460,6 +469,24 @@ def backtest_symbol(
     Undirected labels (no declared long/short bias) keep the original
     point-to-point magnitude, since there's no SL/TP side to simulate.
     One candle yields one case per label it carries, per horizon.
+
+    ``invert_signals`` (Phase 8 strategy-variants framework — see
+    :mod:`scanner.backtesting.strategy_variants`) builds a *fade* variant:
+    for every directional label, the trade is actually walked in the
+    OPPOSITE direction, with the stop and target ATR multipliers swapped
+    (what the original signal called its target distance becomes the
+    faded trade's stop distance, and vice versa) — this is the literal
+    "go the other way and swap SL/TP" idea, not a naive sign flip of the
+    original outcome, because an asymmetric SL/TP means the two trades can
+    exit on entirely different candles. ``LabeledCase.label`` and
+    ``LabeledCase.sl_distance_pct`` still describe the same scanner
+    signal/semantics as the non-inverted run (so every downstream
+    consumer — ``portfolio_backtest``'s ``LABEL_DIRECTION``-based sign
+    correction in particular — needs no changes), which is why
+    ``forward_return_pct`` is pre-negated here rather than left as the raw
+    price delta: it's stored so that re-applying the *original* label's
+    static direction convention downstream yields the correct P&L for the
+    trade that was actually (and oppositely) taken.
     """
     df = history if history is not None else _load_history(symbol, timeframe, limit)
     atr_pct = (df["atr"] / df["close"] * 100.0).replace([float("inf"), float("-inf")], pd.NA)
@@ -481,11 +508,15 @@ def backtest_symbol(
         # on which label implied it, so at most two walk-forwards per candle
         # are needed no matter how many directional labels fire together.
         exit_by_direction: dict[str, tuple[int | None, float | None, str | None]] = {}
+        opposite = {"long": "short", "short": "long"}
         for direction in ("long", "short"):
             needed = any(LABEL_DIRECTION.get(label) == direction for label in labels)
             if needed:
+                walk_direction = opposite[direction] if invert_signals else direction
+                sl_mult = DEFAULT_TP_ATR_MULTIPLIER if invert_signals else DEFAULT_SL_ATR_MULTIPLIER
+                tp_mult = DEFAULT_SL_ATR_MULTIPLIER if invert_signals else DEFAULT_TP_ATR_MULTIPLIER
                 exit_by_direction[direction] = _walk_forward_exit(
-                    df, i, direction, entry_close, entry_atr, max_horizon, sl_tp_tie_break
+                    df, i, walk_direction, entry_close, entry_atr, max_horizon, sl_tp_tie_break, sl_mult, tp_mult
                 )
 
         for label in labels:
@@ -507,7 +538,9 @@ def backtest_symbol(
             hit_candle, exit_price, reason = exit_by_direction.get(direction, (None, None, None))
             if reason is None:
                 continue  # no usable ATR at this candle (NaN/zero) — skip
-            sl_distance_pct = entry_atr * DEFAULT_SL_ATR_MULTIPLIER / entry_close * 100.0
+            traded_direction = opposite[direction] if invert_signals else direction
+            sl_mult = DEFAULT_TP_ATR_MULTIPLIER if invert_signals else DEFAULT_SL_ATR_MULTIPLIER
+            sl_distance_pct = entry_atr * sl_mult / entry_close * 100.0
             for horizon in horizons:
                 if hit_candle is not None and hit_candle <= horizon:
                     # SL/TP resolved the trade before the horizon's end.
@@ -522,12 +555,21 @@ def backtest_symbol(
                     if forward_return is None:
                         continue
                     horizon_exit_reason = "timeout"
+                if invert_signals:
+                    # forward_return above is the raw price delta for the
+                    # ACTUALLY-traded (opposite) direction. Downstream
+                    # (portfolio_backtest._net_return_pct) always re-signs
+                    # using the label's static/original LABEL_DIRECTION, so
+                    # negate here to pre-compensate -- storing it any other
+                    # way would silently score this trade as if it had been
+                    # taken in the original, non-inverted direction.
+                    forward_return = -forward_return
                 trade_funding_cost_pct = 0.0
                 if funding_events:
                     exit_idx = i + (hit_candle if hit_candle is not None and hit_candle <= horizon else horizon)
                     entry_dt = df["open_time"].iloc[i].to_pydatetime()
                     exit_dt = df["open_time"].iloc[exit_idx].to_pydatetime()
-                    trade_funding_cost_pct = funding_cost_pct(direction, entry_dt, exit_dt, funding_events)
+                    trade_funding_cost_pct = funding_cost_pct(traded_direction, entry_dt, exit_dt, funding_events)
                 cases.append(
                     LabeledCase(
                         symbol,

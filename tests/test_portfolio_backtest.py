@@ -858,6 +858,68 @@ class TestBlockBootstrapWiring:
         assert block["confidence_pct"] == 80.0
 
 
+class TestStrategyVariantWiring:
+    """Phase 8 "strategy variants" framework (see
+    scanner.backtesting.strategy_variants): a config's `strategy_variant`
+    must actually reach `backtest_symbol` as the variant's documented
+    kwargs, and must never change behaviour for existing callers that never
+    set it (the "original" variant's kwargs are empty)."""
+
+    def _config(self, **overrides) -> PortfolioBacktestConfig:
+        base = {
+            "symbols": ("BTCUSDT",),
+            "timeframes": ("1h",),
+            "warmup_candles": 0,
+            "kline_limit": 100,
+        }
+        base.update(overrides)
+        return PortfolioBacktestConfig(**base)
+
+    def test_default_original_variant_adds_no_kwargs(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        seen_kwargs: list[dict] = []
+
+        def fake_backtest_symbol(symbol, timeframe, horizons, **kwargs):
+            seen_kwargs.append(kwargs)
+            return []
+
+        monkeypatch.setattr(module, "backtest_symbol", fake_backtest_symbol)
+        run_portfolio_backtest(self._config())
+        assert seen_kwargs == [{"limit": 100}]
+
+    def test_inverted_variant_forwards_invert_signals_true(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        seen_kwargs: list[dict] = []
+
+        def fake_backtest_symbol(symbol, timeframe, horizons, **kwargs):
+            seen_kwargs.append(kwargs)
+            return []
+
+        monkeypatch.setattr(module, "backtest_symbol", fake_backtest_symbol)
+        run_portfolio_backtest(self._config(strategy_variant="inverted"))
+        assert seen_kwargs == [{"limit": 100, "invert_signals": True}]
+
+    def test_unknown_variant_raises_key_error(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        monkeypatch.setattr(module, "backtest_symbol", lambda *a, **k: [])
+        with pytest.raises(KeyError):
+            run_portfolio_backtest(self._config(strategy_variant="not_a_real_variant"))
+
+    def test_dashboard_report_config_includes_strategy_variant(self):
+        from scanner.backtesting.portfolio_backtest import (
+            PortfolioBacktestResult,
+            build_dashboard_report,
+        )
+
+        config = self._config(strategy_variant="inverted")
+        result = PortfolioBacktestResult(trades=[], equity_curve=[], metrics=_compute_metrics([], [], config, []))
+        report = build_dashboard_report(config, result)
+        assert report["config"]["strategy_variant"] == "inverted"
+
+
 class TestMetricsComputation:
     def test_known_trades_produce_expected_net_profit_and_win_rate(self):
         from scanner.backtesting.portfolio_backtest import Trade

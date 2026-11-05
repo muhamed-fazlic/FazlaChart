@@ -578,9 +578,47 @@ function renderQualityBreakdown(buckets) {
 // is a static snapshot that only changes when someone reruns the backtest
 // by hand, so polling it on the scanner's 5-minute cadence would be noise.
 
-async function loadBacktestTab() {
+// Which strategy variant (see scanner/backtesting/strategy_variants.py) the
+// tab currently shows -- defaults to "original" and is only ever changed by
+// the user via the "Strategija" dropdown below. Kept as module state (not
+// re-read from the DOM every call) so every fetch in this file -- report,
+// refresh, refresh/status -- stays in lockstep with whichever variant the
+// dropdown is showing right now, without threading a parameter through
+// every call site.
+let currentBacktestVariant = "original";
+let backtestVariantsLoaded = false;
+
+// Populates the "Strategija" dropdown from /api/backtest/variants exactly
+// once (its options are static for the life of the page -- the registry in
+// strategy_variants.py doesn't change without a code deploy). Re-running
+// this after the user has picked a variant would reset their selection, so
+// loadBacktestTab() only calls it the first time.
+async function loadBacktestVariantsDropdown() {
+  const select = document.getElementById("backtest-variant-select");
+  if (!select) return;
   try {
-    const res = await fetch("/api/backtest/report");
+    const res = await fetch("/api/backtest/variants");
+    const data = await res.json();
+    currentBacktestVariant = data.default_variant_id || "original";
+    select.innerHTML = (data.variants || [])
+      .map((v) => {
+        const reportFlag = v.has_report ? "" : " (nema izvještaja)";
+        return `<option value="${v.variant_id}">${v.label}${reportFlag}</option>`;
+      })
+      .join("");
+    select.value = currentBacktestVariant;
+    backtestVariantsLoaded = true;
+  } catch (err) {
+    console.error("Could not load backtest variants:", err);
+  }
+}
+
+async function loadBacktestTab() {
+  if (!backtestVariantsLoaded) {
+    await loadBacktestVariantsDropdown();
+  }
+  try {
+    const res = await fetch(`/api/backtest/report?variant=${encodeURIComponent(currentBacktestVariant)}`);
     const report = await res.json();
     if (!report.available) {
       renderBacktestUnavailable();
@@ -642,24 +680,31 @@ function applyBacktestRefreshStatus(status) {
 
 async function renderBacktestRefreshStatus() {
   try {
-    const res = await fetch("/api/backtest/refresh/status");
+    const res = await fetch(`/api/backtest/refresh/status?variant=${encodeURIComponent(currentBacktestVariant)}`);
     applyBacktestRefreshStatus(await res.json());
   } catch (err) {
     console.error("Could not read backtest refresh status:", err);
   }
 }
 
-async function pollBacktestRefreshUntilDone() {
+// `variant` is captured at the moment the refresh was triggered (not
+// re-read from `currentBacktestVariant` on every tick) so that switching
+// the dropdown to a different strategy while a refresh is still polling
+// doesn't make this poll start asking about -- and eventually reload the
+// tab for -- the wrong variant's status.
+async function pollBacktestRefreshUntilDone(variant) {
   try {
-    const res = await fetch("/api/backtest/refresh/status");
+    const res = await fetch(`/api/backtest/refresh/status?variant=${encodeURIComponent(variant)}`);
     const status = await res.json();
-    applyBacktestRefreshStatus(status);
+    if (variant === currentBacktestVariant) {
+      applyBacktestRefreshStatus(status);
+    }
     if (status.state === "running") return;
     if (backtestRefreshPollTimer) {
       clearInterval(backtestRefreshPollTimer);
       backtestRefreshPollTimer = null;
     }
-    if (status.state === "done") {
+    if (status.state === "done" && variant === currentBacktestVariant) {
       await loadBacktestTab();
     }
   } catch (err) {
@@ -670,18 +715,21 @@ async function pollBacktestRefreshUntilDone() {
 async function triggerBacktestRefresh() {
   const btn = document.getElementById("backtest-refresh-btn");
   const statusEl = document.getElementById("backtest-refresh-status");
+  const variant = currentBacktestVariant;
   btn.disabled = true;
   statusEl.textContent = "Pokrećem test na serveru…";
   try {
-    const res = await fetch("/api/backtest/refresh", { method: "POST" });
+    const res = await fetch(`/api/backtest/refresh?variant=${encodeURIComponent(variant)}`, {
+      method: "POST",
+    });
     const data = await res.json();
     if (!data.started && data.reason === "already_running") {
       statusEl.textContent = "Test je već u toku (pokrenut ranije).";
     }
     if (!backtestRefreshPollTimer) {
-      backtestRefreshPollTimer = setInterval(pollBacktestRefreshUntilDone, 15000);
+      backtestRefreshPollTimer = setInterval(() => pollBacktestRefreshUntilDone(variant), 15000);
     }
-    await pollBacktestRefreshUntilDone();
+    await pollBacktestRefreshUntilDone(variant);
   } catch (err) {
     statusEl.textContent = `Greška: ${err.message}`;
     btn.disabled = false;
@@ -1896,6 +1944,10 @@ document.getElementById("detail-modal").addEventListener("click", (e) => {
 });
 document.getElementById("analyze-btn").addEventListener("click", analyzeSymbol);
 document.getElementById("backtest-refresh-btn").addEventListener("click", triggerBacktestRefresh);
+document.getElementById("backtest-variant-select").addEventListener("change", (e) => {
+  currentBacktestVariant = e.target.value;
+  loadBacktestTab();
+});
 
 async function loadHealth() {
   const el = document.getElementById("health-banner");

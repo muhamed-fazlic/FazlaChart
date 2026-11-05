@@ -210,6 +210,21 @@ class TestWalkForwardExit:
         assert hit_candle is None
         assert reason == "timeout"
 
+    def test_swapped_multipliers_change_which_level_is_touched(self):
+        # Same candle, same (long) direction, but with SL/TP multipliers
+        # swapped -- entry 100, atr 2 -> with defaults (1.5x/2.5x) SL=97,
+        # TP=105; swapped (2.5x/1.5x) SL=95, TP=103. A candle that only
+        # reaches 103 hits the swapped TP but not the default one.
+        df = _ohlc_df([(99.0, 103.5)])
+        default_hit, _, default_reason = _walk_forward_exit(df, 0, "long", 100.0, 2.0, max_horizon=5)
+        assert default_hit is None and default_reason == "timeout"
+        swapped_hit, swapped_price, swapped_reason = _walk_forward_exit(
+            df, 0, "long", 100.0, 2.0, max_horizon=5, sl_atr_multiplier=2.5, tp_atr_multiplier=1.5
+        )
+        assert swapped_hit == 1
+        assert swapped_reason == "take_profit"
+        assert swapped_price == pytest.approx(103.0)
+
 
 def _timed_case(label: str, entry_time: str, forward_return_pct: float, horizon: int = 4) -> LabeledCase:
     return LabeledCase(
@@ -498,9 +513,9 @@ class TestBacktestSymbolFundingCost:
         seen_tie_breaks: list[str] = []
         real_walk_forward_exit = calibration_module._walk_forward_exit
 
-        def spy(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break="conservative"):
+        def spy(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break="conservative", *args):
             seen_tie_breaks.append(tie_break)
-            return real_walk_forward_exit(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break)
+            return real_walk_forward_exit(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break, *args)
 
         monkeypatch.setattr(calibration_module, "_walk_forward_exit", spy)
         calibration_module.backtest_symbol(
@@ -508,5 +523,122 @@ class TestBacktestSymbolFundingCost:
         )
         assert seen_tie_breaks, "expected _walk_forward_exit to have been called at least once"
         assert all(tb == "optimistic" for tb in seen_tie_breaks)
+
+
+class TestInvertSignals:
+    """Phase 8 "strategy variants" framework: `backtest_symbol(invert_signals=True)`
+    must trade every directional label the OPPOSITE way, with SL/TP ATR
+    multipliers swapped -- not just negate the original return -- and must
+    store `forward_return_pct` pre-negated so the rest of the pipeline
+    (which still re-signs using the label's static, non-inverted
+    `LABEL_DIRECTION`) scores it correctly."""
+
+    _HOUR_MS = 3_600_000
+    _N_CANDLES = 90
+
+    def _history(self) -> pd.DataFrame:
+        from tradingagents.dataflows.vendors.binance.indicators import (
+            add_indicators,
+            klines_to_dataframe,
+        )
+
+        klines = [_trend_kline(i * self._HOUR_MS, base=100.0 + i * 0.5) for i in range(self._N_CANDLES)]
+        return add_indicators(klines_to_dataframe(klines))
+
+    def test_inverted_case_has_same_label_and_horizon_as_original(self):
+        from scanner.calibration import backtest_symbol
+
+        df = self._history()
+        original = backtest_symbol("TESTUSDT", "1h", horizons=(4,), history=df, min_history=60)
+        inverted = backtest_symbol(
+            "TESTUSDT", "1h", horizons=(4,), history=df, min_history=60, invert_signals=True
+        )
+        original_keys = {(c.label, c.entry_time, c.horizon_candles) for c in original}
+        inverted_keys = {(c.label, c.entry_time, c.horizon_candles) for c in inverted}
+        assert original_keys == inverted_keys, "inverting must not change which (label, candle) cases exist"
+
+    def test_inverted_sl_distance_pct_uses_the_swapped_multiplier(self):
+        from agents_crypto.risk_calc import DEFAULT_SL_ATR_MULTIPLIER, DEFAULT_TP_ATR_MULTIPLIER
+        from scanner.calibration import backtest_symbol
+
+        df = self._history()
+        original = {
+            (c.label, c.entry_time): c
+            for c in backtest_symbol("TESTUSDT", "1h", horizons=(4,), history=df, min_history=60)
+        }
+        inverted = {
+            (c.label, c.entry_time): c
+            for c in backtest_symbol(
+                "TESTUSDT", "1h", horizons=(4,), history=df, min_history=60, invert_signals=True
+            )
+        }
+        checked = 0
+        for key, orig_case in original.items():
+            if orig_case.sl_distance_pct is None:
+                continue  # undirected label
+            inv_case = inverted[key]
+            # Same underlying ATR -> ratio of the two stored distances must
+            # equal the ratio of the two (swapped) multipliers, regardless
+            # of the exact ATR value at that candle.
+            ratio = inv_case.sl_distance_pct / orig_case.sl_distance_pct
+            assert ratio == pytest.approx(DEFAULT_TP_ATR_MULTIPLIER / DEFAULT_SL_ATR_MULTIPLIER, rel=1e-6)
+            checked += 1
+        assert checked, "expected at least one directional label to compare"
+
+    def test_inverted_walk_direction_and_multipliers_are_swapped(self, monkeypatch):
+        """Asserts directly against the call args `_walk_forward_exit` is
+        invoked with -- the opposite direction and swapped multipliers --
+        rather than re-deriving the outcome end-to-end."""
+        import scanner.calibration as calibration_module
+
+        df = self._history()
+        seen: list[tuple[str, float, float]] = []
+        real_walk_forward_exit = calibration_module._walk_forward_exit
+
+        def spy(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break="conservative", *mults):
+            seen.append((direction, *mults))
+            return real_walk_forward_exit(df_, i, direction, entry_close, entry_atr, max_horizon, tie_break, *mults)
+
+        monkeypatch.setattr(calibration_module, "_walk_forward_exit", spy)
+        calibration_module.backtest_symbol(
+            "TESTUSDT", "1h", horizons=(4,), history=df, min_history=60, invert_signals=True
+        )
+        assert seen, "expected _walk_forward_exit to have been called at least once"
+        from agents_crypto.risk_calc import DEFAULT_SL_ATR_MULTIPLIER, DEFAULT_TP_ATR_MULTIPLIER
+
+        for direction, sl_mult, tp_mult in seen:
+            assert direction in ("long", "short")
+            assert sl_mult == pytest.approx(DEFAULT_TP_ATR_MULTIPLIER)
+            assert tp_mult == pytest.approx(DEFAULT_SL_ATR_MULTIPLIER)
+
+    def test_inverted_return_is_pre_negated_relative_to_a_symmetric_walk(self, monkeypatch):
+        """With SYMMETRIC SL/TP (swap is a no-op on the levels themselves),
+        the only remaining difference between the original and inverted
+        exit price is the direction walked -- so the inverted return must
+        come out as the exact negation of what a plain direction flip (with
+        no multiplier swap at all) would have produced."""
+        import scanner.calibration as calibration_module
+
+        monkeypatch.setattr(calibration_module, "DEFAULT_SL_ATR_MULTIPLIER", 2.0)
+        monkeypatch.setattr(calibration_module, "DEFAULT_TP_ATR_MULTIPLIER", 2.0)
+        df = self._history()
+        original = {
+            (c.label, c.entry_time): c
+            for c in calibration_module.backtest_symbol("TESTUSDT", "1h", horizons=(4,), history=df, min_history=60)
+        }
+        inverted = {
+            (c.label, c.entry_time): c
+            for c in calibration_module.backtest_symbol(
+                "TESTUSDT", "1h", horizons=(4,), history=df, min_history=60, invert_signals=True
+            )
+        }
+        checked = 0
+        for key, orig_case in original.items():
+            if orig_case.exit_reason not in ("take_profit", "stop_loss"):
+                continue  # only directional, SL/TP-resolved cases are comparable here
+            inv_case = inverted[key]
+            assert inv_case.forward_return_pct == pytest.approx(-orig_case.forward_return_pct, rel=1e-6)
+            checked += 1
+        assert checked, "expected at least one SL/TP-resolved directional case to compare"
 
 

@@ -87,6 +87,13 @@ from scanner.backtesting.historical_universe import (
     is_symbol_in_universe_at,
     load_universe_cache,
 )
+from scanner.backtesting.strategy_variants import (
+    DEFAULT_VARIANT_ID,
+    STRATEGY_VARIANTS,
+    family_suffix,
+    get_variant,
+    report_path_for_variant,
+)
 from scanner.calibration import (
     DEFAULT_ROUND_TRIP_COST_PCT,
     LABEL_DIRECTION,
@@ -283,6 +290,15 @@ class PortfolioBacktestConfig:
     # Display-only metadata (which cache file produced point_in_time_windows,
     # if any) so the dashboard report can show it without re-deriving it.
     point_in_time_universe_cache_path: str | None = None
+    # Phase 8 "strategy variants" framework (see
+    # scanner.backtesting.strategy_variants) -- which named variant of the
+    # scanner's signal to backtest. "original" (default) is the signal
+    # as-is; every other id maps to a documented set of backtest_symbol
+    # kwargs (e.g. "inverted" fades the signal: opposite direction, SL/TP
+    # distances swapped). Lets future strategy ideas reuse this entire
+    # pipeline -- OOS/independence/walk-forward/DSR/block-bootstrap -- by
+    # adding one registry entry instead of a bespoke script.
+    strategy_variant: str = DEFAULT_VARIANT_ID
 
 
 @dataclass
@@ -719,6 +735,7 @@ def build_dashboard_report(
             "block_bootstrap_n_resamples": config.block_bootstrap_n_resamples,
             "block_bootstrap_confidence_pct": config.block_bootstrap_confidence_pct,
             "point_in_time_universe_cache_path": config.point_in_time_universe_cache_path,
+            "strategy_variant": config.strategy_variant,
         },
         "metrics": result.metrics,
         "skipped_symbols": result.skipped_symbols,
@@ -837,6 +854,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
                         kwargs["funding_events"] = funding_events
                     if config.sl_tp_tie_break != "conservative":
                         kwargs["sl_tp_tie_break"] = config.sl_tp_tie_break
+                    kwargs.update(get_variant(config.strategy_variant).backtest_symbol_kwargs)
                     cases = backtest_symbol(symbol, timeframe, horizons=(config.horizon_candles,), **kwargs)
                 else:
                     decision_start_time = None
@@ -845,6 +863,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
                         kwargs["funding_events"] = funding_events
                     if config.sl_tp_tie_break != "conservative":
                         kwargs["sl_tp_tie_break"] = config.sl_tp_tie_break
+                    kwargs.update(get_variant(config.strategy_variant).backtest_symbol_kwargs)
                     cases = backtest_symbol(symbol, timeframe, horizons=(config.horizon_candles,), **kwargs)
             except VendorError:
                 skipped.append(f"{symbol}:{timeframe}")
@@ -1140,6 +1159,15 @@ def _main() -> None:
         "the point-in-time top-N universe at its own entry time is excluded, fixing survivorship bias from "
         "using today's top-N symbol list across the whole backtest period.",
     )
+    parser.add_argument(
+        "--strategy-variant",
+        choices=sorted(STRATEGY_VARIANTS),
+        default=DEFAULT_VARIANT_ID,
+        help="Phase 8 'strategy variants' framework (see scanner.backtesting.strategy_variants): which named "
+        f"variant of the signal to backtest (default {DEFAULT_VARIANT_ID!r}). Each non-default variant's "
+        "--report-json gets its own '__<variant>' suffix and its --experiment-family trials are tracked "
+        "separately, so they are never pooled with a different variant's results.",
+    )
     parser.add_argument("--trades-json", help="Optional path to dump the full trade log as JSON")
     parser.add_argument(
         "--report-json",
@@ -1192,6 +1220,7 @@ def _main() -> None:
         block_bootstrap_confidence_pct=args.block_bootstrap_confidence_pct,
         point_in_time_windows=point_in_time_windows,
         point_in_time_universe_cache_path=args.point_in_time_universe_cache,
+        strategy_variant=args.strategy_variant,
     )
     result = run_portfolio_backtest(config)
 
@@ -1228,12 +1257,16 @@ def _main() -> None:
         print(f"Wrote {len(result.trades)} trades to {args.trades_json}")
 
     if args.report_json:
+        report_json_path = report_path_for_variant(args.report_json, config.strategy_variant)
+        experiment_family = (
+            f"{args.experiment_family}{family_suffix(config.strategy_variant)}" if args.experiment_family else None
+        )
         n_trials = 1
         trial_sharpe_ratios: list[float] | None = None
-        if args.experiment_family:
+        if experiment_family:
             conn = init_experiment_registry(args.experiment_registry_path)
-            n_trials = count_prior_trials(conn, args.experiment_family) + 1
-            notes = f"CLI run: {len(config.symbols)} symbols, --report-json {args.report_json}"
+            n_trials = count_prior_trials(conn, experiment_family) + 1
+            notes = f"CLI run: {len(config.symbols)} symbols, --report-json {report_json_path}"
             if config.point_in_time_windows is not None:
                 notes += (
                     f" (point-in-time universe filter active, excluded "
@@ -1241,7 +1274,7 @@ def _main() -> None:
                 )
             record_experiment(
                 conn,
-                strategy_family=args.experiment_family,
+                strategy_family=experiment_family,
                 timeframe=",".join(config.timeframes),
                 horizon_candles=config.horizon_candles,
                 sl_tp_config={
@@ -1263,6 +1296,7 @@ def _main() -> None:
                     "include_block_bootstrap": config.include_block_bootstrap,
                     "block_bootstrap_n_resamples": config.block_bootstrap_n_resamples,
                     "block_bootstrap_confidence_pct": config.block_bootstrap_confidence_pct,
+                    "strategy_variant": config.strategy_variant,
                 },
                 n_trades=result.metrics.get("n_trades"),
                 sharpe_ratio=result.metrics.get("sharpe_ratio"),
@@ -1270,20 +1304,20 @@ def _main() -> None:
                 result=result.metrics,
                 notes=notes,
             )
-            print(f"Recorded trial #{n_trials} of experiment family '{args.experiment_family}'")
+            print(f"Recorded trial #{n_trials} of experiment family '{experiment_family}'")
 
             # Pull every prior (and this) trial's Sharpe ratio so the DSR
             # benchmark reflects how spread out this family's real attempts
             # have actually been, instead of applying no deflation at all.
-            prior_experiments = fetch_experiments(conn, args.experiment_family, limit=10_000)
+            prior_experiments = fetch_experiments(conn, experiment_family, limit=10_000)
             sharpes = [e["sharpe_ratio"] for e in prior_experiments if e["sharpe_ratio"] is not None]
             if len(sharpes) >= 2:
                 trial_sharpe_ratios = sharpes
 
         report = build_dashboard_report(config, result, n_trials=n_trials, trial_sharpe_ratios=trial_sharpe_ratios)
-        with open(args.report_json, "w", encoding="utf-8") as fh:
+        with open(report_json_path, "w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=2)
-        print(f"Wrote dashboard report to {args.report_json}")
+        print(f"Wrote dashboard report to {report_json_path}")
 
 
 if __name__ == "__main__":

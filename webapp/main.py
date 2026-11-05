@@ -32,6 +32,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from scanner.backtesting.strategy_variants import (
+    DEFAULT_VARIANT_ID,
+    STRATEGY_VARIANTS,
+    get_variant,
+    report_path_for_variant,
+)
 from scanner.drift_detector import active_muted_bucket_set
 from scanner.storage import (
     connect_for_reads,
@@ -297,26 +303,30 @@ def _experiment_registry_path() -> str:
     return os.environ.get("EXPERIMENT_REGISTRY_PATH", "scanner_data/experiment_registry.db")
 
 
-def _backtest_refresh_status_path() -> str:
+def _backtest_refresh_status_path(variant: str = DEFAULT_VARIANT_ID) -> str:
     """Mirrors ``_backtest_report_path()``'s env-var convention. Tracks the
     state of the background job launched by ``POST /api/backtest/refresh``
     so a page reload / a second browser tab can see whether a refresh is
     already in progress, instead of this webapp process holding that state
     only in memory (which a restart would silently lose while the backtest
-    keeps running)."""
-    return os.environ.get("BACKTEST_REFRESH_STATUS_PATH", "scanner_data/backtest_refresh_status.json")
+    keeps running). Suffixed per strategy variant (see
+    ``report_path_for_variant``) so refreshing "inverted" doesn't clobber
+    (or get confused with) "original"'s in-progress state."""
+    base = os.environ.get("BACKTEST_REFRESH_STATUS_PATH", "scanner_data/backtest_refresh_status.json")
+    return report_path_for_variant(base, variant)
 
 
-def _backtest_refresh_log_path() -> str:
-    return os.environ.get("BACKTEST_REFRESH_LOG_PATH", "scanner_data/backtest_refresh.log")
+def _backtest_refresh_log_path(variant: str = DEFAULT_VARIANT_ID) -> str:
+    base = os.environ.get("BACKTEST_REFRESH_LOG_PATH", "scanner_data/backtest_refresh.log")
+    return report_path_for_variant(base, variant)
 
 
 def _backtest_refresh_script_path() -> Path:
     return Path(__file__).resolve().parent.parent / "tool" / "run_full_portfolio_backtest.sh"
 
 
-def _read_refresh_status() -> dict[str, Any]:
-    path = Path(_backtest_refresh_status_path())
+def _read_refresh_status(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
+    path = Path(_backtest_refresh_status_path(variant))
     if not path.exists():
         return {"state": "idle"}
     try:
@@ -325,8 +335,8 @@ def _read_refresh_status() -> dict[str, Any]:
         return {"state": "idle"}
 
 
-def _write_refresh_status(status: dict[str, Any]) -> None:
-    path = Path(_backtest_refresh_status_path())
+def _write_refresh_status(status: dict[str, Any], variant: str = DEFAULT_VARIANT_ID) -> None:
+    path = Path(_backtest_refresh_status_path(variant))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(status, indent=2), encoding="utf-8")
 
@@ -697,7 +707,7 @@ def drift_status() -> dict[str, Any]:
 
 
 @app.get("/api/backtest/report")
-def backtest_report() -> dict[str, Any]:
+def backtest_report(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
     """Reads the cached retrospective portfolio-backtest report (Phase 8
     Korak 2 — see PHASE8_PROFITABILITY_RESEARCH_TODO.md) for the "🧪
     Backtest" tab. This is a **counterfactual simulation** replayed over
@@ -709,9 +719,20 @@ def backtest_report() -> dict[str, Any]:
     this request handler, since the VPS has no spare CPU/network budget to
     run it inline on every page load.
 
+    ``variant`` (Phase 8 "strategy variants" framework — see
+    ``scanner.backtesting.strategy_variants``) selects which strategy's
+    report to read, e.g. ``?variant=inverted`` for the fade/invert variant
+    — defaults to ``"original"``, which keeps every existing caller's URL
+    unchanged. Raises 400 for an unregistered variant id (almost always a
+    typo, not an intentional choice).
+
     Returns ``{"available": False}`` rather than a 404/500 if no report has
     been generated yet, so the frontend can render a friendly empty state."""
-    path = Path(_backtest_report_path())
+    try:
+        get_variant(variant)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    path = Path(report_path_for_variant(_backtest_report_path(), variant))
     if not path.exists():
         return {"available": False}
     try:
@@ -720,6 +741,29 @@ def backtest_report() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Could not read backtest report: {exc}") from None
     report["available"] = True
     return report
+
+
+@app.get("/api/backtest/variants")
+def backtest_variants() -> dict[str, Any]:
+    """Lists every registered strategy variant (see
+    ``scanner.backtesting.strategy_variants``) for the Backtest tab's
+    "Strategija" selector, plus whether that variant already has a report
+    file on disk -- lets the frontend grey out/flag variants nobody has
+    ever run yet instead of silently showing an empty state after the user
+    picks them."""
+    base_report_path = _backtest_report_path()
+    return {
+        "variants": [
+            {
+                "variant_id": variant.variant_id,
+                "label": variant.label,
+                "description": variant.description,
+                "has_report": Path(report_path_for_variant(base_report_path, variant.variant_id)).exists(),
+            }
+            for variant in STRATEGY_VARIANTS.values()
+        ],
+        "default_variant_id": DEFAULT_VARIANT_ID,
+    }
 
 
 @app.get("/api/backtest/experiments")
@@ -748,7 +792,7 @@ def backtest_experiments(limit: int = 50) -> dict[str, Any]:
 
 
 @app.post("/api/backtest/refresh")
-def backtest_refresh() -> dict[str, Any]:
+def backtest_refresh(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
     """Explicit, on-demand only (same spirit as ``/api/analyze/{symbol}``):
     launches ``tool/run_full_portfolio_backtest.sh`` -- the one canonical
     command that combines the point-in-time universe filter, real funding
@@ -760,11 +804,23 @@ def backtest_refresh() -> dict[str, Any]:
     limited vCPU budget; falls back to un-throttled (nice only) if
     ``cpulimit`` isn't installed, rather than failing the request.
 
-    Refuses to start a second run while one is already in progress (checked
-    via the PID recorded in ``_backtest_refresh_status_path()``). The
-    frontend polls ``GET /api/backtest/refresh/status`` for progress and
-    reloads the report once the state flips to "done"."""
-    status = _read_refresh_status()
+    ``variant`` (Phase 8 "strategy variants" framework) is forwarded to the
+    script as ``--strategy-variant`` so it runs that variant's own canonical
+    config and writes to that variant's own report/status/log files instead
+    of the default ("original") ones -- refreshing "inverted" can run
+    concurrently with (and never clobbers) a refresh of "original".
+
+    Refuses to start a second run of the SAME variant while one is already
+    in progress (checked via the PID recorded in that variant's own
+    ``_backtest_refresh_status_path()``). The frontend polls
+    ``GET /api/backtest/refresh/status`` for progress and reloads the
+    report once the state flips to "done"."""
+    try:
+        get_variant(variant)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    status = _read_refresh_status(variant)
     if _refresh_in_progress(status):
         return {"started": False, "reason": "already_running", "status": status}
 
@@ -772,16 +828,20 @@ def backtest_refresh() -> dict[str, Any]:
     if not script_path.exists():
         raise HTTPException(status_code=500, detail=f"Backtest script not found: {script_path}")
 
-    log_path = Path(_backtest_refresh_log_path())
+    log_path = Path(_backtest_refresh_log_path(variant))
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(UTC).isoformat()
 
+    script_args = [str(script_path)]
+    if variant != DEFAULT_VARIANT_ID:
+        script_args += ["--strategy-variant", variant]
+
     with open(log_path, "a", encoding="utf-8") as log_fh:
-        log_fh.write(f"\n=== refresh triggered via dashboard button {started_at} ===\n")
+        log_fh.write(f"\n=== refresh triggered via dashboard button {started_at} (variant={variant}) ===\n")
         log_fh.flush()
         try:
             proc = subprocess.Popen(
-                ["nice", "-n", "19", "bash", str(script_path)],
+                ["nice", "-n", "19", "bash", *script_args],
                 cwd=str(script_path.parent.parent),
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
@@ -805,23 +865,30 @@ def backtest_refresh() -> dict[str, Any]:
         "started_at": started_at,
         "finished_at": None,
         "log_path": str(log_path),
+        "variant": variant,
     }
-    _write_refresh_status(status)
+    _write_refresh_status(status, variant)
     return {"started": True, "status": status}
 
 
 @app.get("/api/backtest/refresh/status")
-def backtest_refresh_status() -> dict[str, Any]:
+def backtest_refresh_status(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
     """Polled by the "🔄 Osvježi" button's status text while a refresh is
     running. There's no separate watcher process -- the transition out of
     "running" happens lazily, the first time anyone calls this endpoint
     after the backgrounded process has actually exited. Distinguishes
-    "done" from "error" by checking whether ``report.json``'s mtime moved
-    forward after the run started (the script can exit 0 having skipped
-    writing the report on, e.g., every symbol failing to fetch)."""
-    status = _read_refresh_status()
+    "done" from "error" by checking whether that variant's own report
+    JSON's mtime moved forward after the run started (the script can exit 0
+    having skipped writing the report on, e.g., every symbol failing to
+    fetch)."""
+    try:
+        get_variant(variant)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    status = _read_refresh_status(variant)
     if status.get("state") == "running" and isinstance(status.get("pid"), int) and not _pid_is_running(status["pid"]):
-        report_path = Path(_backtest_report_path())
+        report_path = Path(report_path_for_variant(_backtest_report_path(), variant))
         succeeded = False
         started_at = status.get("started_at")
         if report_path.exists() and started_at:
@@ -833,7 +900,7 @@ def backtest_refresh_status() -> dict[str, Any]:
                 succeeded = False
         status["state"] = "done" if succeeded else "error"
         status["finished_at"] = datetime.now(UTC).isoformat()
-        _write_refresh_status(status)
+        _write_refresh_status(status, variant)
     return status
 
 
