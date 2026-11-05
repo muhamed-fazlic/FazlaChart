@@ -546,6 +546,24 @@ def backtest_symbol(
     return cases
 
 
+def net_return_pct_series(direction: str | None, group: pd.DataFrame, cost_pct: float) -> pd.Series | None:
+    """Direction-corrected, cost-and-funding-adjusted net return for every
+    case in ``group`` (a frame built from :class:`LabeledCase` rows, same
+    shape ``summarize()`` groups by). ``None`` for undirected labels, which
+    have no win/loss concept at all.
+
+    This is the single source of truth for "what counts as a win" that
+    both :func:`summarize` and
+    :mod:`scanner.validation.independence` (Phase 8 Korak 6) use — factored
+    out specifically so the two can never silently drift apart on the cost/
+    funding/sign correction and disagree about which cases actually won."""
+    if direction == "short":
+        return -group["forward_return_pct"] - cost_pct - group["funding_cost_pct"]
+    if direction == "long":
+        return group["forward_return_pct"] - cost_pct - group["funding_cost_pct"]
+    return None
+
+
 def summarize(
     cases: list[LabeledCase],
     cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT,
@@ -575,12 +593,7 @@ def summarize(
     stats: list[CalibrationStats] = []
     for (label, horizon), group in df.groupby(["label", "horizon_candles"]):
         direction = LABEL_DIRECTION.get(label)
-        if direction == "short":
-            net_return = -group["forward_return_pct"] - cost_pct - group["funding_cost_pct"]
-        elif direction == "long":
-            net_return = group["forward_return_pct"] - cost_pct - group["funding_cost_pct"]
-        else:
-            net_return = None  # undirected: report magnitude only, no win rate
+        net_return = net_return_pct_series(direction, group, cost_pct)
 
         if net_return is not None:
             wins = net_return > 0

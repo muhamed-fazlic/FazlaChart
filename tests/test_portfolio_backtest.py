@@ -561,6 +561,94 @@ class TestOosValidationWiring:
         assert received == {"cost_pct": 0.2, "test_fraction": 0.25, "min_test_n": 10}
 
 
+class TestIndependenceValidationWiring:
+    """Phase 8 Korak 6: sample-independence correction is pure
+    re-computation on cases already fetched for the backtest (same cost
+    category as OOS validation above), so it is wired on by default, with
+    its pooled summary riding along in `result.metrics` for the experiment
+    registry, and its full per-label detail in
+    `result.independence_validation` for the dashboard report."""
+
+    def _config(self, **overrides) -> PortfolioBacktestConfig:
+        base = {
+            "symbols": ("BTCUSDT",),
+            "timeframes": ("1h",),
+            "initial_capital": 10_000.0,
+            "risk_per_trade_pct": 1.0,
+            "max_concurrent_positions": 5,
+            "max_concurrent_per_direction": 5,
+            "round_trip_cost_pct": 0.0,
+            "extra_slippage_pct": 0.0,
+            "warmup_candles": 0,
+            "horizon_candles": 1,
+        }
+        base.update(overrides)
+        return PortfolioBacktestConfig(**base)
+
+    def test_default_calls_summarize_with_independence_and_merges_summary_into_metrics(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+        from scanner.validation.independence import IndependenceClusterStats
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        fake_independence = [
+            IndependenceClusterStats(
+                label="trend:bullish",
+                direction="long",
+                horizon_candles=1,
+                n_raw=45,
+                win_rate_raw_pct=60.0,
+                win_rate_raw_ci_low_pct=50.0,
+                n_independent_events=10,
+                win_rate_independent_pct=60.0,
+                win_rate_independent_ci_low_pct=35.0,
+                holds_up_independent=False,
+                warning="test",
+            )
+        ]
+        monkeypatch.setattr(module, "summarize_with_independence", lambda *a, **kw: fake_independence)
+
+        result = run_portfolio_backtest(self._config())
+
+        assert result.independence_validation == fake_independence
+        assert result.metrics["labels_total_independent_check"] == 1
+        assert result.metrics["labels_holding_up_independent"] == 0
+        assert result.metrics["independent_events_total"] == 10
+        assert result.metrics["raw_cases_total_for_independence_check"] == 45
+
+    def test_include_independence_validation_false_skips_it_entirely(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        called = []
+        monkeypatch.setattr(module, "summarize_with_independence", lambda *a, **kw: called.append(1) or [])
+
+        result = run_portfolio_backtest(self._config(include_independence_validation=False))
+
+        assert called == []
+        assert result.independence_validation == []
+        assert "labels_total_independent_check" not in result.metrics
+
+    def test_independence_min_n_is_forwarded(self, monkeypatch):
+        from scanner.backtesting import portfolio_backtest as module
+
+        warm_up = [_case("trend:bullish", h, forward_return_pct=5.0) for h in range(45)]
+        monkeypatch.setattr(module, "backtest_symbol", lambda symbol, timeframe, horizons, limit: warm_up)
+        received = {}
+
+        def fake_summarize(cases, cost_pct, min_independent_n):
+            received["cost_pct"] = cost_pct
+            received["min_independent_n"] = min_independent_n
+            return []
+
+        monkeypatch.setattr(module, "summarize_with_independence", fake_summarize)
+        config = self._config(round_trip_cost_pct=0.2, independence_min_n=5)
+        run_portfolio_backtest(config)
+
+        assert received == {"cost_pct": 0.2, "min_independent_n": 5}
+
+
 class TestMetricsComputation:
     def test_known_trades_produce_expected_net_profit_and_win_rate(self):
         from scanner.backtesting.portfolio_backtest import Trade
@@ -682,12 +770,30 @@ class TestDashboardReport:
                 warning=None,
             )
         ]
+        from scanner.validation.independence import IndependenceClusterStats
+
+        independence_validation = [
+            IndependenceClusterStats(
+                label="trend:bullish",
+                direction="long",
+                horizon_candles=1,
+                n_raw=40,
+                win_rate_raw_pct=60.0,
+                win_rate_raw_ci_low_pct=45.0,
+                n_independent_events=12,
+                win_rate_independent_pct=58.0,
+                win_rate_independent_ci_low_pct=30.0,
+                holds_up_independent=False,
+                warning="test",
+            )
+        ]
         result = PortfolioBacktestResult(
             trades=trades,
             equity_curve=equity_curve,
             metrics=metrics,
             skipped_symbols=["BADUSDT"],
             oos_validation=oos_validation,
+            independence_validation=independence_validation,
         )
 
         report = build_dashboard_report(config, result)
@@ -696,6 +802,7 @@ class TestDashboardReport:
         assert report["config"]["symbols"] == ["BTCUSDT", "ETHUSDT"]
         assert report["config"]["sl_tp_tie_break"] == "conservative"
         assert report["config"]["include_oos_validation"] is True
+        assert report["config"]["include_independence_validation"] is True
         assert report["oos_validation"] == [
             {
                 "label": "trend:bullish",
@@ -708,6 +815,21 @@ class TestDashboardReport:
                 "test_win_rate_ci_low_pct": 52.0,
                 "holds_up": True,
                 "warning": None,
+            }
+        ]
+        assert report["independence_validation"] == [
+            {
+                "label": "trend:bullish",
+                "direction": "long",
+                "horizon_candles": 1,
+                "n_raw": 40,
+                "win_rate_raw_pct": 60.0,
+                "win_rate_raw_ci_low_pct": 45.0,
+                "n_independent_events": 12,
+                "win_rate_independent_pct": 58.0,
+                "win_rate_independent_ci_low_pct": 30.0,
+                "holds_up_independent": False,
+                "warning": "test",
             }
         ]
         assert report["metrics"]["n_trades"] == 2

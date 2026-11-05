@@ -107,6 +107,11 @@ from scanner.validation.experiment_registry import (
     init_db as init_experiment_registry,
     record_experiment,
 )
+from scanner.validation.independence import (
+    MIN_INDEPENDENT_EVENTS_N,
+    IndependenceClusterStats,
+    summarize_with_independence,
+)
 from scanner.validation.statistical_validation import deflated_sharpe_ratio
 from tradingagents.dataflows.errors import VendorError
 
@@ -211,6 +216,22 @@ class PortfolioBacktestConfig:
     include_oos_validation: bool = True
     oos_test_fraction: float = OOS_TEST_FRACTION
     oos_min_test_n: int = OOS_MIN_TEST_N
+    # Phase 8 Korak 6 (this one is the actual "Korak 6" per
+    # PHASE8_PROFITABILITY_RESEARCH_TODO.md -- the "Korak 6" label on
+    # include_oos_validation above is a pre-existing, harmless naming quirk
+    # that predates this field and is left alone as out of scope here):
+    # sample-independence correction. Every Wilson interval above (and the
+    # OOS check above it) silently assumes each case in a (label, horizon)
+    # group is an independent trial, but several symbols can fire the same
+    # label from one correlated market-wide move (e.g. a BTC pump) within
+    # the same window -- one event counted as several. This re-runs the
+    # Wilson interval over the number of time-overlapping-event CLUSTERS
+    # instead of raw case count. Pure re-computation on cases already
+    # fetched (no extra network calls), so safe to default to True, same as
+    # include_oos_validation. See scanner.validation.independence's module
+    # docstring for the full method and its deliberately bounded scope.
+    include_independence_validation: bool = True
+    independence_min_n: int = MIN_INDEPENDENT_EVENTS_N
     # Phase 8 Korak 4 (survivorship-bias fix): when set, any candidate event
     # whose symbol was NOT in the point-in-time top-N universe at its own
     # entry_time is dropped before the portfolio simulation runs -- i.e. a
@@ -239,6 +260,13 @@ class PortfolioBacktestResult:
     # by label, not by symbol. Empty if config.include_oos_validation is
     # False or there were no cases at all.
     oos_validation: list[OutOfSampleResult] = field(default_factory=list)
+    # Phase 8 Korak 6: same grouping as oos_validation above, but each
+    # entry compares the raw (today's) win-rate CI against one recomputed
+    # over independent-event clusters -- see
+    # scanner.validation.independence.summarize_with_independence. Empty if
+    # config.include_independence_validation is False or there were no
+    # cases at all.
+    independence_validation: list[IndependenceClusterStats] = field(default_factory=list)
 
 
 def _parse_time(iso_timestamp: str) -> datetime:
@@ -592,6 +620,8 @@ def build_dashboard_report(
             "include_oos_validation": config.include_oos_validation,
             "oos_test_fraction": config.oos_test_fraction,
             "oos_min_test_n": config.oos_min_test_n,
+            "include_independence_validation": config.include_independence_validation,
+            "independence_min_n": config.independence_min_n,
             "point_in_time_universe_cache_path": config.point_in_time_universe_cache_path,
         },
         "metrics": result.metrics,
@@ -617,6 +647,22 @@ def build_dashboard_report(
                 "warning": r.warning,
             }
             for r in result.oos_validation
+        ],
+        "independence_validation": [
+            {
+                "label": r.label,
+                "direction": r.direction,
+                "horizon_candles": r.horizon_candles,
+                "n_raw": r.n_raw,
+                "win_rate_raw_pct": r.win_rate_raw_pct,
+                "win_rate_raw_ci_low_pct": r.win_rate_raw_ci_low_pct,
+                "n_independent_events": r.n_independent_events,
+                "win_rate_independent_pct": r.win_rate_independent_pct,
+                "win_rate_independent_ci_low_pct": r.win_rate_independent_ci_low_pct,
+                "holds_up_independent": r.holds_up_independent,
+                "warning": r.warning,
+            }
+            for r in result.independence_validation
         ],
         "point_in_time_universe": (
             {
@@ -784,6 +830,23 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
         # below), not just in this run's own report.
         metrics["oos_labels_holding_up"] = sum(1 for r in oos_validation if r.holds_up)
         metrics["oos_labels_total"] = len(oos_validation)
+
+    independence_validation: list[IndependenceClusterStats] = []
+    if config.include_independence_validation and all_cases:
+        independence_validation = summarize_with_independence(
+            all_cases,
+            cost_pct=config.round_trip_cost_pct,
+            min_independent_n=config.independence_min_n,
+        )
+        # Same "rides along in metrics" pattern as oos_labels_holding_up
+        # above, so a stale/old registry entry and a fresh one are both
+        # comparable without re-opening the full report.
+        metrics["independent_events_total"] = sum(r.n_independent_events for r in independence_validation)
+        metrics["raw_cases_total_for_independence_check"] = sum(r.n_raw for r in independence_validation)
+        metrics["labels_holding_up_independent"] = sum(
+            1 for r in independence_validation if r.holds_up_independent
+        )
+        metrics["labels_total_independent_check"] = len(independence_validation)
     return PortfolioBacktestResult(
         trades=trades,
         equity_curve=equity_curve,
@@ -791,6 +854,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
         skipped_symbols=skipped,
         point_in_time_filtered_count=point_in_time_filtered_count,
         oos_validation=oos_validation,
+        independence_validation=independence_validation,
     )
 
 
@@ -865,6 +929,20 @@ def _main() -> None:
         help=f"Minimum held-out test cases required before an OOS result is trusted (default {OOS_MIN_TEST_N}).",
     )
     parser.add_argument(
+        "--no-independence-validation",
+        action="store_true",
+        help="Phase 8 Korak 6: skip the sample-independence correction (scanner.validation.independence) that "
+        "re-runs the Wilson interval over clusters of time-overlapping cases (any symbol) instead of raw case "
+        "count. On by default -- it's pure re-computation on cases already fetched, no extra network calls.",
+    )
+    parser.add_argument(
+        "--independence-min-n",
+        type=int,
+        default=MIN_INDEPENDENT_EVENTS_N,
+        help="Minimum independent-event clusters required before an independence-corrected result is trusted "
+        f"(default {MIN_INDEPENDENT_EVENTS_N}).",
+    )
+    parser.add_argument(
         "--point-in-time-universe-cache",
         help="Phase 8 Korak 4: path to a cache produced by "
         "'python -m scanner.backtesting.historical_universe'. When given, any trade whose symbol was not in "
@@ -912,6 +990,8 @@ def _main() -> None:
         include_oos_validation=not args.no_oos_validation,
         oos_test_fraction=args.oos_test_fraction,
         oos_min_test_n=args.oos_min_test_n,
+        include_independence_validation=not args.no_independence_validation,
+        independence_min_n=args.independence_min_n,
         point_in_time_windows=point_in_time_windows,
         point_in_time_universe_cache_path=args.point_in_time_universe_cache,
     )
@@ -976,6 +1056,8 @@ def _main() -> None:
                     "include_oos_validation": config.include_oos_validation,
                     "oos_test_fraction": config.oos_test_fraction,
                     "oos_min_test_n": config.oos_min_test_n,
+                    "include_independence_validation": config.include_independence_validation,
+                    "independence_min_n": config.independence_min_n,
                 },
                 n_trades=result.metrics.get("n_trades"),
                 sharpe_ratio=result.metrics.get("sharpe_ratio"),

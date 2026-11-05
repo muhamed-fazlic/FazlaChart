@@ -595,6 +595,7 @@ async function loadBacktestTab() {
       renderBacktestBreakdownTable("backtest-breakdown-label", "Po label-u (setup tipu)", breakdown.by_label, "Label");
       renderStatisticalValidation(report.statistical_validation);
       renderOosValidation(report.oos_validation);
+      renderIndependenceValidation(report.independence_validation);
     }
   } catch (err) {
     console.error("Could not load backtest report:", err);
@@ -774,6 +775,57 @@ function renderOosValidation(oos) {
     </table>`;
 }
 
+// Phase 8 Korak 6: per (label, horizon) comparison of the raw win-rate CI
+// (today's number, one row per historical case) against one recomputed
+// after collapsing time-overlapping cases -- any symbol -- into single
+// independent events first. A label can look confirmed on raw N and still
+// be a handful of correlated market moves counted many times over; this is
+// the check for that specific failure mode, distinct from (and upstream
+// of) the in/out-of-sample check above.
+function renderIndependenceValidation(independence) {
+  const el = document.getElementById("backtest-independence-validation");
+  if (!independence || !independence.length) {
+    el.className = "bucket-breakdown muted";
+    el.textContent =
+      "Nema provjere nezavisnosti uzorka u ovom izvještaju (isključena preko --no-independence-validation, " +
+      "ili nema dovoljno slučajeva, ili je izvještaj generisan prije dodavanja ove funkcije).";
+    return;
+  }
+  el.className = "bucket-breakdown";
+  const rows = independence
+    .map((r) => {
+      const badge = r.holds_up_independent
+        ? '<span class="pos">drži se</span>'
+        : `<span class="neg">${r.warning ? "ne drži se" : "slabije nakon korekcije"}</span>`;
+      return `
+    <tr>
+      <td><b>${r.label}</b></td>
+      <td>${r.direction ?? "—"}</td>
+      <td>${r.horizon_candles}</td>
+      <td>${r.n_raw} (${fmt(r.win_rate_raw_pct, 1)}%, CI low ${r.win_rate_raw_ci_low_pct != null ? fmt(r.win_rate_raw_ci_low_pct, 1) + "%" : "—"})</td>
+      <td>${r.n_independent_events} (${r.win_rate_independent_pct != null ? fmt(r.win_rate_independent_pct, 1) + "%" : "—"}, CI low ${r.win_rate_independent_ci_low_pct != null ? fmt(r.win_rate_independent_ci_low_pct, 1) + "%" : "—"})</td>
+      <td>${badge}</td>
+      <td class="muted">${r.warning ?? ""}</td>
+    </tr>`;
+    })
+    .join("");
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">
+      🧩 Provjera nezavisnosti uzorka (po label-u) — da li su preklapajući trejdovi (bilo kog simbola) naduvali broj "dokaza"
+    </div>
+    <p class="dsr-explainer muted">
+      Jedan tržišni pokret (npr. BTC pumpa) može upaliti isti label na više povezanih altcoin-a gotovo istovremeno —
+      to je JEDAN događaj, ne nekoliko nezavisnih potvrda. "Sirovo N" broji svaki slučaj posebno; "Nezavisni događaji"
+      spaja vremenski preklapajuće slučajeve (bilo kog simbola) u jedan prije nego što se ponovo računa 95% CI. Ako
+      je "drži se" kolona "ne drži se" ovdje a gore (OOS) je bila "drži se", edge je vjerovatno samo par korelisanih
+      pokreta koji su se brojali više puta, ne širok, stvaran uzorak.
+    </p>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Label</th><th>Smjer</th><th>Horizon</th><th>Sirovo N (win%, CI low)</th><th>Nezavisni događaji (win%, CI low)</th><th>Status</th><th>Napomena</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 // Deliberately a separate fetch from loadBacktestTab's try/catch -- the
 // experiment registry can be populated (and interesting to see) even when
 // no dashboard report has been generated yet, and vice versa, so one
@@ -838,6 +890,8 @@ function renderBacktestUnavailable() {
   document.getElementById("backtest-full-config").textContent = "";
   document.getElementById("backtest-oos-validation").className = "bucket-breakdown muted";
   document.getElementById("backtest-oos-validation").textContent = "";
+  document.getElementById("backtest-independence-validation").className = "bucket-breakdown muted";
+  document.getElementById("backtest-independence-validation").textContent = "";
 }
 
 function renderBacktestMeta(report) {
@@ -899,6 +953,12 @@ function renderBacktestFullConfig(cfg) {
       "In/out-of-sample provjera",
       cfg.include_oos_validation
         ? `<span class="pos">uključena</span> (test prozor: posljednjih ${Math.round((cfg.oos_test_fraction ?? 0) * 100)}% slučajeva, min. ${cfg.oos_min_test_n ?? "—"} za pouzdanost)`
+        : '<span class="muted">isključena</span>',
+    ],
+    [
+      "Provjera nezavisnosti uzorka",
+      cfg.include_independence_validation
+        ? `<span class="pos">uključena</span> (preklapajući trejdovi bilo kog simbola broje se kao jedan događaj; min. ${cfg.independence_min_n ?? "—"} nezavisnih događaja za pouzdanost)`
         : '<span class="muted">isključena</span>',
     ],
   ];
