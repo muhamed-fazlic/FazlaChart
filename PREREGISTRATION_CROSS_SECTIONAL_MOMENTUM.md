@@ -221,3 +221,89 @@ ni ovaj ne prodje.
 - **Manji n_independent nego prethodne dvije porodice** (sekcija 3-5) je
   strukturalna karakteristika cross-sectional pristupa (jedna opservacija
   po danu za cijelu kosaru, ne po simbolu), ne greska u metodologiji.
+
+## 9. Implementation notes (appended AFTER coding, BEFORE the one run --
+design decisions not pinned above)
+
+This section is appended by the implementer at the time
+`scanner/backtesting/cross_sectional_momentum_backtest.py` was written, as
+instructed by this doc's own rule (section 1-8 content above is frozen and
+unedited; only this new section is new). Every item below is a decision
+the pre-registered spec deliberately left open and asked to be recorded,
+not silently made.
+
+1. **Price data / candle timeframe.** 1h candles
+   (`cached_load_extended_history(..., "1h", 8000, end_timestamp_ms, ...)`),
+   same choice as the funding-extreme-reversion module, for consistency.
+   Entry/24h-lookback/exit price = close of the most recent candle at or
+   before the target timestamp (never a candle opening after it, to
+   preserve no-look-ahead).
+2. **Rebalance-timestamp grid.** Anchored to the EARLIEST candle
+   timestamp across all requested symbols' fetched histories, then
+   stepped forward by exactly 24h until the latest candle timestamp
+   across all histories is reached. This does not hand-pick a particular
+   hour-of-day; it simply follows whatever hour the earliest available
+   candle happens to fall on, so no rebalance timestamp is invented ahead
+   of real data. The last grid point cannot form a basket (no further
+   grid point 24h later to price the exit against) and is therefore
+   always excluded from `n_independent`.
+3. **Basket-to-single-number capital convention.** Section 2's "izbor
+   jedinice kapitala ne mijenja % povrat dok je simetrican" is read as:
+   whichever capital unit you use, the WEIGHT of a symbol within its own
+   leg (1/N) is unaffected. It does not, on its own, pin how the two legs
+   combine into one basket-wide % return. The simplest, least-levered
+   reading is used here: each leg represents HALF of total capital
+   (50%/50%, not 100%/100% leveraged), so a symbol's overall weight is
+   `0.5 / N` (10% of total capital for N=5). This keeps the reported
+   basket return directly comparable in magnitude to a single-leg
+   directional bet, rather than doubled by leverage.
+4. **Turnover-cost accounting for pure exits.** A symbol that leaves a
+   leg entirely (held at `t-1`, absent from the basket at `t`, not simply
+   flipped into the other leg) still pays its full round-trip cost -- it
+   is included in the cost-charged set even though it does not appear in
+   the CURRENT basket. The `turnover` diagnostic itself, however, is
+   measured only over TODAY's basket slots (`2*N`): the fraction of
+   today's positions that are not a same-leg continuation from the prior
+   rebalance. This is the simplest direct reading of "udio pozicija koje
+   su se promijenile po rebalansu" (today's basket IS "the positions" for
+   that rebalance) -- not otherwise pinned by section 2.
+5. **First rebalance has no prior basket.** Every symbol in the very
+   first formed basket is treated as a fresh entrant (full cost charged,
+   turnover = 1.0) -- there is no rebalance before it to compare against.
+6. **Funding-data-optional participation.** A symbol with usable candle
+   data but no funding history is still included in ranking/pricing,
+   contributing 0 funding cost for any period it is held, rather than
+   being excluded from the universe entirely. The pre-registration doc
+   does not say whether missing funding data should gate participation;
+   this choice maximizes `n_independent` without ever inventing a funding
+   number, since `funding_cost_pct` on an empty events list is defined as
+   0 by that function's own existing contract.
+7. **Measured sigma definition.** Sample standard deviation
+   (`statistics.stdev`, i.e. `ddof=1`), not population standard deviation
+   -- same convention as the funding hypothesis's implementation, for
+   consistency, and the standard inferential choice when estimating a
+   population sigma from a single finite observed sample.
+8. **Block-bootstrap seed.** No explicit `seed` is passed to
+   `block_bootstrap_confidence_interval` (mirrors both prior hypotheses'
+   own call sites) -- the CI is therefore not bit-for-bit reproducible run
+   over run, though with the library's default `n_resamples` the
+   variation between runs is expected to be small. This affects only the
+   CI's own estimation noise, not which rebalance periods/baskets were
+   formed (that part is fully deterministic given a frozen
+   `end_timestamp_ms`).
+9. **Point-in-time universe filter.** Supported via an optional
+   `--point-in-time-universe-cache` CLI flag, reusing
+   `historical_universe.load_universe_cache`/`is_symbol_in_universe_at`
+   verbatim (same mechanism as both prior hypotheses). As with the
+   funding-extreme-reversion run, no such cache existed on disk at the
+   time of this run (`scanner_data/` is gitignored and building one from
+   scratch was out of scope for this task), so the filter ran disabled;
+   the fallback eligibility check is simply "does the symbol have a
+   priced candle at both `t-24h` and `t`", which already correctly
+   excludes not-yet-listed symbols from ranking (point-in-time by
+   construction via each symbol's own candle-history start), just without
+   a formal top-N-by-volume cache.
+10. **Cost-model base rate.** `DEFAULT_ROUND_TRIP_COST_PCT` plus
+    `round_trip_cost_pct_for`'s existing per-symbol liquidity tiers, used
+    as-is with no override -- same base rate both prior hypotheses use by
+    default.
