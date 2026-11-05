@@ -992,9 +992,13 @@ def _strategy_lab_db_path() -> str:
 def strategy_lab_overview() -> dict[str, Any]:
     """Read-only overview for the "⚒️ Strategy Lab" tab: current best
     confirmed strategy (if any), the Layer 1 leaderboard, weekly snapshot
-    history, Layer 2 confirmation history, and the rolling-holdout status.
-    Never triggers a mining/snapshot/confirmation run itself — purely
-    reads what ``scanner.strategy_lab_scheduler`` has already produced.
+    history, Layer 2 confirmation history, the rolling-holdout status, plus
+    a compact "what's Layer 1 doing right now" summary (total candidates
+    ever tested, the single most-recently-tested one, and the single
+    best-ever-by-composite-score one — both of the latter all-time, not
+    just from the most recent mining cycle). Never triggers a
+    mining/snapshot/confirmation run itself — purely reads what
+    ``scanner.strategy_lab_scheduler`` has already produced.
 
     Returns ``{"available": False}`` rather than a 404/500 if
     ``scanner_data/strategy_lab.db`` doesn't exist yet (e.g. the scheduler
@@ -1012,6 +1016,9 @@ def strategy_lab_overview() -> dict[str, Any]:
         confirmations = strategy_lab_storage.fetch_confirmations(conn, limit=100)
         current_best = strategy_lab_storage.fetch_current_best(conn)
         holdout_state = strategy_lab_storage.fetch_rolling_holdout_state(conn)
+        total_candidates_tested = strategy_lab_storage.fetch_total_candidates_tested(conn)
+        latest_candidate = strategy_lab_storage.fetch_latest_candidate(conn)
+        best_candidate_all_time = strategy_lab_storage.fetch_best_candidate_all_time(conn)
     finally:
         conn.close()
     return {
@@ -1021,6 +1028,9 @@ def strategy_lab_overview() -> dict[str, Any]:
         "weekly_snapshots": weekly_snapshots,
         "confirmations": confirmations,
         "rolling_holdout_state": holdout_state,
+        "total_candidates_tested": total_candidates_tested,
+        "latest_candidate": latest_candidate,
+        "best_candidate_all_time": best_candidate_all_time,
     }
 
 

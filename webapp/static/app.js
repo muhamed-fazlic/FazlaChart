@@ -2328,6 +2328,7 @@ async function loadStrategyLabTab() {
     } else {
       document.getElementById("strategy-lab-unavailable").classList.add("hidden");
       document.getElementById("strategy-lab-content").classList.remove("hidden");
+      renderStrategyLabAtAGlance(data.total_candidates_tested, data.latest_candidate, data.best_candidate_all_time);
       renderStrategyLabCurrentBest(data.current_best);
       renderStrategyLabLeaderboard(data.leaderboard || []);
       renderStrategyLabSnapshots(data.weekly_snapshots || []);
@@ -2363,6 +2364,39 @@ function strategyLabCiRangeHtml(low, high, survives) {
   if (low === null || low === undefined || high === null || high === undefined) return "";
   const badge = survives ? `<span class="research-badge research-badge-confirmed">CI &gt; 0</span>` : `<span class="research-badge research-badge-noedge">CI uključuje 0</span>`;
   return `[${fmt(low)}%, ${fmt(high)}%] ${badge}`;
+}
+
+function renderStrategyLabAtAGlance(totalTested, latest, bestAllTime) {
+  const el = document.getElementById("strategy-lab-at-a-glance");
+  if (!totalTested) {
+    el.innerHTML = `<p class="muted">Layer 1 još nije izvršio nijedan mining ciklus — ovdje će se pojaviti brojka čim prvi krene.</p>`;
+    return;
+  }
+  const card = (label, c, detailId) => {
+    if (!c) return `<div class="strategy-lab-best-card"><div class="strategy-lab-best-title">${label}</div><p class="muted">—</p></div>`;
+    const detailJson = escapeHtml(JSON.stringify(c, null, 2));
+    return `
+      <div class="strategy-lab-best-card" onclick="toggleStrategyLabRow('${detailId}')" style="cursor:pointer;">
+        <div class="strategy-lab-best-title">${label}: ${c.template} / ${c.tercile} / ${c.variant_label}</div>
+        <div>Neto: <b>${c.net_observed_pct === null || c.net_observed_pct === undefined ? "—" : `${fmt(c.net_observed_pct)}%`}</b> · Kompozitni skor: <b>${fmt(c.composite_score)}</b></div>
+        <div class="muted">Rang #${c.all_time_rank} od ${totalTested} ikad testiranih (po kompozitnom skoru) · testirano: ${c.mined_at ? new Date(c.mined_at).toLocaleString("bs-BA") : "—"}</div>
+        <div class="muted-caption">(klikni za puni JSON)</div>
+      </div>
+      <div id="${detailId}" class="hidden"><pre style="white-space:pre-wrap; font-size:0.8em; max-height:300px; overflow-y:auto;">${detailJson}</pre></div>`;
+  };
+  let comparisonLine = "";
+  if (latest && bestAllTime && latest.id !== bestAllTime.id) {
+    comparisonLine = `<p class="muted-caption" style="margin-top:8px;">Zadnja testirana je na #${latest.all_time_rank}. mjestu od ${totalTested} po kompozitnom skoru (najbolja ikad je, po definiciji, na #1. mjestu).</p>`;
+  } else if (latest && bestAllTime && latest.id === bestAllTime.id) {
+    comparisonLine = `<p class="muted-caption" style="margin-top:8px;">Zadnja testirana JESTE trenutno najbolja ikad pronađena (po kompozitnom skoru).</p>`;
+  }
+  el.innerHTML = `
+    <p><b>Ukupno testirano (svi ciklusi ikad): ${totalTested} strategija</b></p>
+    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+      ${card("🥇 Najbolja ikad (Layer 1, nepotvrđena)", bestAllTime, "strategy-lab-glance-best")}
+      ${card("🕐 Zadnja testirana", latest, "strategy-lab-glance-latest")}
+    </div>
+    ${comparisonLine}`;
 }
 
 function renderStrategyLabCurrentBest(best) {

@@ -193,6 +193,67 @@ def fetch_leaderboard(conn: sqlite3.Connection, limit: int = 10) -> list[dict[st
     return rows
 
 
+def fetch_total_candidates_tested(conn: sqlite3.Connection) -> int:
+    """Total row count in ``mining_candidates`` across EVERY mining cycle
+    ever run (not just the most recent one -- that's ``fetch_leaderboard``'s
+    job). Purely a "how much exploring has Layer 1 done so far" counter,
+    not a statistical statement."""
+    return int(conn.execute("SELECT COUNT(*) FROM mining_candidates").fetchone()[0])
+
+
+def _candidate_all_time_rank(conn: sqlite3.Connection, composite_score: float) -> int:
+    """1-based rank of ``composite_score`` among every candidate ever
+    mined (higher score = better rank), ties broken arbitrarily by SQLite's
+    row order (acceptable here -- this is a descriptive position, not a
+    statistical claim)."""
+    better_count = conn.execute(
+        "SELECT COUNT(*) FROM mining_candidates WHERE composite_score > ?", (composite_score,)
+    ).fetchone()[0]
+    return int(better_count) + 1
+
+
+def fetch_latest_candidate(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """The single most-recently-inserted row in ``mining_candidates``
+    (highest ``id``), with its all-time rank by ``composite_score``
+    attached -- lets the dashboard show "what did Layer 1 just test, and
+    how does it compare to the best ever found" without a second
+    round-trip."""
+    cursor = conn.execute(
+        "SELECT id, mined_at, as_of_timestamp_ms, template, tercile, variant_label, params_json,"
+        " n_independent, gross_observed_pct, net_observed_pct, stability_score, composite_score"
+        " FROM mining_candidates ORDER BY id DESC LIMIT 1"
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    columns = [d[0] for d in cursor.description]
+    result = dict(zip(columns, row, strict=True))
+    result["params"] = json.loads(result.pop("params_json"))
+    result["all_time_rank"] = _candidate_all_time_rank(conn, result["composite_score"])
+    return result
+
+
+def fetch_best_candidate_all_time(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """The single highest-``composite_score`` row across EVERY mining
+    cycle ever run (not just the latest one). This is still Layer 1 --
+    purely descriptive, NEVER a confirmed edge. Use ``fetch_current_best``
+    (Layer 2 confirmations) for the only field in this whole feature that
+    carries a real pass/fail verdict."""
+    cursor = conn.execute(
+        "SELECT id, mined_at, as_of_timestamp_ms, template, tercile, variant_label, params_json,"
+        " n_independent, gross_observed_pct, net_observed_pct, stability_score, composite_score"
+        " FROM mining_candidates ORDER BY composite_score DESC LIMIT 1"
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    columns = [d[0] for d in cursor.description]
+    result = dict(zip(columns, row, strict=True))
+    result["params"] = json.loads(result.pop("params_json"))
+    result["all_time_rank"] = 1
+    return result
+
+
 def fetch_mining_candidate(conn: sqlite3.Connection, candidate_id: int) -> dict[str, Any] | None:
     cursor = conn.execute(
         "SELECT id, mined_at, as_of_timestamp_ms, template, tercile, variant_label, params_json,"
