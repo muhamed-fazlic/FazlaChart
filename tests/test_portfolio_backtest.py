@@ -277,11 +277,20 @@ class TestPortfolioAdmission:
         # 10 warm-up candles + 5 "tradable" candles = 15 total; the boundary
         # between them is what decision_start_time should be computed from.
         open_times = pd.date_range(_T0, periods=15, freq="1h", tz="UTC")
-        fake_history = pd.DataFrame({"open_time": open_times})
+        fake_history = pd.DataFrame(
+            {
+                "open_time": open_times,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 10.0,
+            }
+        )
 
         captured: dict[str, object] = {}
 
-        def fake_load_extended_history(symbol, timeframe, total_candles):
+        def fake_cached_load_extended_history(symbol, timeframe, total_candles, end_timestamp_ms, cache_dir):
             captured["total_candles"] = total_candles
             return fake_history
 
@@ -289,7 +298,7 @@ class TestPortfolioAdmission:
             captured["history_passed"] = history is fake_history
             return []
 
-        monkeypatch.setattr(module, "load_extended_history", fake_load_extended_history)
+        monkeypatch.setattr(module, "cached_load_extended_history", fake_cached_load_extended_history)
         monkeypatch.setattr(module, "backtest_symbol", fake_backtest_symbol)
         config = self._config(kline_limit=5, warmup_candles=10)
         run_portfolio_backtest(config)

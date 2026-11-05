@@ -278,7 +278,9 @@ def _load_history(symbol: str, timeframe: str, limit: int = 1500) -> pd.DataFram
     return add_indicators(klines_to_dataframe(klines))
 
 
-def load_extended_history(symbol: str, timeframe: str, total_candles: int, batch_limit: int = 1500) -> pd.DataFrame:
+def load_extended_history(
+    symbol: str, timeframe: str, total_candles: int, batch_limit: int = 1500, end_time: int | None = None
+) -> pd.DataFrame:
     """Like :func:`_load_history`, but pages backwards past Binance's
     single-request 1500-candle cap (via ``endTime``) to assemble up to
     ``total_candles`` of continuous history, then computes indicators once
@@ -294,9 +296,15 @@ def load_extended_history(symbol: str, timeframe: str, total_candles: int, batch
     ever shown. Fetching roughly double the window and only treating the
     second half as "tradable" (first half as calibration-only) gives a much
     fairer comparison.
+
+    ``end_time`` (epoch milliseconds), if given, anchors the *whole* window
+    to end there instead of "now" -- see
+    :mod:`scanner.backtesting.data_snapshot` for why a frozen anchor matters
+    for reproducible backtests. Left as ``None`` (the default), every call
+    pages backwards from whatever is most recent at call time, same as
+    before this parameter existed.
     """
     batches: list[list[dict[str, Any]]] = []
-    end_time: int | None = None
     remaining = total_candles
     while remaining > 0:
         requested = min(batch_limit, remaining)

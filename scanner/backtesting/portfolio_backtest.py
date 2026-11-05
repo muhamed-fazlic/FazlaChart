@@ -89,6 +89,13 @@ from agents_crypto.best_signal import (
     BEST_SIGNAL_MIN_SAMPLE_SIZE,
     TRACKED_TIMEFRAMES,
 )
+from scanner.backtesting.data_snapshot import (
+    DEFAULT_KLINE_CACHE_DIR,
+    cached_load_extended_history,
+    combined_dataset_fingerprint,
+    dataset_fingerprint,
+    parse_end_timestamp,
+)
 from scanner.backtesting.funding_simulator import FundingEvent, fetch_funding_history
 from scanner.backtesting.historical_universe import (
     UniverseWindow,
@@ -110,7 +117,6 @@ from scanner.calibration import (
     LabeledCase,
     OutOfSampleResult,
     backtest_symbol,
-    load_extended_history,
     round_trip_cost_pct_for,
     validate_out_of_sample,
     wilson_score_interval,
@@ -333,6 +339,19 @@ class PortfolioBacktestConfig:
     # pipeline -- OOS/independence/walk-forward/DSR/block-bootstrap -- by
     # adding one registry entry instead of a bespoke script.
     strategy_variant: str = DEFAULT_VARIANT_ID
+    # Reproducibility fix (see scanner.backtesting.data_snapshot's module
+    # docstring): the live scanner runs 24/7, so the old "always fetch the
+    # freshest candles" behaviour made two runs of the exact same config
+    # minutes/hours apart silently see two different datasets -- measured
+    # at ~9 percentage points of pure noise in net profit between otherwise
+    # identical runs. Setting this (epoch milliseconds) anchors every
+    # (symbol, timeframe) fetch to end at this exact timestamp and serves
+    # it from an on-disk cache after the first fetch, so repeated runs
+    # against the same locked snapshot are both deterministic and fast.
+    # ``None`` (the default) preserves the old "always freshest" behaviour,
+    # which is still the right choice for a live/ad-hoc dashboard refresh.
+    end_timestamp_ms: int | None = None
+    kline_cache_dir: str = DEFAULT_KLINE_CACHE_DIR
 
 
 @dataclass
@@ -930,6 +949,7 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
     all_events: list[CandidateEvent] = []
     all_cases: list[LabeledCase] = []
     skipped: list[str] = []
+    dataset_fingerprints: list[str] = []
 
     for symbol in config.symbols:
         funding_events: list[FundingEvent] | None = None
@@ -943,7 +963,14 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
         for timeframe in config.timeframes:
             try:
                 if config.warmup_candles > 0:
-                    history = load_extended_history(symbol, timeframe, config.warmup_candles + config.kline_limit)
+                    history = cached_load_extended_history(
+                        symbol,
+                        timeframe,
+                        config.warmup_candles + config.kline_limit,
+                        config.end_timestamp_ms,
+                        cache_dir=config.kline_cache_dir,
+                    )
+                    dataset_fingerprints.append(dataset_fingerprint(history))
                     # The last config.kline_limit candles are "tradable"; everything
                     # before that is warm-up-only (feeds the stats accumulator, see
                     # _build_candidate_events, but never emits a CandidateEvent).
@@ -1069,6 +1096,14 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig) -> PortfolioBacktest
         _close(position)
 
     metrics = _compute_metrics(trades, equity_curve, config, concurrency_samples)
+    # Reproducibility fix (see scanner.backtesting.data_snapshot): rides
+    # along in `metrics` the same way oos_labels_holding_up does below, so
+    # it lands "for free" in both this run's report and the experiment
+    # registry's result_json -- lets two trials be compared to confirm (or
+    # rule out) whether they actually ran over the same underlying candles.
+    if dataset_fingerprints:
+        metrics["dataset_hash"] = combined_dataset_fingerprint(dataset_fingerprints)
+    metrics["end_timestamp_ms"] = config.end_timestamp_ms
     oos_validation: list[OutOfSampleResult] = []
     if config.include_oos_validation and all_cases:
         oos_validation = validate_out_of_sample(
@@ -1282,6 +1317,24 @@ def _main() -> None:
         "--report-json gets its own '__<variant>' suffix and its --experiment-family trials are tracked "
         "separately, so they are never pooled with a different variant's results.",
     )
+    parser.add_argument(
+        "--end-timestamp",
+        type=parse_end_timestamp,
+        default=None,
+        help="Reproducibility fix (see scanner.backtesting.data_snapshot): freeze every (symbol, timeframe) "
+        "fetch to end at this timestamp (ISO 8601, e.g. 2026-11-04T00:00:00Z, or a raw epoch-milliseconds "
+        "integer) instead of 'now', and serve it from an on-disk cache after the first fetch. Required for "
+        "any two runs to be honestly comparable -- without it, the live scanner's constantly-arriving candles "
+        "make identical-config runs minutes apart silently see different data (measured at ~9 percentage "
+        "points of net-profit noise). Omit (the default) for a live/ad-hoc dashboard refresh that should "
+        "always see the freshest data.",
+    )
+    parser.add_argument(
+        "--kline-cache-dir",
+        default=DEFAULT_KLINE_CACHE_DIR,
+        help=f"Where frozen-snapshot candle caches are stored when --end-timestamp is given (default "
+        f"{DEFAULT_KLINE_CACHE_DIR!r}). Ignored when --end-timestamp is omitted.",
+    )
     parser.add_argument("--trades-json", help="Optional path to dump the full trade log as JSON")
     parser.add_argument(
         "--report-json",
@@ -1336,6 +1389,8 @@ def _main() -> None:
         point_in_time_windows=point_in_time_windows,
         point_in_time_universe_cache_path=args.point_in_time_universe_cache,
         strategy_variant=args.strategy_variant,
+        end_timestamp_ms=args.end_timestamp,
+        kline_cache_dir=args.kline_cache_dir,
     )
     result = run_portfolio_backtest(config)
 
@@ -1398,6 +1453,11 @@ def _main() -> None:
                     f" (point-in-time universe filter active, excluded "
                     f"{result.point_in_time_filtered_count} candidate trade(s))"
                 )
+            if config.end_timestamp_ms is not None:
+                notes += f" (locked snapshot end_timestamp_ms={config.end_timestamp_ms}, dataset_hash=" \
+                    f"{result.metrics.get('dataset_hash')})"
+            else:
+                notes += " (LIVE data -- not a locked/reproducible snapshot, see --end-timestamp)"
             record_experiment(
                 conn,
                 strategy_family=experiment_family,
@@ -1423,6 +1483,7 @@ def _main() -> None:
                     "block_bootstrap_n_resamples": config.block_bootstrap_n_resamples,
                     "block_bootstrap_confidence_pct": config.block_bootstrap_confidence_pct,
                     "strategy_variant": config.strategy_variant,
+                    "end_timestamp_ms": config.end_timestamp_ms,
                 },
                 n_trades=result.metrics.get("n_trades"),
                 sharpe_ratio=result.metrics.get("sharpe_ratio"),
