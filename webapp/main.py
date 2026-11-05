@@ -332,6 +332,34 @@ def _write_refresh_status(status: dict[str, Any]) -> None:
 
 
 def _pid_is_running(pid: int) -> bool:
+    # The backtest subprocess launched in /api/backtest/refresh is a direct
+    # child of this very process, so this is the one place that can ever
+    # reap it. subprocess.Popen() doesn't reap on its own: its __del__ only
+    # self-reaps if the child already exited by the time the Popen object is
+    # garbage-collected, which it never has been here (the object goes out
+    # of scope at the end of the request handler, while the backtest is
+    # still running). Without this waitpid() call the finished child stays
+    # a zombie forever, and os.kill(pid, 0) below keeps reporting "alive"
+    # for it indefinitely -- zombies still hold their PID in the process
+    # table -- so GET /api/backtest/refresh/status would never see "done".
+    try:
+        # os.WNOHANG itself doesn't exist on Windows (os.waitpid there is a
+        # restricted, Windows-specific implementation) -- getattr(..., 0)
+        # keeps this call reachable in local/dev tests instead of silently
+        # skipping straight to the os.kill() fallback below.
+        reaped_pid, _ = os.waitpid(pid, getattr(os, "WNOHANG", 0))
+        if reaped_pid == pid:
+            return False
+    except ChildProcessError:
+        # Not (or no longer) a child of this process -- e.g. this webapp
+        # restarted after the refresh was launched. Fall back to the plain
+        # liveness probe below.
+        pass
+    except AttributeError:
+        # os.waitpid isn't available on Windows -- fall through to the
+        # os.kill-based check, which has its own Windows fallback.
+        pass
+
     try:
         os.kill(pid, 0)
     except OSError:

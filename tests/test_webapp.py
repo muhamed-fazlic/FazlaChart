@@ -882,3 +882,53 @@ def test_forward_tracking_trades_time_range_filters_by_logged_at(tmp_path, monke
     assert resp_custom.status_code == 200
     assert resp_custom.json()["count"] == 1
 
+
+class TestPidIsRunning:
+    """``_pid_is_running()`` backs the /api/backtest/refresh "already
+    running" guard and the /status "has it finished" check. A real
+    incident on the VPS showed the previous os.kill(pid, 0)-only version
+    reports a finished backtest subprocess as "running" forever: once a
+    child exits it becomes a zombie until *this* process (its parent)
+    reaps it via waitpid(), and a zombie's PID still answers
+    os.kill(pid, 0) successfully. These tests pin down the fix -- a
+    waitpid(WNOHANG) reap attempt before the os.kill probe -- without
+    needing a real subprocess."""
+
+    def test_reports_not_running_once_waitpid_reaps_the_exited_child(self, monkeypatch):
+        from webapp.main import _pid_is_running
+
+        monkeypatch.setattr("os.waitpid", lambda pid, flags: (pid, 0))
+        # Should never even reach os.kill once waitpid confirms the reap.
+        monkeypatch.setattr("os.kill", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("unreachable")))
+        assert _pid_is_running(12345) is False
+
+    def test_reports_running_while_waitpid_finds_nothing_to_reap_and_kill_succeeds(self, monkeypatch):
+        from webapp.main import _pid_is_running
+
+        monkeypatch.setattr("os.waitpid", lambda pid, flags: (0, 0))  # still alive, WNOHANG didn't block
+        monkeypatch.setattr("os.kill", lambda pid, sig: None)
+        assert _pid_is_running(12345) is True
+
+    def test_falls_back_to_kill_probe_when_pid_is_not_our_child(self, monkeypatch):
+        from webapp.main import _pid_is_running
+
+        def _raise_child_process_error(pid, flags):
+            raise ChildProcessError("not a child")
+
+        monkeypatch.setattr("os.waitpid", _raise_child_process_error)
+        monkeypatch.setattr("os.kill", lambda pid, sig: None)
+        assert _pid_is_running(12345) is True
+
+    def test_reports_not_running_when_fallback_kill_probe_raises(self, monkeypatch):
+        from webapp.main import _pid_is_running
+
+        def _raise_child_process_error(pid, flags):
+            raise ChildProcessError("not a child")
+
+        def _raise_os_error(pid, sig):
+            raise ProcessLookupError("no such process")
+
+        monkeypatch.setattr("os.waitpid", _raise_child_process_error)
+        monkeypatch.setattr("os.kill", _raise_os_error)
+        assert _pid_is_running(12345) is False
+
