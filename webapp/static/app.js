@@ -316,7 +316,7 @@ function switchTab(tab) {
   } else if (tab === "research") {
     loadResearchTab();
   } else if (tab === "strategy-lab") {
-    loadStrategyLabTab();
+    startStrategyLabPolling();
   }
 }
 
@@ -2309,17 +2309,17 @@ function renderResearchFamilies(families) {
 }
 
 // --- Strategy Lab: read-only overview of the continuous, two-layer -------
-// strategy-mining pipeline (see STRATEGY_LAB_DESIGN.md). One-time fetch on
-// first tab click, same convention as loadResearchTab() above -- this tab
-// never triggers a mining cycle, weekly snapshot, or Layer 2 confirmation
-// itself; it only displays what scanner.strategy_lab_scheduler has already
+// strategy-mining pipeline (see STRATEGY_LAB_DESIGN.md). Polls every 30s
+// while this tab is open (same convention as startSystemJobsPolling()
+// above) so a freshly-started scanner.strategy_lab_scheduler's first Layer
+// 1 mining cycle shows up here without needing a manual page reload. This
+// tab never triggers a mining cycle, weekly snapshot, or Layer 2
+// confirmation itself; it only displays what the scheduler has already
 // produced into scanner_data/strategy_lab.db.
 
-let strategyLabLoaded = false;
+let strategyLabPollTimer = null;
 
 async function loadStrategyLabTab() {
-  if (strategyLabLoaded) return;
-  strategyLabLoaded = true;
   try {
     const res = await fetch("/api/strategy-lab/overview");
     const data = await res.json();
@@ -2334,11 +2334,20 @@ async function loadStrategyLabTab() {
       renderStrategyLabConfirmations(data.confirmations || []);
       renderStrategyLabHoldoutStatus(data.rolling_holdout_state, data.confirmations || []);
     }
+    const lastUpdatedEl = document.getElementById("strategy-lab-last-updated");
+    if (lastUpdatedEl) {
+      lastUpdatedEl.textContent = `Zadnje provjereno: ${new Date().toLocaleTimeString("bs-BA")}`;
+    }
   } catch (err) {
     console.error("Could not load Strategy Lab overview:", err);
-    strategyLabLoaded = false; // allow a retry on the next tab click
     renderStrategyLabUnavailable(`Greška: ${err.message}`);
   }
+}
+
+function startStrategyLabPolling() {
+  if (strategyLabPollTimer) return;
+  loadStrategyLabTab();
+  strategyLabPollTimer = setInterval(loadStrategyLabTab, 30000);
 }
 
 function renderStrategyLabUnavailable(message) {
@@ -2374,6 +2383,11 @@ function renderStrategyLabCurrentBest(best) {
     </div>`;
 }
 
+function toggleStrategyLabRow(rowId) {
+  const el = document.getElementById(rowId);
+  if (el) el.classList.toggle("hidden");
+}
+
 function renderStrategyLabLeaderboard(leaderboard) {
   const el = document.getElementById("strategy-lab-leaderboard");
   if (!leaderboard.length) {
@@ -2381,9 +2395,14 @@ function renderStrategyLabLeaderboard(leaderboard) {
     return;
   }
   const rows = leaderboard
-    .map(
-      (c, i) => `
-      <tr>
+    .map((c, i) => {
+      const detailId = `strategy-lab-detail-${c.id ?? i}`;
+      // Full raw record (params + every numeric field returned by the API) --
+      // click a row to see exactly what this candidate's configuration was,
+      // same spirit as the "Analyze with AI" raw-JSON detail view.
+      const detailJson = escapeHtml(JSON.stringify(c, null, 2));
+      return `
+      <tr onclick="toggleStrategyLabRow('${detailId}')" style="cursor:pointer;">
         <td>#${i + 1}</td>
         <td>${c.template}</td>
         <td>${c.tercile}</td>
@@ -2393,10 +2412,12 @@ function renderStrategyLabLeaderboard(leaderboard) {
         <td>${c.n_independent ?? "—"}</td>
         <td>${c.stability_score === null || c.stability_score === undefined ? "—" : fmt(c.stability_score)}</td>
         <td>${fmt(c.composite_score)}</td>
-      </tr>`
-    )
+      </tr>
+      <tr id="${detailId}" class="hidden"><td colspan="9"><pre style="white-space:pre-wrap; font-size:0.8em; max-height:300px; overflow-y:auto;">${detailJson}</pre></td></tr>`;
+    })
     .join("");
   el.innerHTML = `
+    <p class="muted-caption">Klikni na red da vidiš punu konfiguraciju (JSON) tog kandidata.</p>
     <table class="bucket-breakdown-table">
       <thead><tr><th>Rang</th><th>Template</th><th>Tercil</th><th>Varijanta</th><th>Neto</th><th>Bruto</th><th>n</th><th>Stabilnost</th><th>Kompozitni skor</th></tr></thead>
       <tbody>${rows}</tbody>
