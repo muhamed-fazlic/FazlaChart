@@ -13,6 +13,7 @@ scan-cycle convention rather than inventing a second one.
 from __future__ import annotations
 
 import logging
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -84,49 +85,61 @@ def run_weekly_snapshot(
         top = leaderboard[0]
         variant = _variant_for_candidate(top)
         tercile_symbols = symbols
-        if ranked_universe_cache_path is not None:
-            tercile_symbols = _resolve_tercile_symbols(ranked_universe_cache_path, top["tercile"])
-        if not tercile_symbols:
-            raise ValueError("could not resolve a symbol set for the #1 candidate's tercile")
+        evaluation_cache_path: str | None = None
+        with ExitStack() as stack:
+            if ranked_universe_cache_path is not None:
+                tercile_symbols = _resolve_tercile_symbols(ranked_universe_cache_path, top["tercile"])
+                # Never forward the raw ranked cache to evaluate_variant --
+                # funding_extreme/cross_sectional's frozen modules expect the
+                # OLD schema, not the ranked one (see tercile_universe_cache_path).
+                evaluation_cache_path = stack.enter_context(
+                    miner.tercile_universe_cache_path(ranked_universe_cache_path, top["tercile"])
+                )
+            if not tercile_symbols:
+                raise ValueError("could not resolve a symbol set for the #1 candidate's tercile")
 
-        evaluation = miner.evaluate_variant(variant, tuple(tercile_symbols), end_timestamp_ms, ranked_universe_cache_path)
-        ci = evaluation.report.get("net_block_bootstrap")
-        win_rate_pct = evaluation.report.get("win_rate_pct")
-
-        telegram_sent = False
-        snapshot_payload = {
-            "template": top["template"],
-            "tercile": top["tercile"],
-            "variant_label": top["variant_label"],
-            "net_observed_pct": evaluation.net_observed_pct,
-            "net_ci_low_pct": ci["ci_low_pct"] if ci else None,
-            "net_ci_high_pct": ci["ci_high_pct"] if ci else None,
-            "n_independent": evaluation.n_independent,
-            "win_rate_pct": win_rate_pct,
-        }
-        if telegram_config is not None and telegram_config.enabled:
-            telegram_sent = send_telegram_message(
-                telegram_config.bot_token, telegram_config.chat_id, format_strategy_lab_weekly_report(snapshot_payload)
+            evaluation = miner.evaluate_variant(
+                variant, tuple(tercile_symbols), end_timestamp_ms, evaluation_cache_path
             )
+            ci = evaluation.report.get("net_block_bootstrap")
+            win_rate_pct = evaluation.report.get("win_rate_pct")
 
-        snapshot_id = storage.insert_weekly_snapshot(
-            conn,
-            candidate_id=top["id"],
-            template=top["template"],
-            tercile=top["tercile"],
-            variant_label=top["variant_label"],
-            n_independent=evaluation.n_independent,
-            net_observed_pct=evaluation.net_observed_pct,
-            net_ci_low_pct=ci["ci_low_pct"] if ci else None,
-            net_ci_high_pct=ci["ci_high_pct"] if ci else None,
-            gross_observed_pct=evaluation.gross_observed_pct,
-            win_rate_pct=win_rate_pct,
-            telegram_sent=telegram_sent,
-            report=evaluation.report,
-        )
-        snapshot_payload["id"] = snapshot_id
-        snapshot_payload["telegram_sent"] = telegram_sent
-        return snapshot_payload
+            telegram_sent = False
+            snapshot_payload = {
+                "template": top["template"],
+                "tercile": top["tercile"],
+                "variant_label": top["variant_label"],
+                "net_observed_pct": evaluation.net_observed_pct,
+                "net_ci_low_pct": ci["ci_low_pct"] if ci else None,
+                "net_ci_high_pct": ci["ci_high_pct"] if ci else None,
+                "n_independent": evaluation.n_independent,
+                "win_rate_pct": win_rate_pct,
+            }
+            if telegram_config is not None and telegram_config.enabled:
+                telegram_sent = send_telegram_message(
+                    telegram_config.bot_token,
+                    telegram_config.chat_id,
+                    format_strategy_lab_weekly_report(snapshot_payload),
+                )
+
+            snapshot_id = storage.insert_weekly_snapshot(
+                conn,
+                candidate_id=top["id"],
+                template=top["template"],
+                tercile=top["tercile"],
+                variant_label=top["variant_label"],
+                n_independent=evaluation.n_independent,
+                net_observed_pct=evaluation.net_observed_pct,
+                net_ci_low_pct=ci["ci_low_pct"] if ci else None,
+                net_ci_high_pct=ci["ci_high_pct"] if ci else None,
+                gross_observed_pct=evaluation.gross_observed_pct,
+                win_rate_pct=win_rate_pct,
+                telegram_sent=telegram_sent,
+                report=evaluation.report,
+            )
+            snapshot_payload["id"] = snapshot_id
+            snapshot_payload["telegram_sent"] = telegram_sent
+            return snapshot_payload
     finally:
         conn.close()
 
@@ -242,64 +255,69 @@ def run_layer2_check(
         # the fresh window [boundary_ms, now_ms].
         variant = _variant_for_candidate(top)
         tercile_symbols = symbols
-        if ranked_universe_cache_path is not None:
-            tercile_symbols = _resolve_tercile_symbols(ranked_universe_cache_path, top["tercile"])
-        if not tercile_symbols:
-            raise ValueError("could not resolve a symbol set for the #1 candidate's tercile")
+        evaluation_cache_path: str | None = None
+        with ExitStack() as stack:
+            if ranked_universe_cache_path is not None:
+                tercile_symbols = _resolve_tercile_symbols(ranked_universe_cache_path, top["tercile"])
+                evaluation_cache_path = stack.enter_context(
+                    miner.tercile_universe_cache_path(ranked_universe_cache_path, top["tercile"])
+                )
+            if not tercile_symbols:
+                raise ValueError("could not resolve a symbol set for the #1 candidate's tercile")
 
-        evaluation = miner.evaluate_variant(variant, tuple(tercile_symbols), now_ms, ranked_universe_cache_path)
-        ci = evaluation.report.get("net_block_bootstrap")
-        edge_survives = bool(ci and ci["edge_survives_lower_bound"])
+            evaluation = miner.evaluate_variant(variant, tuple(tercile_symbols), now_ms, evaluation_cache_path)
+            ci = evaluation.report.get("net_block_bootstrap")
+            edge_survives = bool(ci and ci["edge_survives_lower_bound"])
 
-        confirmation_payload = {
-            "template": top["template"],
-            "tercile": top["tercile"],
-            "variant_label": top["variant_label"],
-            "fresh_window_start_iso": datetime.fromtimestamp(boundary_ms / 1000.0, tz=UTC).isoformat(),
-            "fresh_window_end_iso": datetime.fromtimestamp(now_ms / 1000.0, tz=UTC).isoformat(),
-            "net_observed_pct": evaluation.net_observed_pct,
-            "net_ci_low_pct": ci["ci_low_pct"] if ci else None,
-            "net_ci_high_pct": ci["ci_high_pct"] if ci else None,
-            "n_independent": evaluation.n_independent,
-            "n_required": power.n_required,
-            "edge_survives_lower_bound": edge_survives,
-        }
-        telegram_sent = False
-        if telegram_config is not None and telegram_config.enabled:
-            telegram_sent = send_telegram_message(
-                telegram_config.bot_token,
-                telegram_config.chat_id,
-                format_strategy_lab_confirmation_report(confirmation_payload),
+            confirmation_payload = {
+                "template": top["template"],
+                "tercile": top["tercile"],
+                "variant_label": top["variant_label"],
+                "fresh_window_start_iso": datetime.fromtimestamp(boundary_ms / 1000.0, tz=UTC).isoformat(),
+                "fresh_window_end_iso": datetime.fromtimestamp(now_ms / 1000.0, tz=UTC).isoformat(),
+                "net_observed_pct": evaluation.net_observed_pct,
+                "net_ci_low_pct": ci["ci_low_pct"] if ci else None,
+                "net_ci_high_pct": ci["ci_high_pct"] if ci else None,
+                "n_independent": evaluation.n_independent,
+                "n_required": power.n_required,
+                "edge_survives_lower_bound": edge_survives,
+            }
+            telegram_sent = False
+            if telegram_config is not None and telegram_config.enabled:
+                telegram_sent = send_telegram_message(
+                    telegram_config.bot_token,
+                    telegram_config.chat_id,
+                    format_strategy_lab_confirmation_report(confirmation_payload),
+                )
+
+            storage.insert_confirmation(
+                conn,
+                candidate_id=top["id"],
+                template=top["template"],
+                tercile=top["tercile"],
+                variant_label=top["variant_label"],
+                fresh_window_start_ms=boundary_ms,
+                fresh_window_end_ms=now_ms,
+                n_independent=evaluation.n_independent,
+                n_required=power.n_required,
+                net_observed_pct=evaluation.net_observed_pct,
+                net_ci_low_pct=ci["ci_low_pct"] if ci else None,
+                net_ci_high_pct=ci["ci_high_pct"] if ci else None,
+                edge_survives_lower_bound=edge_survives,
+                telegram_sent=telegram_sent,
+                report=evaluation.report,
             )
 
-        storage.insert_confirmation(
-            conn,
-            candidate_id=top["id"],
-            template=top["template"],
-            tercile=top["tercile"],
-            variant_label=top["variant_label"],
-            fresh_window_start_ms=boundary_ms,
-            fresh_window_end_ms=now_ms,
-            n_independent=evaluation.n_independent,
-            n_required=power.n_required,
-            net_observed_pct=evaluation.net_observed_pct,
-            net_ci_low_pct=ci["ci_low_pct"] if ci else None,
-            net_ci_high_pct=ci["ci_high_pct"] if ci else None,
-            edge_survives_lower_bound=edge_survives,
-            telegram_sent=telegram_sent,
-            report=evaluation.report,
-        )
+            new_state = advance_boundary(state, consumed_until_ms=now_ms)
+            storage.save_rolling_holdout_state(conn, new_state.boundary_timestamp_ms)
 
-        new_state = advance_boundary(state, consumed_until_ms=now_ms)
-        storage.save_rolling_holdout_state(conn, new_state.boundary_timestamp_ms)
-
-        confirmation_payload["telegram_sent"] = telegram_sent
-        return Layer2CheckResult(
-            ran_confirmation=True,
-            fresh_days_available=fresh_days,
-            n_required=power.n_required,
-            estimated_days_needed=0.0,
-            confirmation=confirmation_payload,
-        )
+            confirmation_payload["telegram_sent"] = telegram_sent
+            return Layer2CheckResult(
+                ran_confirmation=True,
+                fresh_days_available=fresh_days,
+                n_required=power.n_required,
+                estimated_days_needed=0.0,
+                confirmation=confirmation_payload,
+            )
     finally:
         conn.close()

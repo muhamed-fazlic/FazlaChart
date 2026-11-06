@@ -45,8 +45,11 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import os
 import statistics
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from scanner.backtesting import (
@@ -334,6 +337,49 @@ def evaluate_variant(
     )
 
 
+def _write_tercile_universe_cache(windows: list[Any], tercile_name: str) -> Path:
+    """Writes ``windows`` (already tercile-sliced ``UniverseWindow``s) out
+    in the OLD ``save_universe_cache`` schema (``{"symbols": [...]}`` per
+    window) to a fresh temp file, and returns its path. Caller owns
+    deleting the file once done with it (``Path.unlink(missing_ok=True)``)."""
+    from scanner.backtesting.historical_universe import save_universe_cache
+
+    fd, raw_path = tempfile.mkstemp(prefix=f"strategy_lab_tercile_{tercile_name}_", suffix=".json")
+    os.close(fd)  # mkstemp leaves the fd open; close it so the file can be written/deleted (notably on Windows)
+    tmp_file = Path(raw_path)
+    save_universe_cache(windows, tmp_file)
+    return tmp_file
+
+
+@contextlib.contextmanager
+def tercile_universe_cache_path(
+    ranked_universe_cache_path: str,
+    tercile_name: str,
+    tercile_rank_ranges: dict[str, tuple[int, int]] | None = None,
+):
+    """Context manager yielding a path to a TEMPORARY old-schema universe
+    cache file scoped to one tercile, derived from a ranked universe cache
+    (``historical_universe.save_ranked_universe_cache`` output). Always use
+    this (never forward a ranked cache path directly) before calling
+    ``evaluate_variant`` for ``funding_extreme_reversion``/
+    ``cross_sectional_momentum`` -- their frozen backtest modules only
+    understand the old ``{"symbols": [...]}`` schema, not the ranked
+    cache's ``{"ranked_symbols": [...]}`` one, and forwarding the wrong one
+    raises ``KeyError: 'symbols'`` (a real production bug this helper
+    exists to prevent recurring). The temp file is deleted on exit."""
+    from scanner.backtesting.historical_universe import load_ranked_universe_cache
+
+    tercile_rank_ranges = tercile_rank_ranges or DEFAULT_TERCILE_RANK_RANGES
+    start_rank, end_rank = tercile_rank_ranges[tercile_name]
+    ranked_windows = load_ranked_universe_cache(ranked_universe_cache_path)
+    full_tercile_windows = windows_for_rank_range(ranked_windows, start_rank, end_rank)
+    tmp_file = _write_tercile_universe_cache(full_tercile_windows, tercile_name)
+    try:
+        yield str(tmp_file)
+    finally:
+        tmp_file.unlink(missing_ok=True)
+
+
 def run_mining_cycle(
     as_of_ts: int,
     *,
@@ -359,10 +405,22 @@ def run_mining_cycle(
     unsliced as a SINGLE flat tercile named ``"unsliced"`` -- a documented,
     smaller-scale fallback for engineering verification, NOT a substitute
     for the real 170-symbol/3-tercile run once that cache exists.
+
+    Internally, each tercile also gets its OWN point-in-time universe cache
+    file written in the older ``save_universe_cache``/``load_universe_cache``
+    schema (``{"symbols": [...]}`` per window) -- ``funding_extreme_reversion``
+    and ``cross_sectional_momentum``'s frozen backtest modules only understand
+    that schema, not the ranked cache's ``{"ranked_symbols": [...]}`` one, so
+    the raw ``ranked_universe_cache_path`` must never be forwarded to them
+    directly (doing so raises ``KeyError: 'symbols'`` for every one of their
+    combinations, every cycle -- this was a real bug, not a hypothetical one).
+    These per-tercile files are temporary and removed once the cycle ends.
     """
     tercile_rank_ranges = tercile_rank_ranges or DEFAULT_TERCILE_RANK_RANGES
 
     tercile_symbol_sets: dict[str, tuple[str, ...]] = {}
+    tercile_universe_cache_paths: dict[str, str | None] = {}
+    tmp_cache_files: list[Path] = []
     if ranked_universe_cache_path is not None:
         from scanner.backtesting.historical_universe import load_ranked_universe_cache
 
@@ -373,6 +431,15 @@ def run_mining_cycle(
         for tercile_name, (start_rank, end_rank) in tercile_rank_ranges.items():
             sliced = windows_for_rank_range([latest_window], start_rank, end_rank)
             tercile_symbol_sets[tercile_name] = tuple(sorted(sliced[-1].symbols)) if sliced else ()
+
+            # Full multi-window slice (not just the latest window) so
+            # funding_extreme/cross_sectional still get real point-in-time
+            # survivorship-bias protection across the whole backtest period,
+            # same as trend_anomaly's Korak-10 runs did.
+            full_tercile_windows = windows_for_rank_range(ranked_windows, start_rank, end_rank)
+            tmp_file = _write_tercile_universe_cache(full_tercile_windows, tercile_name)
+            tmp_cache_files.append(tmp_file)
+            tercile_universe_cache_paths[tercile_name] = str(tmp_file)
     else:
         if not symbols:
             raise ValueError("symbols must be provided when ranked_universe_cache_path is not set")
@@ -400,39 +467,46 @@ def run_mining_cycle(
     )
 
     candidates: list[MiningCandidate] = []
-    for tercile_name, tercile_symbols in tercile_symbol_sets.items():
-        if not tercile_symbols:
-            logger.warning("Tercile %r has no symbols at this as_of_ts -- skipping all variants for it", tercile_name)
-            continue
-        for variant in template_variants:
-            try:
-                evaluation = evaluate_variant(variant, tercile_symbols, as_of_ts, ranked_universe_cache_path)
-            except Exception:
-                logger.exception(
-                    "Mining combination failed (template=%s tercile=%s variant=%s) -- skipping, not aborting "
-                    "the whole cycle",
-                    variant.template,
-                    tercile_name,
-                    variant.variant_label,
+    try:
+        for tercile_name, tercile_symbols in tercile_symbol_sets.items():
+            if not tercile_symbols:
+                logger.warning(
+                    "Tercile %r has no symbols at this as_of_ts -- skipping all variants for it", tercile_name
                 )
                 continue
+            tercile_cache_path = tercile_universe_cache_paths.get(tercile_name)
+            for variant in template_variants:
+                try:
+                    evaluation = evaluate_variant(variant, tercile_symbols, as_of_ts, tercile_cache_path)
+                except Exception:
+                    logger.exception(
+                        "Mining combination failed (template=%s tercile=%s variant=%s) -- skipping, not aborting "
+                        "the whole cycle",
+                        variant.template,
+                        tercile_name,
+                        variant.variant_label,
+                    )
+                    continue
 
-            stability_score = compute_stability_score(evaluation.event_net_returns)
-            composite = _composite_score(evaluation.net_observed_pct, stability_score)
-            candidates.append(
-                MiningCandidate(
-                    template=variant.template,
-                    tercile=tercile_name,
-                    variant_label=variant.variant_label,
-                    params=variant.params,
-                    n_independent=evaluation.n_independent,
-                    gross_observed_pct=evaluation.gross_observed_pct,
-                    net_observed_pct=evaluation.net_observed_pct,
-                    stability_score=stability_score,
-                    composite_score=composite,
-                    report=evaluation.report,
+                stability_score = compute_stability_score(evaluation.event_net_returns)
+                composite = _composite_score(evaluation.net_observed_pct, stability_score)
+                candidates.append(
+                    MiningCandidate(
+                        template=variant.template,
+                        tercile=tercile_name,
+                        variant_label=variant.variant_label,
+                        params=variant.params,
+                        n_independent=evaluation.n_independent,
+                        gross_observed_pct=evaluation.gross_observed_pct,
+                        net_observed_pct=evaluation.net_observed_pct,
+                        stability_score=stability_score,
+                        composite_score=composite,
+                        report=evaluation.report,
+                    )
                 )
-            )
+    finally:
+        for tmp_file in tmp_cache_files:
+            tmp_file.unlink(missing_ok=True)
 
     candidates.sort(key=lambda c: c.composite_score, reverse=True)
     return candidates

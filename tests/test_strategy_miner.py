@@ -10,10 +10,18 @@ test_funding_extreme_backtest.py / test_cross_sectional_momentum_backtest.py
 from __future__ import annotations
 
 import logging
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from scanner.backtesting import strategy_miner as miner
+from scanner.backtesting.historical_universe import (
+    RankedUniverseWindow,
+    load_universe_cache,
+    save_ranked_universe_cache,
+)
 from scanner.backtesting.strategy_miner import (
     ALL_TEMPLATE_VARIANTS,
     CROSS_SECTIONAL_MOMENTUM_VARIANTS,
@@ -179,3 +187,109 @@ class TestRunMiningCycle:
         # the other two templates' variants still produced candidates.
         assert all(c.template != "funding_extreme_reversion" for c in candidates)
         assert len(candidates) == len(TREND_ANOMALY_VARIANTS) + len(CROSS_SECTIONAL_MOMENTUM_VARIANTS)
+
+
+class TestRankedUniverseCacheTranslation:
+    """Regression coverage for a real production bug: funding_extreme/
+    cross_sectional variants used to receive the RANKED universe cache
+    path (``{"ranked_symbols": [...]}`` schema) completely unchanged as
+    their ``point_in_time_universe_cache`` argument, even though their
+    frozen backtest modules only understand the older
+    ``{"symbols": [...]}`` schema -- causing a ``KeyError: 'symbols'`` on
+    every single funding_extreme_reversion/cross_sectional_momentum
+    combination, every mining cycle, while only trend_anomaly (which never
+    takes that argument at all) ever succeeded."""
+
+    @staticmethod
+    def _build_ranked_cache(tmp_path: Path) -> Path:
+        base = datetime(2024, 1, 1, tzinfo=UTC)
+        # 170 symbols so the default tercile rank ranges (1-57 / 58-113 /
+        # 114-170) each get a non-empty slice, same shape as the real
+        # production cache.
+        symbols = tuple(f"SYM{i}USDT" for i in range(170))
+        windows = [
+            RankedUniverseWindow(start=base, end=base + timedelta(days=30), ranked_symbols=symbols),
+            RankedUniverseWindow(
+                start=base + timedelta(days=30), end=base + timedelta(days=60), ranked_symbols=symbols
+            ),
+        ]
+        cache_path = tmp_path / "ranked_universe.json"
+        save_ranked_universe_cache(windows, cache_path)
+        return cache_path
+
+    def test_funding_extreme_and_cross_sectional_receive_old_schema_cache(self, tmp_path, monkeypatch) -> None:
+        ranked_cache_path = self._build_ranked_cache(tmp_path)
+        seen_caches: list[str | None] = []
+        loaded_window_sets: list[tuple] = []
+
+        def _check_and_record(cache: str | None) -> None:
+            seen_caches.append(cache)
+            assert cache is not None
+            assert cache != str(ranked_cache_path)
+            # Must be loadable through the OLD schema's loader, while the
+            # file still exists (it's deleted once the cycle ends) -- the
+            # real bug: the ranked cache's "ranked_symbols" key raises
+            # KeyError('symbols') here instead.
+            windows = load_universe_cache(cache)
+            assert windows
+            assert all(w.symbols for w in windows)
+            loaded_window_sets.append(windows)
+
+        def fake_funding(symbols, as_of_ts, cache, variant):
+            _check_and_record(cache)
+            return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
+                0.1
+            ] * 10
+
+        def fake_momentum(symbols, as_of_ts, cache, variant):
+            _check_and_record(cache)
+            return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
+                0.1
+            ] * 10
+
+        def fake_trend(symbols, as_of_ts, variant):
+            return {"metrics": {"n_independent_episodes": 5, "net_profit_pct": 1.5}}, [1.5] * 5
+
+        monkeypatch.setattr(miner, "_run_funding_extreme_variant", fake_funding)
+        monkeypatch.setattr(miner, "_run_cross_sectional_variant", fake_momentum)
+        monkeypatch.setattr(miner, "_run_trend_anomaly_variant", fake_trend)
+
+        candidates = run_mining_cycle(1_000, ranked_universe_cache_path=str(ranked_cache_path))
+
+        # All 3 terciles x (funding_extreme + cross_sectional) variants ran --
+        # none silently skipped due to a cache-schema mismatch.
+        expected_non_trend = len(FUNDING_EXTREME_VARIANTS) * 3 + len(CROSS_SECTIONAL_MOMENTUM_VARIANTS) * 3
+        assert len(seen_caches) == expected_non_trend
+        assert len(loaded_window_sets) == expected_non_trend
+        assert len(candidates) == len(ALL_TEMPLATE_VARIANTS) * 3
+
+    def test_temp_tercile_cache_files_are_cleaned_up(self, tmp_path, monkeypatch) -> None:
+        ranked_cache_path = self._build_ranked_cache(tmp_path)
+        seen_caches: list[str] = []
+
+        def fake_funding(symbols, as_of_ts, cache, variant):
+            seen_caches.append(cache)
+            return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
+                0.1
+            ] * 10
+
+        monkeypatch.setattr(miner, "_run_funding_extreme_variant", fake_funding)
+        monkeypatch.setattr(miner, "_run_cross_sectional_variant", fake_funding)
+        monkeypatch.setattr(
+            miner, "_run_trend_anomaly_variant", lambda symbols, as_of_ts, variant: ({"metrics": {}}, [])
+        )
+
+        run_mining_cycle(1_000, ranked_universe_cache_path=str(ranked_cache_path))
+
+        assert seen_caches
+        for cache_path in seen_caches:
+            assert not os.path.exists(cache_path)
+
+    def test_tercile_universe_cache_path_context_manager_cleans_up(self, tmp_path) -> None:
+        ranked_cache_path = self._build_ranked_cache(tmp_path)
+        with miner.tercile_universe_cache_path(str(ranked_cache_path), "top") as cache_path:
+            assert os.path.exists(cache_path)
+            windows = load_universe_cache(cache_path)
+            assert windows
+            assert len(windows[-1].symbols) == 57
+        assert not os.path.exists(cache_path)
