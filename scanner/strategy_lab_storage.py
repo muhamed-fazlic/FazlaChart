@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS mining_candidates (
     report_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mining_candidates_run ON mining_candidates (mined_at);
+CREATE INDEX IF NOT EXISTS idx_mining_candidates_as_of ON mining_candidates (as_of_timestamp_ms);
 CREATE INDEX IF NOT EXISTS idx_mining_candidates_score ON mining_candidates (composite_score DESC);
 
 CREATE TABLE IF NOT EXISTS weekly_snapshots (
@@ -176,14 +177,24 @@ def insert_mining_candidate(
 def fetch_leaderboard(conn: sqlite3.Connection, limit: int = 10) -> list[dict[str, Any]]:
     """Top ``limit`` candidates from the MOST RECENT mining run only (not
     pooled across every historical run ever stored), ranked by
-    ``composite_score`` descending."""
-    latest = conn.execute("SELECT MAX(mined_at) FROM mining_candidates").fetchone()[0]
+    ``composite_score`` descending.
+
+    Grouped by ``as_of_timestamp_ms`` (the single value shared by every
+    candidate within one mining cycle), NOT ``mined_at`` -- ``mined_at`` is
+    ``datetime.now(UTC).isoformat()`` captured individually per row inside
+    ``insert_mining_candidate``'s insert loop, so it differs (down to the
+    microsecond) between candidates of the SAME cycle. Grouping by it was a
+    real bug: ``WHERE mined_at = MAX(mined_at)`` only ever matched the
+    single last-inserted row of the latest cycle, not all of that cycle's
+    candidates, making this table silently show just one row instead of
+    one per (template, tercile, variant) combination actually mined."""
+    latest = conn.execute("SELECT MAX(as_of_timestamp_ms) FROM mining_candidates").fetchone()[0]
     if latest is None:
         return []
     cursor = conn.execute(
         "SELECT id, mined_at, template, tercile, variant_label, params_json, n_independent,"
         " gross_observed_pct, net_observed_pct, stability_score, composite_score"
-        " FROM mining_candidates WHERE mined_at = ? ORDER BY composite_score DESC LIMIT ?",
+        " FROM mining_candidates WHERE as_of_timestamp_ms = ? ORDER BY composite_score DESC LIMIT ?",
         (latest, limit),
     )
     columns = [d[0] for d in cursor.description]
