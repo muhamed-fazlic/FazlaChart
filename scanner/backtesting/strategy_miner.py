@@ -387,12 +387,24 @@ def run_mining_cycle(
     tercile_rank_ranges: dict[str, tuple[int, int]] | None = None,
     ranked_universe_cache_path: str | None = None,
     template_variants: tuple[TemplateVariant, ...] = ALL_TEMPLATE_VARIANTS,
+    already_mined_keys: frozenset[tuple[str, str, str]] | None = None,
 ) -> list[MiningCandidate]:
     """Runs exactly one Layer 1 mining cycle: every (template, tercile,
     variant) combination in ``template_variants`` x ``tercile_rank_ranges``,
     using only data at or before ``as_of_ts``. Prints/logs the EXACT total
     combination count up front (same "count must be known upfront"
     discipline as the Korak 10 exploratory scan) before running anything.
+
+    ``already_mined_keys`` is an optional set of ``(template, tercile,
+    variant_label)`` tuples to SKIP entirely (no backtest re-run, no
+    candidate produced for them). Pass in every combination already stored
+    for this exact ``as_of_ts`` to avoid pointlessly re-computing a result
+    that is mathematically guaranteed to be byte-identical to last time --
+    ``as_of_ts`` is clamped to a frozen train/holdout boundary
+    (``SHARED_HOLDOUT_END_MS``) once real time passes it, so re-running the
+    same combination against the same frozen cutoff forever produces the
+    same answer and only wastes CPU and pollutes storage with duplicate
+    rows (a real bug this parameter exists to prevent).
 
     ``ranked_universe_cache_path`` should point at a Korak-10-style ranked
     point-in-time universe cache (``historical_universe.save_ranked_universe_cache``
@@ -452,18 +464,27 @@ def run_mining_cycle(
         )
 
     total_combinations = len(template_variants) * len(tercile_symbol_sets)
+    already_mined_keys = already_mined_keys or frozenset()
+    skip_count = sum(
+        1
+        for tercile_name in tercile_symbol_sets
+        for variant in template_variants
+        if (variant.template, tercile_name, variant.variant_label) in already_mined_keys
+    )
     logger.info(
         "Strategy Lab mining cycle: %d template variants x %d terciles = %d total combinations "
-        "(as_of_ts=%d)",
+        "(as_of_ts=%d) -- %d already mined at this as_of_ts and will be skipped, %d new",
         len(template_variants),
         len(tercile_symbol_sets),
         total_combinations,
         as_of_ts,
+        skip_count,
+        total_combinations - skip_count,
     )
     print(
         f"Strategy Lab mining cycle: {len(template_variants)} template variants x "
         f"{len(tercile_symbol_sets)} terciles = {total_combinations} total combinations "
-        f"(as_of_ts={as_of_ts})"
+        f"(as_of_ts={as_of_ts}) -- {skip_count} already mined and skipped, {total_combinations - skip_count} new"
     )
 
     candidates: list[MiningCandidate] = []
@@ -476,6 +497,8 @@ def run_mining_cycle(
                 continue
             tercile_cache_path = tercile_universe_cache_paths.get(tercile_name)
             for variant in template_variants:
+                if (variant.template, tercile_name, variant.variant_label) in already_mined_keys:
+                    continue
                 try:
                     evaluation = evaluate_variant(variant, tercile_symbols, as_of_ts, tercile_cache_path)
                 except Exception:

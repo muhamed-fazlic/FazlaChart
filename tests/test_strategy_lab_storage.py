@@ -78,3 +78,31 @@ class TestFetchLeaderboard:
         finally:
             conn.close()
         assert leaderboard == []
+
+
+class TestFetchMinedComboKeys:
+    def test_returns_only_combos_at_the_given_as_of_timestamp(self, tmp_path) -> None:
+        conn = storage.init_db(str(tmp_path / "strategy_lab.db"))
+        try:
+            _insert(conn, as_of_timestamp_ms=1_000, variant_label="old cycle variant", composite_score=1.0)
+            _insert(conn, as_of_timestamp_ms=2_000, variant_label="Original signal", composite_score=1.0)
+            _insert(conn, as_of_timestamp_ms=2_000, variant_label="Fade (invert) signal", composite_score=1.0)
+
+            keys = storage.fetch_mined_combo_keys(conn, 2_000)
+        finally:
+            conn.close()
+
+        assert keys == frozenset(
+            {
+                ("trend_anomaly", "top", "Original signal"),
+                ("trend_anomaly", "top", "Fade (invert) signal"),
+            }
+        )
+
+    def test_empty_db_returns_empty_frozenset(self, tmp_path) -> None:
+        conn = storage.init_db(str(tmp_path / "strategy_lab.db"))
+        try:
+            keys = storage.fetch_mined_combo_keys(conn, 1_000)
+        finally:
+            conn.close()
+        assert keys == frozenset()

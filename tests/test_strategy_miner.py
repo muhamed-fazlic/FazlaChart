@@ -188,6 +188,63 @@ class TestRunMiningCycle:
         assert all(c.template != "funding_extreme_reversion" for c in candidates)
         assert len(candidates) == len(TREND_ANOMALY_VARIANTS) + len(CROSS_SECTIONAL_MOMENTUM_VARIANTS)
 
+    def test_already_mined_keys_are_skipped_entirely(self, monkeypatch) -> None:
+        """Regression coverage for a real production bug: once real time
+        passes the frozen SHARED_HOLDOUT_END_MS boundary, as_of_ts is
+        clamped to the same value forever, so re-running an
+        already-mined combination against it is guaranteed to reproduce
+        the identical result -- a pure waste of CPU that also pollutes
+        storage with duplicate rows every cycle. already_mined_keys lets
+        callers skip those combinations without even invoking the
+        (potentially expensive) backtest for them."""
+        calls: list[str] = []
+
+        def fake_funding(symbols, as_of_ts, cache, variant):
+            calls.append(f"funding:{variant.variant_label}")
+            return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
+                0.1
+            ] * 10
+
+        def fake_momentum(symbols, as_of_ts, cache, variant):
+            calls.append(f"momentum:{variant.variant_label}")
+            return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
+                0.1
+            ] * 10
+
+        def fake_trend(symbols, as_of_ts, variant):
+            calls.append(f"trend:{variant.variant_label}")
+            return {"metrics": {"n_independent_episodes": 5, "net_profit_pct": 1.5}}, [1.5] * 5
+
+        monkeypatch.setattr(miner, "_run_funding_extreme_variant", fake_funding)
+        monkeypatch.setattr(miner, "_run_cross_sectional_variant", fake_momentum)
+        monkeypatch.setattr(miner, "_run_trend_anomaly_variant", fake_trend)
+
+        already_mined = frozenset(
+            (variant.template, "unsliced", variant.variant_label) for variant in TREND_ANOMALY_VARIANTS
+        )
+        candidates = run_mining_cycle(1_000, symbols=("BTCUSDT",), already_mined_keys=already_mined)
+
+        # The already-mined trend_anomaly variants were never even
+        # invoked (not just filtered out after the fact).
+        assert all(not call.startswith("trend:") for call in calls)
+        assert all(c.template != "trend_anomaly" for c in candidates)
+        # Everything else still ran normally.
+        assert len(candidates) == len(FUNDING_EXTREME_VARIANTS) + len(CROSS_SECTIONAL_MOMENTUM_VARIANTS)
+
+    def test_all_combinations_already_mined_produces_no_candidates(self, monkeypatch) -> None:
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("should not be called -- everything was already mined")
+
+        monkeypatch.setattr(miner, "_run_funding_extreme_variant", fail_if_called)
+        monkeypatch.setattr(miner, "_run_cross_sectional_variant", fail_if_called)
+        monkeypatch.setattr(miner, "_run_trend_anomaly_variant", fail_if_called)
+
+        already_mined = frozenset(
+            (variant.template, "unsliced", variant.variant_label) for variant in ALL_TEMPLATE_VARIANTS
+        )
+        candidates = run_mining_cycle(1_000, symbols=("BTCUSDT",), already_mined_keys=already_mined)
+        assert candidates == []
+
 
 class TestRankedUniverseCacheTranslation:
     """Regression coverage for a real production bug: funding_extreme/

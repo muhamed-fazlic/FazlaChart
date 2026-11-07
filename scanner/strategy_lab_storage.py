@@ -204,6 +204,22 @@ def fetch_leaderboard(conn: sqlite3.Connection, limit: int = 10) -> list[dict[st
     return rows
 
 
+def fetch_mined_combo_keys(conn: sqlite3.Connection, as_of_timestamp_ms: int) -> frozenset[tuple[str, str, str]]:
+    """``(template, tercile, variant_label)`` combinations already stored
+    for this exact ``as_of_timestamp_ms``. The scheduler uses this to skip
+    re-mining a combination whose result is guaranteed to be byte-identical
+    to what's already stored -- ``as_of_ts`` is clamped to a frozen
+    train/holdout boundary once real time passes it, so without this check
+    every scheduled cycle re-runs (and re-inserts) the exact same
+    combinations forever, wasting CPU and filling the leaderboard with
+    duplicate rows (a real bug this function exists to prevent)."""
+    cursor = conn.execute(
+        "SELECT DISTINCT template, tercile, variant_label FROM mining_candidates WHERE as_of_timestamp_ms = ?",
+        (as_of_timestamp_ms,),
+    )
+    return frozenset((row[0], row[1], row[2]) for row in cursor.fetchall())
+
+
 def fetch_total_candidates_tested(conn: sqlite3.Connection) -> int:
     """Total row count in ``mining_candidates`` across EVERY mining cycle
     ever run (not just the most recent one -- that's ``fetch_leaderboard``'s

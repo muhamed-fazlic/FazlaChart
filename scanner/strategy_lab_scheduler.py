@@ -60,16 +60,28 @@ class StrategyLabScheduler:
 
     def run_mining_once(self) -> int:
         """Runs one Layer 1 mining cycle, persisting every evaluated
-        candidate. Returns the number of candidates stored."""
+        candidate. Returns the number of candidates stored.
+
+        Skips any (template, tercile, variant) combination already stored
+        for this exact ``as_of_ts`` -- once real time passes
+        ``SHARED_HOLDOUT_END_MS``, ``as_of_ts`` is permanently clamped to
+        that same frozen value every cycle, so re-mining an already-mined
+        combination would just reproduce the identical result and waste
+        CPU/storage forever. New candidates only appear once a human adds
+        new ``TemplateVariant`` entries to ``ALL_TEMPLATE_VARIANTS`` (the
+        deliberate, bounded way this system grows -- see
+        ``strategy_miner.py``'s module docstring)."""
         as_of_ts = min(int(datetime.now(UTC).timestamp() * 1000), SHARED_HOLDOUT_END_MS)
-        candidates = run_mining_cycle(
-            as_of_ts,
-            symbols=self.symbols,
-            ranked_universe_cache_path=self.ranked_universe_cache_path,
-            template_variants=ALL_TEMPLATE_VARIANTS,
-        )
         conn = storage.init_db(self.db_path)
         try:
+            already_mined_keys = storage.fetch_mined_combo_keys(conn, as_of_ts)
+            candidates = run_mining_cycle(
+                as_of_ts,
+                symbols=self.symbols,
+                ranked_universe_cache_path=self.ranked_universe_cache_path,
+                template_variants=ALL_TEMPLATE_VARIANTS,
+                already_mined_keys=already_mined_keys,
+            )
             for candidate in candidates:
                 storage.insert_mining_candidate(
                     conn,
@@ -87,7 +99,7 @@ class StrategyLabScheduler:
                 )
         finally:
             conn.close()
-        logger.info("Strategy Lab mining cycle stored %d candidates", len(candidates))
+        logger.info("Strategy Lab mining cycle stored %d new candidates", len(candidates))
         return len(candidates)
 
     def run_weekly_once(self) -> None:
