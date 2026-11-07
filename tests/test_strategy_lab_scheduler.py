@@ -85,3 +85,49 @@ class TestRunMiningOnceSkipsAlreadyMinedCombos:
         # The pre-seeded "Original signal" row must still be there exactly
         # once (not duplicated), plus the one genuinely new candidate.
         assert [r[0] for r in rows] == ["Fade (invert) signal", "Original signal"]
+
+
+class TestWeeklyRunStateSurvivesRestart:
+    """Regression coverage for a real production bug: the scheduler used to
+    track "when did the weekly snapshot last run" only in an in-process
+    ``time.monotonic()`` field, starting at ``None`` every time. That meant
+    every routine deployment restart of the systemd service immediately
+    re-triggered an out-of-schedule weekly snapshot (and its Telegram
+    message), no matter how recently the real last one had actually run."""
+
+    def test_init_seeds_last_weekly_run_at_from_existing_snapshot(self, tmp_path) -> None:
+        db_path = str(tmp_path / "strategy_lab.db")
+        conn = storage.init_db(db_path)
+        storage.insert_weekly_snapshot(
+            conn,
+            candidate_id=None,
+            template="trend_anomaly",
+            tercile="unsliced",
+            variant_label="Original signal",
+            n_independent=50,
+            net_observed_pct=0.3,
+            net_ci_low_pct=None,
+            net_ci_high_pct=None,
+            gross_observed_pct=0.5,
+            win_rate_pct=50.0,
+            telegram_sent=True,
+            report={},
+        )
+        conn.close()
+
+        # Simulating a process restart: a brand new scheduler instance must
+        # pick up the already-persisted snapshot time instead of starting
+        # from "never ran" (which would immediately re-fire).
+        sched = scheduler_module.StrategyLabScheduler(db_path=db_path, symbols=("BTCUSDT",))
+
+        assert sched._last_weekly_run_at is not None
+
+    def test_init_leaves_last_weekly_run_at_none_when_no_snapshot_exists_yet(self, tmp_path) -> None:
+        db_path = str(tmp_path / "strategy_lab.db")
+        storage.init_db(db_path).close()
+
+        sched = scheduler_module.StrategyLabScheduler(db_path=db_path, symbols=("BTCUSDT",))
+
+        # First-ever run of the service genuinely has no prior weekly
+        # snapshot, so it is correct (and desired) for it to run once.
+        assert sched._last_weekly_run_at is None

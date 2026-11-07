@@ -106,3 +106,42 @@ class TestFetchMinedComboKeys:
         finally:
             conn.close()
         assert keys == frozenset()
+
+
+class TestFetchLatestWeeklySnapshotAt:
+    """Regression coverage for a real production bug: the scheduler used to
+    only track "last weekly run" in memory, so every process restart reset
+    it to "never" and immediately re-triggered an out-of-schedule weekly
+    snapshot + Telegram send. This function lets the scheduler instead ask
+    the database what actually happened."""
+
+    def test_returns_none_when_no_snapshot_exists(self, tmp_path) -> None:
+        conn = storage.init_db(str(tmp_path / "strategy_lab.db"))
+        try:
+            assert storage.fetch_latest_weekly_snapshot_at(conn) is None
+        finally:
+            conn.close()
+
+    def test_returns_timestamp_of_most_recent_snapshot(self, tmp_path) -> None:
+        conn = storage.init_db(str(tmp_path / "strategy_lab.db"))
+        try:
+            storage.insert_weekly_snapshot(
+                conn,
+                candidate_id=None,
+                template="trend_anomaly",
+                tercile="unsliced",
+                variant_label="Original signal",
+                n_independent=50,
+                net_observed_pct=0.3,
+                net_ci_low_pct=None,
+                net_ci_high_pct=None,
+                gross_observed_pct=0.5,
+                win_rate_pct=50.0,
+                telegram_sent=True,
+                report={},
+            )
+            latest = storage.fetch_latest_weekly_snapshot_at(conn)
+        finally:
+            conn.close()
+
+        assert latest is not None

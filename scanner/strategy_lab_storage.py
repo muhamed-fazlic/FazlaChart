@@ -337,6 +337,22 @@ def insert_weekly_snapshot(
     return int(cursor.lastrowid)
 
 
+def fetch_latest_weekly_snapshot_at(conn: sqlite3.Connection) -> datetime | None:
+    """UTC timestamp of the most recently stored weekly snapshot, or
+    ``None`` if Layer 1 has never produced one. Lets the scheduler persist
+    "when did the weekly snapshot/Layer-2 check last run" in the database
+    instead of an in-process ``time.monotonic()`` value -- the in-memory
+    version resets to "never" on every process restart, so a routine
+    deployment restart used to immediately re-trigger an out-of-schedule
+    weekly snapshot (and its Telegram message) regardless of how recently
+    the real last one happened (a real production bug this function exists
+    to prevent)."""
+    row = conn.execute("SELECT MAX(snapshot_at) FROM weekly_snapshots").fetchone()
+    if row is None or row[0] is None:
+        return None
+    return datetime.fromisoformat(row[0])
+
+
 def fetch_weekly_snapshots(conn: sqlite3.Connection, limit: int = 52) -> list[dict[str, Any]]:
     cursor = conn.execute(
         "SELECT id, snapshot_at, candidate_id, template, tercile, variant_label, n_independent,"

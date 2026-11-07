@@ -56,7 +56,18 @@ class StrategyLabScheduler:
             bot_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
             chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,
         )
-        self._last_weekly_run_at_monotonic: float | None = None
+        # Seeded from storage (NOT left as None / a fresh time.monotonic()
+        # clock) so a process restart can never by itself re-trigger an
+        # out-of-schedule weekly snapshot + Telegram send -- see
+        # storage.fetch_latest_weekly_snapshot_at's docstring for the real
+        # bug this prevents. Wall-clock (UTC datetime), not monotonic,
+        # since monotonic clocks cannot be compared across process restarts.
+        conn = storage.init_db(self.db_path)
+        try:
+            self._last_weekly_run_at: datetime | None = storage.fetch_latest_weekly_snapshot_at(conn)
+        finally:
+            conn.close()
+
 
     def run_mining_once(self) -> int:
         """Runs one Layer 1 mining cycle, persisting every evaluated
@@ -141,23 +152,24 @@ class StrategyLabScheduler:
             self.weekly_interval_seconds,
         )
         while True:
-            cycle_start = time.monotonic()
+            cycle_start_monotonic = time.monotonic()
+            cycle_start_wall = datetime.now(UTC)
             try:
                 self.run_mining_once()
             except Exception:
                 logger.exception("Strategy Lab mining cycle failed; continuing on the next interval")
 
             if (
-                self._last_weekly_run_at_monotonic is None
-                or cycle_start - self._last_weekly_run_at_monotonic >= self.weekly_interval_seconds
+                self._last_weekly_run_at is None
+                or (cycle_start_wall - self._last_weekly_run_at).total_seconds() >= self.weekly_interval_seconds
             ):
                 try:
                     self.run_weekly_once()
                 except Exception:
                     logger.exception("Strategy Lab weekly snapshot/Layer-2 check failed; continuing")
-                self._last_weekly_run_at_monotonic = cycle_start
+                self._last_weekly_run_at = cycle_start_wall
 
-            elapsed = time.monotonic() - cycle_start
+            elapsed = time.monotonic() - cycle_start_monotonic
             sleep_for = max(0.0, self.mining_interval_seconds - elapsed)
             time.sleep(sleep_for)
 
