@@ -73,6 +73,7 @@ def _seed_frozen_candidate(
     windows_checked: int = 3,
     windows_positive: int = 3,
     btc_beta: float = 0.1,
+    frozen_as_of_ts: int | None = None,
 ) -> int:
     """Seeds a mining_candidate row AND freezes it straight into the Layer
     2 confirmation queue -- bypassing ``check_entry_threshold`` so these
@@ -89,7 +90,9 @@ def _seed_frozen_candidate(
             template=variant.template,
             tercile="unsliced",
             variant_label=variant.variant_label,
-            frozen_as_of_ts=SHARED_HOLDOUT_END_MS - 180 * DAY_MS,
+            frozen_as_of_ts=(
+                frozen_as_of_ts if frozen_as_of_ts is not None else SHARED_HOLDOUT_END_MS - 180 * DAY_MS
+            ),
             source_candidate_id=candidate_id,
             windows_checked=windows_checked,
             windows_positive=windows_positive,
@@ -209,7 +212,7 @@ class TestRunLayer2Check:
         _seed_boundary(db_path, SHARED_HOLDOUT_END_MS)
         now_ms = SHARED_HOLDOUT_END_MS + 400 * DAY_MS
 
-        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path, bootstrap_confidence_pct=None):
+        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             raise AssertionError("evaluate_variant must not be called when manual_trigger is False")
 
         monkeypatch.setattr(miner, "evaluate_variant", fake_evaluate)
@@ -242,7 +245,7 @@ class TestRunLayer2Check:
         _seed_boundary(db_path, SHARED_HOLDOUT_END_MS)
         now_ms = SHARED_HOLDOUT_END_MS + 400 * DAY_MS
 
-        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path, bootstrap_confidence_pct=None):
+        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             return miner.VariantEvaluation(
                 report={"net_block_bootstrap": {"ci_low_pct": 0.5, "ci_high_pct": 2.0, "edge_survives_lower_bound": True}},
                 event_net_returns=[1.0] * 500,
@@ -283,7 +286,7 @@ class TestRunLayer2Check:
         _seed_boundary(db_path, SHARED_HOLDOUT_END_MS)
         now_ms = SHARED_HOLDOUT_END_MS + 400 * DAY_MS
 
-        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path, bootstrap_confidence_pct=None):
+        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             return miner.VariantEvaluation(
                 report={"net_block_bootstrap": {"ci_low_pct": 0.5, "ci_high_pct": 2.0, "edge_survives_lower_bound": True}},
                 event_net_returns=[1.0] * 500,
@@ -316,3 +319,54 @@ class TestRunLayer2Check:
         assert second.ran_confirmation is False
         assert second.candidate is None
         assert second.fresh_days_available == 0.0
+
+    def test_confirmation_isolation_boundary_uses_candidates_own_later_t_not_the_stale_global_boundary(
+        self, db_path: str, monkeypatch
+    ) -> None:
+        """Korak 10 item 2/6 leakage fix: the confirmatory backtest's
+        isolation boundary must be ``max(boundary_ms, candidate's own
+        frozen_as_of_ts)``, per-candidate -- never the bare global
+        rolling-holdout boundary alone. Here the global boundary is
+        seeded OLDER than the candidate's own ``frozen_as_of_ts`` (e.g.
+        because an earlier, different candidate's confirmation attempt
+        left a stale, earlier marker); using the global boundary alone
+        would let this candidate's confirmation see calendar time its own
+        training data already used -- exactly the leak the fix closes."""
+        frozen_as_of_ts = SHARED_HOLDOUT_END_MS + 50 * DAY_MS
+        _seed_frozen_candidate(db_path, net_observed_pct=5.0, n_independent=2000, frozen_as_of_ts=frozen_as_of_ts)
+        _seed_boundary(db_path, SHARED_HOLDOUT_END_MS)  # stale: older than the candidate's own T
+        now_ms = SHARED_HOLDOUT_END_MS + 400 * DAY_MS
+
+        captured: dict[str, object] = {}
+
+        def fake_evaluate(variant, symbols, end_timestamp_ms, cache_path, bootstrap_confidence_pct=None, start_timestamp_ms=None):
+            captured["start_timestamp_ms"] = start_timestamp_ms
+            return miner.VariantEvaluation(
+                report={"net_block_bootstrap": {"ci_low_pct": 0.5, "ci_high_pct": 2.0, "edge_survives_lower_bound": True}},
+                event_net_returns=[1.0] * 500,
+                n_independent=500,
+                net_observed_pct=1.2,
+                gross_observed_pct=1.4,
+            )
+
+        monkeypatch.setattr(miner, "evaluate_variant", fake_evaluate)
+        result = runner.run_layer2_check(
+            db_path=db_path,
+            shared_holdout_end_ms=SHARED_HOLDOUT_END_MS,
+            now_ms=now_ms,
+            symbols=("BTCUSDT",),
+            manual_trigger=True,
+        )
+
+        assert result.ran_confirmation is True
+        # The boundary actually passed through to the backtest must be the
+        # candidate's own (later) T, not the stale (earlier) global one.
+        assert captured["start_timestamp_ms"] == frozen_as_of_ts
+
+        conn = storage.connect_for_reads(db_path)
+        try:
+            confirmations = storage.fetch_confirmations(conn)
+        finally:
+            conn.close()
+        assert len(confirmations) == 1
+        assert confirmations[0]["fresh_window_start_ms"] == frozen_as_of_ts

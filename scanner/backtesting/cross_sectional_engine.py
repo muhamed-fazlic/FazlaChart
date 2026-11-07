@@ -308,6 +308,7 @@ def run_backtest(
     symbols: tuple[str, ...] = DEFAULT_SYMBOLS,
     *,
     end_timestamp_ms: int,
+    start_timestamp_ms: int | None = None,
     price_timeframe: str = DEFAULT_PRICE_TIMEFRAME,
     price_candles: int = DEFAULT_PRICE_CANDLES,
     kline_cache_dir: str = DEFAULT_KLINE_CACHE_DIR,
@@ -321,7 +322,24 @@ def run_backtest(
     data anchored at the frozen ``end_timestamp_ms`` -- same no-look-ahead
     guarantee and overall shape as the frozen momentum module's
     ``run_backtest``, generalized over ranking signal/lookback/rebalance
-    cadence/basket size."""
+    cadence/basket size.
+
+    ``start_timestamp_ms`` (Korak 10 item 2/6 leakage fix): when given,
+    this is Layer 2's isolation boundary -- the engine still LOADS the
+    full ``price_candles`` of history up to ``end_timestamp_ms`` (so each
+    rebalance's ranking signal can use its normal lookback window, which
+    is legitimately allowed to dip before this boundary -- see the
+    ``CrossSectionalConfig.lookback_hours`` warm-up), but every rebalance
+    PERIOD counted toward ``n_independent``/the returned returns/the
+    block-bootstrap CI/beta check is filtered to ``rebalance_time >=
+    start_timestamp_ms`` -- i.e. a period's entire holding interval
+    (``[rebalance_time, exit_time]``) must fall strictly within the fresh
+    window. Without this, Layer 1 (``end_timestamp_ms`` only, no lower
+    bound) and a Layer 2 "confirmation" ran the exact same ~
+    ``price_candles``-long trailing window, just with the end date pushed
+    a little further out -- so the two were never actually independent
+    samples. ``None`` (Layer 1's own calls, and the weekly snapshot) keeps
+    the original full-history behaviour unchanged."""
     point_in_time_windows = None
     if point_in_time_universe_cache is not None:
         try:
@@ -386,6 +404,21 @@ def run_backtest(
         periods.append(period)
         prev_basket = basket
 
+    # Korak 10 item 2/6 leakage fix: the grid/ranking/turnover loop above
+    # deliberately runs over the FULL history (a period's basket selection
+    # is allowed to rank symbols using lookback data from before
+    # ``start_timestamp_ms`` -- warm-up, not leakage -- and turnover needs
+    # the unbroken ``prev_basket`` chain to cost each actual rebalance
+    # correctly). Only NOW, after that chain is built, do we drop any
+    # period whose holding interval could include pre-boundary data --
+    # i.e. everything downstream (n_independent, returns, CI, beta,
+    # reported periods) sees ONLY periods entered at or after the
+    # boundary, so a Layer 2 confirmation's statistics are never built
+    # from the same periods Layer 1 already looked at.
+    if start_timestamp_ms is not None:
+        start_dt = datetime.fromtimestamp(start_timestamp_ms / 1000.0, tz=UTC)
+        periods = [p for p in periods if p.rebalance_time >= start_dt]
+
     n_independent = len(periods)
     net_returns = [p.net_return_pct for p in periods]
     gross_returns = [p.gross_return_pct for p in periods]
@@ -424,6 +457,12 @@ def run_backtest(
             "base_cost_pct": base_cost_pct,
             "price_timeframe": price_timeframe,
         },
+        "start_timestamp_ms": start_timestamp_ms,
+        "start_timestamp_iso": (
+            datetime.fromtimestamp(start_timestamp_ms / 1000.0, tz=UTC).isoformat()
+            if start_timestamp_ms is not None
+            else None
+        ),
         "symbols_requested": list(symbols),
         "symbols_used": sorted(histories.keys()),
         "skipped_symbols": skipped_symbols,

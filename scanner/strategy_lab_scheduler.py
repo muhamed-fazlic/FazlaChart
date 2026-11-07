@@ -99,6 +99,20 @@ class StrategyLabScheduler:
         conn = storage.init_db(self.db_path)
         try:
             self._last_weekly_run_at: datetime | None = storage.fetch_latest_weekly_snapshot_at(conn)
+            # Korak 10 item 2/6 leakage fix: the rolling holdout boundary's
+            # first-ever value is bootstrapped HERE, at this
+            # owning-process's startup -- never lazily from
+            # ``run_layer2_check``'s read-only path (the dashboard's
+            # overview endpoint calls it with ``manual_trigger=False`` on
+            # every page load, which must never have a database side
+            # effect). This keeps the anchor fixed and stable even if the
+            # dashboard is the very first thing to ever query it.
+            if storage.fetch_rolling_holdout_state(conn) is None:
+                from scanner.backtesting.rolling_holdout import initial_boundary_ms
+
+                storage.save_rolling_holdout_state(
+                    conn, initial_boundary_ms(SHARED_HOLDOUT_END_MS, now_ms=int(datetime.now(UTC).timestamp() * 1000))
+                )
         finally:
             conn.close()
 

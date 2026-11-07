@@ -367,13 +367,18 @@ def _run_cross_sectional_engine_variant(
     point_in_time_universe_cache: str | None,
     variant: TemplateVariant,
     bootstrap_confidence_pct: float | None = None,
+    start_timestamp_ms: int | None = None,
 ) -> tuple[dict[str, Any], list[float]]:
     """Runs one of the Korak 10 rolling templates (momentum_30d, low_vol,
     funding_carry_xs) through the generalized ``cross_sectional_engine``.
     Unlike ``_run_funding_extreme_variant``/``_run_cross_sectional_variant``,
     this needs no ``_patched_module_constants`` -- the engine takes its
     parameterization directly via ``CrossSectionalConfig``, not via
-    frozen-module globals."""
+    frozen-module globals.
+
+    ``start_timestamp_ms`` is Layer 2's isolation boundary (see
+    ``cross_sectional_engine.run_backtest``'s docstring) -- ``None`` for
+    every Layer 1 mining/weekly-snapshot call."""
     config = cse.CrossSectionalConfig(
         hypothesis=variant.template,
         ranking_fn=_CSE_RANKING_FNS[variant.template],
@@ -387,6 +392,8 @@ def _run_cross_sectional_engine_variant(
     }
     if bootstrap_confidence_pct is not None:
         kwargs["bootstrap_confidence_pct"] = bootstrap_confidence_pct
+    if start_timestamp_ms is not None:
+        kwargs["start_timestamp_ms"] = start_timestamp_ms
     report = cse.run_backtest(config, symbols, **kwargs)
     event_net_returns = [p["net_return_pct"] for p in report["rebalance_periods"]]
     return report, event_net_returns
@@ -431,6 +438,7 @@ def evaluate_variant(
     end_timestamp_ms: int,
     point_in_time_universe_cache: str | None,
     bootstrap_confidence_pct: float | None = None,
+    start_timestamp_ms: int | None = None,
 ) -> VariantEvaluation:
     """Runs ``variant`` against ``symbols``/``end_timestamp_ms`` through
     the correct frozen backtest module, normalizing the result into
@@ -447,7 +455,21 @@ def evaluate_variant(
     which threads this straight into ``run_backtest``) currently honor a
     non-default value here; the three frozen modules keep their own
     pre-registered defaults regardless, since they are never Layer 2
-    candidates (``CLOSED_PRIOR_TEMPLATES``)."""
+    candidates (``CLOSED_PRIOR_TEMPLATES``).
+
+    ``start_timestamp_ms`` (Korak 10 item 2/6 leakage fix) is Layer 2's
+    isolation boundary -- the confirmatory run must not count any
+    rebalance period entered before this -- and, like
+    ``bootstrap_confidence_pct``, is only ever honored for
+    ``ROLLING_AS_OF_TEMPLATES`` (the only templates ever eligible for
+    Layer 2). Passing it for any other template is a caller bug (those
+    templates are ``CLOSED_PRIOR_TEMPLATES``, never confirmed), so it
+    raises rather than silently ignoring the boundary."""
+    if start_timestamp_ms is not None and variant.template not in ROLLING_AS_OF_TEMPLATES:
+        raise ValueError(
+            f"start_timestamp_ms is only meaningful for ROLLING_AS_OF_TEMPLATES, got template={variant.template!r} "
+            "-- closed/frozen templates are never Layer 2 candidates and have no isolation-boundary support"
+        )
     if variant.template == "funding_extreme_reversion":
         report, event_net_returns = _run_funding_extreme_variant(
             symbols, end_timestamp_ms, point_in_time_universe_cache, variant
@@ -468,7 +490,12 @@ def evaluate_variant(
         )
     elif variant.template in ROLLING_AS_OF_TEMPLATES:
         report, event_net_returns = _run_cross_sectional_engine_variant(
-            symbols, end_timestamp_ms, point_in_time_universe_cache, variant, bootstrap_confidence_pct
+            symbols,
+            end_timestamp_ms,
+            point_in_time_universe_cache,
+            variant,
+            bootstrap_confidence_pct,
+            start_timestamp_ms=start_timestamp_ms,
         )
         n_independent = report["n_independent"]
         net_observed_pct = report["net_block_bootstrap"]["observed_pct"] if report["net_block_bootstrap"] else None

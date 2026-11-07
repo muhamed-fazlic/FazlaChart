@@ -213,6 +213,43 @@ sažetak za "Istraživanje" tab; `strategy_lab.db` nosi pune, žive detalje za
 "Strategy Lab" tab — oba su generička i aditivna, nijedno ne duplira
 drugo.
 
+### Holm/Bonferroni `m` (ispravljeno poslije Korak 10)
+
+Originalni Korak 10 prompt (tačka 4) je tražio da Layer 2 koristi
+`unique_config_count` (ukupan broj JEDINSTVENIH Layer 1 konfiguracija ikad
+minovanih, do limita 300) kao `m` za Holm korekciju. To je bila greška u
+samom promptu, ne implementaciona greška: ispravna semantika je da `m` =
+broj kandidata koji se potvrđuju na ISTOM svježem prozoru podataka, ne
+Layer 1-ov cjelokupni brojač.
+
+Pod trenutnim strogim FIFO dizajnom (tačno jedan kandidat u redu u datom
+trenutku, trošeno sekvencijalno), `m = 1` uvijek, pa se bazni alpha (0.05)
+NE smanjuje. Ako dizajn ikad dozvoli više kandidata da se potvrđuju na
+istom svježem prozoru istovremeno, `m` treba rasti s tim brojem — vidi
+`layer2_entry.holm_corrected_confidence_pct(candidates_confirmed_on_same_window)`.
+
+### Izolacija svježeg prozora (per-candidate boundary)
+
+Layer 2-ova potvrda smije brojati samo rebalance periode čije je vrijeme
+ulaska `>= max(rolling_holdout_boundary, kandidatov_vlastiti_frozen_as_of_ts)`
+— nikad samo globalnu `rolling_holdout_boundary` samu za sebe. Globalna
+granica sprečava da se ISTO kalendarsko vrijeme dvaput potroši kroz više
+kandidata tokom vremena; kandidatov vlastiti zamrznuti `T`
+(`frozen_as_of_ts`) sprečava da kandidatovi SOPSTVENI trening podaci
+procure u njegovu vlastitu potvrdu. Nijedno samo za sebe nije dovoljno —
+samo `max()` oba garantuje obje stvari (vidi
+`strategy_lab_runner.run_layer2_check`'s `candidate_start_ms`).
+
+Loading istorije (`cached_load_extended_history`) i dalje učitava PUNU
+istoriju do `end_timestamp_ms` (nema donje granice pri učitavanju) — svaki
+rebalance smije koristiti lookback podatke i prije granice za računanje
+ranga (legitiman "warm-up", ne curenje). Tek PO IZGRADNJI punog grid/basket
+lanca (potreban za ispravno koštanje turnover-a), lista perioda se filtrira
+na `rebalance_time >= start_timestamp_ms` prije bilo kakve statistike
+(`n_independent`, CI, beta, itd.) — vidi
+`cross_sectional_engine.run_backtest`'ov `start_timestamp_ms` parametar i
+`tests/test_cross_sectional_engine.py::TestRunBacktestIsolationBoundary`.
+
 ---
 
 ## Scheduler (ne tight `while True` petlja bez strukture)

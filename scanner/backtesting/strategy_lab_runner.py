@@ -218,9 +218,18 @@ def run_layer2_check(
 
     Holm/Bonferroni correction: the confirmatory block-bootstrap CI is
     computed at ``layer2_entry.holm_corrected_confidence_pct`` (scaled by
-    the total unique-configuration count) rather than the engine's default
-    95%, so more configurations fished through means a stricter bar to
-    call an edge confirmed.
+    ``m`` = candidates confirmed against this same fresh window -- always
+    1 under the current strictly-sequential queue, NOT Layer 1's all-time
+    unique-configuration count; see that function's docstring for why the
+    original Korak 10 item 4 wording was corrected).
+
+    Isolation boundary (Korak 10 item 2/6): the confirmatory backtest only
+    ever counts rebalance periods entered at or after
+    ``max(rolling_holdout_boundary, candidate["frozen_as_of_ts"])`` -- a
+    per-candidate floor, never the raw global boundary alone, so a
+    confirmation can never double back onto calendar time Layer 1 already
+    used to decide this candidate qualified for the queue in the first
+    place.
     """
     if now_ms is None:
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
@@ -230,7 +239,18 @@ def run_layer2_check(
         state_row = storage.fetch_rolling_holdout_state(conn)
         if state_row is None:
             boundary_ms = initial_boundary_ms(shared_holdout_end_ms, now_ms=now_ms)
-            storage.save_rolling_holdout_state(conn, boundary_ms)
+            # Only persist this first-ever boundary on a REAL confirmation
+            # attempt (``manual_trigger=True``, only ever reached via the
+            # owner's explicit ``--confirm-layer2`` CLI run) -- a read-only
+            # call (the dashboard's overview endpoint, or the scheduler's
+            # own automatic weekly check, both always pass
+            # ``manual_trigger=False``) must never have a side effect.
+            # ``StrategyLabScheduler.__init__`` separately bootstraps this
+            # row at process startup so the automatic path has a stable,
+            # non-drifting anchor to read even before any confirmation
+            # ever runs.
+            if manual_trigger:
+                storage.save_rolling_holdout_state(conn, boundary_ms)
         else:
             boundary_ms = state_row["boundary_timestamp_ms"]
         state = RollingHoldoutState(boundary_timestamp_ms=boundary_ms)
@@ -244,6 +264,20 @@ def run_layer2_check(
 
         if candidate.get("net_observed_pct") is None or not candidate["n_independent"]:
             return Layer2CheckResult(ran_confirmation=False, fresh_days_available=fresh_days, candidate=candidate)
+
+        # Korak 10 item 2/6 leakage fix: the fresh window actually
+        # available to THIS candidate can never start before its own
+        # frozen T (``frozen_as_of_ts``, the as_of_ts of the Layer 1
+        # training run that qualified it) -- the global rolling boundary
+        # alone is not enough, since a later-frozen candidate's T can be
+        # AFTER the boundary that happened to be set (e.g. at this
+        # feature's very first run, or right after a previous
+        # confirmation). Every fresh-days calculation, power-gate check,
+        # and the confirmatory backtest itself all use this per-candidate
+        # floor, never the raw global boundary alone.
+        candidate_start_ms = max(boundary_ms, candidate["frozen_as_of_ts"])
+        fresh_ms = max(0, now_ms - candidate_start_ms)
+        fresh_days = fresh_ms / _MS_PER_DAY
 
         # Training period estimate: anchored to this config's OWN first
         # mining timestamp, not the fixed shared_holdout_end_ms (see
@@ -313,9 +347,16 @@ def run_layer2_check(
 
         # manual_trigger=True: power-gate satisfied AND owner approved --
         # run exactly ONE real confirmatory backtest against the fresh
-        # window [boundary_ms, now_ms], at the Holm-corrected confidence level.
-        unique_config_count = storage.count_unique_configurations(conn)
-        confidence_pct = layer2_entry.holm_corrected_confidence_pct(unique_config_count)
+        # window [candidate_start_ms, now_ms], at the Holm-corrected
+        # confidence level. m = how many candidates are being confirmed
+        # against THIS SAME fresh window -- under the current strictly
+        # one-at-a-time FIFO confirmation queue (fetch_next_unconsumed_
+        # layer2_candidate always returns exactly one, consumed before the
+        # next gets its own turn), that is always 1 (see
+        # layer2_entry.holm_corrected_confidence_pct's docstring for why
+        # this is NOT Layer 1's all-time unique-configuration count).
+        candidates_confirmed_on_same_window = 1
+        confidence_pct = layer2_entry.holm_corrected_confidence_pct(candidates_confirmed_on_same_window)
 
         variant = _variant_for_candidate(candidate)
         tercile_symbols = symbols
@@ -335,6 +376,7 @@ def run_layer2_check(
                 now_ms,
                 evaluation_cache_path,
                 bootstrap_confidence_pct=confidence_pct,
+                start_timestamp_ms=candidate_start_ms,
             )
             ci = evaluation.report.get("net_block_bootstrap")
             edge_survives = bool(ci and ci["edge_survives_lower_bound"])
@@ -343,7 +385,7 @@ def run_layer2_check(
                 "template": candidate["template"],
                 "tercile": candidate["tercile"],
                 "variant_label": candidate["variant_label"],
-                "fresh_window_start_iso": datetime.fromtimestamp(boundary_ms / 1000.0, tz=UTC).isoformat(),
+                "fresh_window_start_iso": datetime.fromtimestamp(candidate_start_ms / 1000.0, tz=UTC).isoformat(),
                 "fresh_window_end_iso": datetime.fromtimestamp(now_ms / 1000.0, tz=UTC).isoformat(),
                 "net_observed_pct": evaluation.net_observed_pct,
                 "net_ci_low_pct": ci["ci_low_pct"] if ci else None,
@@ -367,7 +409,7 @@ def run_layer2_check(
                 template=candidate["template"],
                 tercile=candidate["tercile"],
                 variant_label=candidate["variant_label"],
-                fresh_window_start_ms=boundary_ms,
+                fresh_window_start_ms=candidate_start_ms,
                 fresh_window_end_ms=now_ms,
                 n_independent=evaluation.n_independent,
                 n_required=power.n_required,

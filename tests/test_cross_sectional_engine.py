@@ -124,3 +124,140 @@ class TestBuildRebalanceGrid:
         histories = {"AAAUSDT": _history({0.0: 100.0, 48.0: 100.0})}
         grid = build_rebalance_grid(histories, rebalance_hours=24)
         assert grid == [_dt(0.0), _dt(24.0), _dt(48.0)]
+
+
+def _linear_price_history(hours: int, start_price: float, slope_per_hour: float) -> pd.DataFrame:
+    """Hourly candle series ``start_price + slope_per_hour * h`` for
+    ``h in [0, hours]`` -- deterministic enough that ranking order between
+    symbols is known in advance (needed to pin down exactly which basket
+    ``run_backtest`` should pick at a given rebalance time)."""
+    open_times = [_dt(float(h)) for h in range(hours + 1)]
+    closes = [start_price + slope_per_hour * h for h in range(hours + 1)]
+    return pd.DataFrame(
+        {
+            "open_time": open_times,
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": 10.0,
+        }
+    )
+
+
+class TestRunBacktestIsolationBoundary:
+    """Korak 10 item 2/6 leakage fix: ``start_timestamp_ms`` must (a) let
+    every rebalance's ranking signal use lookback data from before the
+    boundary (legitimate warm-up), while (b) never reporting a period
+    whose own rebalance time is before the boundary. A regression that
+    instead truncated the loaded candle history itself at the boundary
+    (the "obvious but wrong" fix) would silently swap in the wrong basket
+    for any period whose lookback dips before the boundary -- exactly what
+    ``test_warmup_history_before_boundary_still_drives_ranking`` below
+    would catch.
+    """
+
+    SYMBOLS = ("AUSDT", "BUSDT", "CUSDT", "DUSDT")
+
+    def _histories(self) -> dict[str, pd.DataFrame]:
+        # A/B: tiny, slow drift (never the strongest momentum signal).
+        # C/D: strong, opposite-signed trends across the whole series --
+        # the clear long/short pick whenever their full trailing history
+        # is visible to the ranking function.
+        return {
+            "AUSDT": _linear_price_history(199, 1000.0, 0.1),
+            "BUSDT": _linear_price_history(199, 1000.0, -0.1),
+            "CUSDT": _linear_price_history(199, 1000.0, 3.0),
+            "DUSDT": _linear_price_history(199, 1000.0, -3.0),
+        }
+
+    def _patch_data_loading(self, monkeypatch, histories: dict[str, pd.DataFrame]):
+        from scanner.backtesting import cross_sectional_engine as module
+
+        def fake_load_history(symbol, timeframe, total_candles, end_timestamp_ms, cache_dir):
+            return histories[symbol]
+
+        def fake_load_funding(symbol, end_timestamp_ms, cache_dir):
+            return []
+
+        monkeypatch.setattr(module, "cached_load_extended_history", fake_load_history)
+        monkeypatch.setattr(module, "cached_fetch_full_funding_history", fake_load_funding)
+
+    def _config(self) -> CrossSectionalConfig:
+        return CrossSectionalConfig(
+            hypothesis="test isolation boundary",
+            ranking_fn=momentum_ranking_fn,
+            lookback_hours=48,
+            rebalance_hours=24,
+            basket_size=1,
+            min_eligible_multiplier=2,
+        )
+
+    def test_no_returned_period_starts_before_the_boundary(self, monkeypatch):
+        from scanner.backtesting.cross_sectional_engine import run_backtest
+
+        histories = self._histories()
+        self._patch_data_loading(monkeypatch, histories)
+        boundary = _dt(120.0)
+
+        report = run_backtest(
+            self._config(),
+            self.SYMBOLS,
+            end_timestamp_ms=int(_dt(199.0).timestamp() * 1000),
+            start_timestamp_ms=int(boundary.timestamp() * 1000),
+        )
+
+        assert report["rebalance_periods"], "expected at least one period at/after the boundary"
+        for period in report["rebalance_periods"]:
+            assert datetime.fromisoformat(period["rebalance_time"]) >= boundary
+
+    def test_warmup_history_before_boundary_still_drives_ranking(self, monkeypatch):
+        """The first included period (rebalance_time == boundary, 48h
+        lookback) must rank symbols using its FULL 48h lookback -- which
+        dips 48h before the boundary -- not just data at/after it. CUSDT
+        (strong uptrend) must win the long leg and DUSDT (strong
+        downtrend) the short leg; if lookback data before the boundary
+        were wrongly excluded, C/D would have no valid trailing price at
+        all and the weak A/B drift would be picked instead."""
+        from scanner.backtesting.cross_sectional_engine import run_backtest
+
+        histories = self._histories()
+        self._patch_data_loading(monkeypatch, histories)
+        boundary = _dt(120.0)
+
+        report = run_backtest(
+            self._config(),
+            self.SYMBOLS,
+            end_timestamp_ms=int(_dt(199.0).timestamp() * 1000),
+            start_timestamp_ms=int(boundary.timestamp() * 1000),
+        )
+
+        first_period = next(
+            p for p in report["rebalance_periods"] if datetime.fromisoformat(p["rebalance_time"]) == boundary
+        )
+        assert first_period["basket"] == {"CUSDT": "long", "DUSDT": "short"}
+
+    def test_none_start_timestamp_matches_manually_filtered_full_history(self, monkeypatch):
+        """Regression check: running with ``start_timestamp_ms=None``
+        (Layer 1's own call shape, unchanged) must reproduce exactly the
+        periods a full, unfiltered run would have produced for the same
+        window -- i.e. filtering by boundary changes nothing about Layer
+        1's own full-history results."""
+        from scanner.backtesting.cross_sectional_engine import run_backtest
+
+        histories = self._histories()
+        self._patch_data_loading(monkeypatch, histories)
+        end_ms = int(_dt(199.0).timestamp() * 1000)
+
+        full_report = run_backtest(self._config(), self.SYMBOLS, end_timestamp_ms=end_ms, start_timestamp_ms=None)
+        boundary = _dt(120.0)
+        filtered_report = run_backtest(
+            self._config(), self.SYMBOLS, end_timestamp_ms=end_ms, start_timestamp_ms=int(boundary.timestamp() * 1000)
+        )
+
+        full_periods_after_boundary = [
+            p for p in full_report["rebalance_periods"] if datetime.fromisoformat(p["rebalance_time"]) >= boundary
+        ]
+        assert full_periods_after_boundary == filtered_report["rebalance_periods"]
+        assert full_report["start_timestamp_ms"] is None
+        assert filtered_report["start_timestamp_ms"] == int(boundary.timestamp() * 1000)

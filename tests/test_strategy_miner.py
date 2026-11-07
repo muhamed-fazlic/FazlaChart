@@ -141,7 +141,7 @@ class TestRunMiningCycle:
                 -0.1
             ] * 10
 
-        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None):
+        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.05}, "gross_block_bootstrap": None}, [
                 0.05
             ] * 10
@@ -172,7 +172,7 @@ class TestRunMiningCycle:
                 5.0
             ] * 10
 
-        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None):
+        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.2}, "gross_block_bootstrap": None}, [
                 0.2
             ] * 10
@@ -204,7 +204,7 @@ class TestRunMiningCycle:
                 0.1
             ] * 10
 
-        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None):
+        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
                 0.1
             ] * 10
@@ -252,7 +252,7 @@ class TestRunMiningCycle:
                 0.1
             ] * 10
 
-        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None):
+        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             calls.append(f"engine:{variant.variant_label}")
             return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
                 0.1
@@ -359,7 +359,7 @@ class TestRankedUniverseCacheTranslation:
                 0.1
             ] * 10
 
-        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None):
+        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             _check_and_record(cache)
             return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
                 0.1
@@ -399,7 +399,7 @@ class TestRankedUniverseCacheTranslation:
                 0.1
             ] * 10
 
-        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None):
+        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             seen_caches.append(cache)
             return {"n_independent": 10, "net_block_bootstrap": {"observed_pct": 0.1}, "gross_block_bootstrap": None}, [
                 0.1
@@ -485,7 +485,7 @@ class TestEvaluateVariantDispatchForRollingTemplates:
     def test_dispatches_to_cross_sectional_engine_runner(self, template, monkeypatch) -> None:
         seen_kwargs: dict = {}
 
-        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None):
+        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             seen_kwargs["bootstrap_confidence_pct"] = bootstrap_confidence_pct
             return {
                 "n_independent": 7,
@@ -508,7 +508,7 @@ class TestEvaluateVariantDispatchForRollingTemplates:
     def test_defaults_to_none_confidence_when_unspecified(self, monkeypatch) -> None:
         seen_kwargs: dict = {}
 
-        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None):
+        def fake_engine(symbols, as_of_ts, cache, variant, bootstrap_confidence_pct=None, start_timestamp_ms=None):
             seen_kwargs["bootstrap_confidence_pct"] = bootstrap_confidence_pct
             return {"n_independent": 1, "net_block_bootstrap": None, "gross_block_bootstrap": None}, []
 

@@ -137,27 +137,38 @@ def check_entry_threshold(
     )
 
 
-def holm_corrected_confidence_pct(unique_config_count: int, *, base_alpha: float = BASE_ALPHA) -> float:
+def holm_corrected_confidence_pct(candidates_confirmed_on_same_window: int, *, base_alpha: float = BASE_ALPHA) -> float:
     """Bonferroni-style correction of the block-bootstrap CI's confidence
-    level, scaled by the total number of unique configs Layer 1 has ever
-    tested (Korak 10 item 4's counter) -- the more hypotheses that have
-    been fished through, the more conservative (wider) the CI Layer 2
-    requires before calling an edge confirmed.
+    level, scaled by ``m`` = how many candidates are being confirmed
+    against the SAME fresh Layer 2 holdout window in this run -- NOT
+    Layer 1's all-time unique-configuration counter (that counter answers
+    a different question, "how many configs are in the mined universe
+    toward the 300 cap", and is scoped by ``strategy_miner`` /
+    ``strategy_lab_scheduler`` separately; conflating the two made Layer 2
+    needlessly stricter as Layer 1 mined more configs it never even
+    offered to Layer 2 -- corrected per the actual Korak 10 agreement,
+    overriding this module's own originally-written item 4 wording).
 
-    Strategy Lab only ever runs ONE Layer 2 confirmation at a time (the
+    Layer 2 only ever runs ONE confirmation per fresh window today (the
     oldest unconsumed frozen candidate -- see
-    ``strategy_lab_storage.fetch_next_unconsumed_layer2_candidate``), not
-    many simultaneously, so a full sequential Holm step-down table (which
-    needs every candidate's p-value ranked together) doesn't apply cleanly
-    here. Using the single-test Bonferroni bound (``alpha / m``) is the
+    ``strategy_lab_storage.fetch_next_unconsumed_layer2_candidate``,
+    consumed exactly once before the next one gets its own turn), so under
+    the CURRENT architecture ``m`` is always 1 (base_alpha, unadjusted) --
+    a full sequential Holm step-down table (which needs every candidate's
+    p-value ranked together) doesn't apply cleanly to a single test
+    anyway. Using the single-test Bonferroni bound (``alpha / m``) is the
     conservative, well-understood special case of Holm's correction for
     "one test examined out of m possible ones", and is deliberately named
     "Holm/Bonferroni" throughout this feature's docs for that reason --
-    not a claim of implementing the full step-down procedure.
+    not a claim of implementing the full step-down procedure. If a future
+    change ever confirms more than one candidate against the exact same
+    window in one pass, ``m`` should be that count, not Layer 1's mining
+    universe size.
 
-    ``m = max(unique_config_count, 1)`` so an empty/near-empty history
-    never divides by zero or produces an alpha above the base rate."""
-    m = max(unique_config_count, 1)
+    ``m = max(candidates_confirmed_on_same_window, 1)`` so an empty/
+    near-empty count never divides by zero or produces an alpha above the
+    base rate."""
+    m = max(candidates_confirmed_on_same_window, 1)
     alpha_corrected = base_alpha / m
     alpha_corrected = min(max(alpha_corrected, 1e-6), base_alpha)
     return 100.0 * (1.0 - alpha_corrected)
