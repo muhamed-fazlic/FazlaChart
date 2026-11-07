@@ -995,6 +995,112 @@ def test_strategy_lab_overview_returns_populated_sections(tmp_path, monkeypatch)
     assert body["rolling_holdout_state"]["boundary_timestamp_ms"] == 1_793_000_000_000
 
 
+def test_strategy_lab_overview_reports_korak10_fields(tmp_path, monkeypatch):
+    """Korak 10 dashboard overhaul: the "x / 300" unique-config counter,
+    the Phase 8 badge, per-family as_of_ts status, the Layer 2
+    confirmation queue, and deduped (one-per-ISO-week) weekly snapshots
+    all have to show up in the API response."""
+    from scanner import strategy_lab_storage as storage
+
+    db_path = tmp_path / "strategy_lab.db"
+    conn = storage.init_db(str(db_path))
+    candidate_id = storage.insert_mining_candidate(
+        conn,
+        as_of_timestamp_ms=1_790_000_000_000,
+        template="momentum_30d",
+        tercile="top",
+        variant_label="baseline (30d lookback, N=5)",
+        params={"lookback_days": 30},
+        n_independent=60,
+        gross_observed_pct=0.6,
+        net_observed_pct=0.4,
+        stability_score=0.8,
+        composite_score=0.4,
+        report={"n_independent": 60},
+    )
+    # Two weekly snapshots landing in the SAME ISO week: the API must
+    # collapse these down to a single row (the newer one), not show both.
+    storage.insert_weekly_snapshot(
+        conn,
+        candidate_id=candidate_id,
+        template="momentum_30d",
+        tercile="top",
+        variant_label="baseline (30d lookback, N=5)",
+        n_independent=60,
+        net_observed_pct=0.4,
+        net_ci_low_pct=None,
+        net_ci_high_pct=None,
+        gross_observed_pct=0.6,
+        win_rate_pct=55.0,
+        telegram_sent=True,
+        report={},
+    )
+    storage.insert_weekly_snapshot(
+        conn,
+        candidate_id=candidate_id,
+        template="momentum_30d",
+        tercile="top",
+        variant_label="baseline (30d lookback, N=5)",
+        n_independent=61,
+        net_observed_pct=0.5,
+        net_ci_low_pct=None,
+        net_ci_high_pct=None,
+        gross_observed_pct=0.7,
+        win_rate_pct=56.0,
+        telegram_sent=True,
+        report={},
+    )
+    storage.insert_layer2_frozen_candidate(
+        conn,
+        template="momentum_30d",
+        tercile="top",
+        variant_label="baseline (30d lookback, N=5)",
+        frozen_as_of_ts=1_790_000_000_000,
+        source_candidate_id=candidate_id,
+        windows_checked=3,
+        windows_positive=3,
+        net_observed_pct=0.4,
+        gross_observed_pct=0.6,
+        n_independent=60,
+        btc_beta=0.1,
+    )
+    conn.close()
+
+    monkeypatch.setenv("STRATEGY_LAB_DB_PATH", str(db_path))
+    from webapp.main import app
+
+    resp = TestClient(app).get("/api/strategy-lab/overview")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["unique_config_count"] == 1
+    assert body["max_unique_configurations"] == 300
+    assert "Phase 8" in body["phase8_holdout_status"]
+    assert body["as_of_ts_status"]["rolling_family_as_of_ts_ms"] > 0
+    assert body["as_of_ts_status"]["closed_family_as_of_ts_ms"] > 0
+
+    # Weekly snapshots deduped to one row for the shared ISO week, keeping
+    # the newer (higher net_observed_pct) one.
+    assert len(body["weekly_snapshots"]) == 1
+    assert body["weekly_snapshots"][0]["net_observed_pct"] == 0.5
+
+    # Leaderboard row for a rolling-family template reports its windows.
+    leaderboard_row = body["leaderboard"][0]
+    assert leaderboard_row["closed_prior"] is False
+    assert leaderboard_row["windows_checked"] == 1
+    assert leaderboard_row["windows_positive"] == 1
+
+    # The frozen candidate shows up in the confirmation queue, unconsumed.
+    assert len(body["confirmation_queue"]) == 1
+    assert body["confirmation_queue"][0]["template"] == "momentum_30d"
+    assert body["confirmation_queue"][0]["consumed"] == 0
+
+    # Readiness check ran (read-only, manual_trigger defaults to False) and
+    # reports the queue's only candidate rather than spending anything.
+    assert body["layer2_readiness"]["candidate"]["template"] == "momentum_30d"
+    assert body["layer2_readiness"]["ready_for_manual_trigger"] is False
+
+
 class TestPidIsRunning:
     """``_pid_is_running()`` backs the /api/backtest/refresh "already
     running" guard and the /status "has it finished" check. A real

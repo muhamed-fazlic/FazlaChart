@@ -1,5 +1,5 @@
 """Tests for scanner.strategy_lab_storage -- focused on fetch_leaderboard's
-"most recent mining cycle" grouping logic.
+"most recent result per config" grouping logic.
 
 Regression coverage for a real production bug: insert_mining_candidate
 stamps ``mined_at`` with ``datetime.now(UTC).isoformat()`` individually for
@@ -9,7 +9,15 @@ every row gets a slightly different ``mined_at``. fetch_leaderboard used to
 group by ``MAX(mined_at)``, which only ever matched the single
 last-inserted row of the latest cycle -- silently showing just one
 candidate in the "Layer 1 top 10" dashboard table instead of every
-candidate actually mined that cycle."""
+candidate actually mined that cycle.
+
+Korak 10 widening: the closed/frozen families stay pinned to one fixed
+``as_of_timestamp_ms`` forever, while the new rolling templates get a new
+one roughly weekly -- so "the latest mining cycle" is no longer a single
+global concept. ``fetch_leaderboard`` now groups by
+(template, tercile, variant_label) and shows each DISTINCT config's own
+most-recently-inserted (highest ``id``) row, regardless of which
+``as_of_timestamp_ms`` that happens to be."""
 
 from __future__ import annotations
 
@@ -34,14 +42,16 @@ def _insert(conn, *, as_of_timestamp_ms: int, variant_label: str, composite_scor
 
 
 class TestFetchLeaderboard:
-    def test_returns_every_candidate_from_the_latest_cycle(self, tmp_path) -> None:
+    def test_returns_every_distinct_config_from_its_own_latest_evaluation(self, tmp_path) -> None:
         conn = storage.init_db(str(tmp_path / "strategy_lab.db"))
         try:
-            # Older cycle: must never leak into the leaderboard.
-            _insert(conn, as_of_timestamp_ms=1_000, variant_label="old cycle only", composite_score=99.0)
+            # A config mined long ago and never re-mined: stays on the
+            # leaderboard forever at its own (old) result -- there is no
+            # longer a single global "latest cycle" to exclude it from.
+            _insert(conn, as_of_timestamp_ms=1_000, variant_label="old config, never re-mined", composite_score=99.0)
 
-            # Latest cycle: several candidates sharing one as_of_timestamp_ms,
-            # but each gets its OWN mined_at (real insert-loop behavior).
+            # Several DISTINCT configs sharing one as_of_timestamp_ms, each
+            # getting its OWN mined_at (real insert-loop behavior).
             latest_as_of = 2_000
             _insert(conn, as_of_timestamp_ms=latest_as_of, variant_label="Original signal", composite_score=-57.88)
             _insert(conn, as_of_timestamp_ms=latest_as_of, variant_label="Fade (invert) signal", composite_score=-14.25)
@@ -51,15 +61,32 @@ class TestFetchLeaderboard:
         finally:
             conn.close()
 
-        # All 3 of the latest cycle's candidates must appear -- not just
-        # the single last-inserted row.
-        assert len(leaderboard) == 3
-        assert all(row["variant_label"] != "old cycle only" for row in leaderboard)
+        # All 4 distinct configs appear -- one row per config, not per cycle.
+        assert len(leaderboard) == 4
+        assert any(row["variant_label"] == "old config, never re-mined" for row in leaderboard)
         # Ranked by composite_score descending: the best (least negative)
         # candidate must be #1, regardless of insertion order.
-        assert leaderboard[0]["variant_label"] == "Fade (invert) signal"
-        assert leaderboard[1]["variant_label"] == "third variant"
-        assert leaderboard[2]["variant_label"] == "Original signal"
+        assert leaderboard[0]["variant_label"] == "old config, never re-mined"
+        assert leaderboard[1]["variant_label"] == "Fade (invert) signal"
+        assert leaderboard[2]["variant_label"] == "third variant"
+        assert leaderboard[3]["variant_label"] == "Original signal"
+
+    def test_re_mining_the_same_config_shows_only_its_newest_result(self, tmp_path) -> None:
+        conn = storage.init_db(str(tmp_path / "strategy_lab.db"))
+        try:
+            # Same (template, tercile, variant_label) evaluated twice, at
+            # two different as_of_timestamp_ms -- only the newest (highest
+            # id) row for this config should ever appear.
+            _insert(conn, as_of_timestamp_ms=1_000, variant_label="Original signal", composite_score=-57.88)
+            _insert(conn, as_of_timestamp_ms=2_000, variant_label="Original signal", composite_score=0.22)
+
+            leaderboard = storage.fetch_leaderboard(conn, limit=10)
+        finally:
+            conn.close()
+
+        assert len(leaderboard) == 1
+        assert leaderboard[0]["composite_score"] == 0.22
+        assert leaderboard[0]["as_of_timestamp_ms"] == 2_000
 
     def test_respects_limit(self, tmp_path) -> None:
         conn = storage.init_db(str(tmp_path / "strategy_lab.db"))

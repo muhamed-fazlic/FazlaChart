@@ -990,6 +990,37 @@ cetvrta hipoteza, nego eksplicitan razgovor o pauzi ili preusmjeravanju
 projekta (npr. risk-management/alat umjesto trazenja edge-a). Puni detalji:
 `PREREGISTRATION_CROSS_SECTIONAL_MOMENTUM.md` sekcije 9-10.
 
+## Korak 10 — Zakljucani holdout formalno oslobodjen za Strategy Lab Layer 1 (7.11.2026., vlasnik odobrio)
+
+Nakon zatvaranja sve tri pre-registrovane hipoteze (Koraci 7-9), zakljucani
+6-sedmicni holdout (`end_timestamp_ms > 1790253820000`, pocetak
+`2026-09-24T12:43:40Z`) nikada nije "potrosen" u smislu pre-registrovanog
+jednokratnog testa — sve tri porodice su pale vec na train/validation
+periodu, prije nego sto je holdout uopste bio otvoren.
+
+**Odluka:** ovaj period se formalno **oznacava kao potrosen za svrhu
+pre-registrovanih jednokratnih testova** i **oslobadja kao dio Layer 1
+(Strategy Lab) treninga** — Layer 1 je, za razliku od Koraka 7-9, po
+dizajnu neogranicen/eksplorativan (ne pre-registrovana hipoteza sa
+jednokratnim kriterijem), pa indirektno "vidjeti" ove sedmice u punim
+periodima vec kroz prethodna tri zatvorena runa ne krsi isti princip koji
+bi bio prekrsen da se, npr., koristi za RETUNIRANJE jedne od tri zatvorene
+hipoteze. Period **NIKAD** vise ne sluzi kao Layer 2 potvrda — Layer 2 u
+Strategy Lab-u koristi iskljucivo svoj vlastiti, odvojeno pomjerani rolling
+holdout (vidi `STRATEGY_LAB_DESIGN.md` / `strategy_lab_scheduler.py`), ne
+ovaj.
+
+**Zatvorene porodice ostaju zatvorene:** trend_anomaly, funding_extreme, i
+cross_sectional_momentum (24h bazelina) iz Koraka 7-9 se ne otvaraju
+ponovo niti im se mijenjaju rezultati — Strategy Lab ih tretira kao
+`closed_prior`: i dalje vidljive u Layer 1 rang-listi (radi istorijskog
+konteksta), ali vizuelno oznacene, nikad predlozene kao novi Layer 2
+kandidati, i generator im ne pravi nove varijante.
+
+Ovaj zapis je administrativni (dokumentuje odluku za Strategy Lab-ovu
+rolling as_of_ts infrastrukturu), ne novi pre-registrovani trial — ne
+mijenja nijednu od tri FINALNE ODLUKE iznad.
+
 
      `tests/test_portfolio_backtest.py`. Pure re-computation na vec
      izracunatim trejdovima (bez mrezhnih poziva), pa je ukey po

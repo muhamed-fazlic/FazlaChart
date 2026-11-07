@@ -230,6 +230,11 @@
 
     <div id="strategy-lab-content" class="hidden">
       <section class="backtest-meta">
+        <h3>📊 Stanje sistema</h3>
+        <div id="strategy-lab-status-bar"></div>
+      </section>
+
+      <section class="backtest-meta">
         <h3>ℹ️ Šta Layer 1 radi upravo sada</h3>
         <p class="muted-caption">Informativni pregled — oba kartona su eksploratorna (composite_score rang, ne CI),
           klikni bilo koji da vidiš punu JSON konfiguraciju.</p>
@@ -241,6 +246,13 @@
         <p class="muted-caption">Jedina "potvrda" sa pravim pass/fail jezikom u cijelom Strategy Lab-u — rezultat tačno
           jednog Layer 2 confirmatory runa čiji je donji CI prag iznad nule.</p>
         <div id="strategy-lab-current-best"></div>
+      </section>
+
+      <section class="backtest-meta">
+        <h3>🚦 Red za potvrdu (Layer 2 kandidati)</h3>
+        <p class="muted-caption">Konfiguracije koje su zadovoljile prag ulaska (Korak 10 item 5) i čekaju svoj jedini
+          Layer 2 pokušaj potvrde — FIFO, redom kako su se kvalifikovale. Prazno većinu vremena je normalno stanje.</p>
+        <div id="strategy-lab-confirmation-queue"></div>
       </section>
 
       <section class="bucket-breakdown">

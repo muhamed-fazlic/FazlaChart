@@ -1,23 +1,34 @@
 """Strategy Lab Layer 1 -- the continuous, train-data-only, purely
 DESCRIPTIVE strategy miner (see ``STRATEGY_LAB_DESIGN.md``).
 
-Evaluates a small, EXPLICITLY-DECLARED grid of variants built from the
-three existing frozen signal templates:
+Evaluates a small, EXPLICITLY-DECLARED grid of variants built from three
+CLOSED, permanently-frozen signal templates PLUS three NEW, OPEN rolling
+templates added in Korak 10 (see ``PHASE8_PROFITABILITY_RESEARCH_TODO.md``
+"Korak 10" and ``CLOSED_PRIOR_TEMPLATES``/``ROLLING_AS_OF_TEMPLATES``
+below for the single source of truth on which family is which):
 
-* Template A -- trend/anomaly (family #1, ``PHASE8_PROFITABILITY_RESEARCH_TODO.md``
-  Korak 7): reuses ``scanner.backtesting.portfolio_backtest.run_portfolio_backtest``
+* Template A -- trend/anomaly (family #1, Korak 7, CLOSED): reuses
+  ``scanner.backtesting.portfolio_backtest.run_portfolio_backtest``
   and ``scanner.backtesting.strategy_variants`` AS-IS, with its two already
   -frozen variants (``original``/``inverted``) as the grid -- no new knobs
   invented on this template.
-* Template B -- funding-extreme reversion (family #2): reuses
+* Template B -- funding-extreme reversion (family #2, CLOSED): reuses
   ``scanner.backtesting.funding_extreme_backtest.run_backtest`` with its
   percentile-threshold/hold-hours constants TEMPORARILY overridden (see
   ``_patched_module_constants``) for a small, pre-declared grid around the
   frozen 95/5/8h baseline.
-* Template C -- cross-sectional momentum (family #3): reuses
+* Template C -- cross-sectional momentum (family #3, CLOSED): reuses
   ``scanner.backtesting.cross_sectional_momentum_backtest.run_backtest``
   with its lookback/basket-size constants similarly overridden for a small
   grid around the frozen 24h/N=5 baseline.
+* Templates D/E/F -- ``momentum_30d``/``low_vol``/``funding_carry_xs``
+  (Korak 10, OPEN/ROLLING): run through the generalized
+  ``scanner.backtesting.cross_sectional_engine`` (an extraction of
+  Template C's own mechanics, parametrized over ranking signal), mined
+  against a ROLLING ``as_of_ts`` (see
+  ``strategy_lab_scheduler.compute_rolling_as_of_ts``) rather than the
+  frozen ``SHARED_HOLDOUT_END_MS`` -- these are the only templates that
+  can ever reach Layer 2 (``scanner.backtesting.layer2_entry``).
 
 ``_patched_module_constants`` does NOT edit those frozen modules on disk --
 it temporarily reassigns module-level attributes (which those modules'
@@ -30,14 +41,19 @@ still serve (their own CLI/tests/default behaviour are completely
 unaffected -- the patch is undone before this module's caller ever sees
 control again). Single-process, sequential use only (not safe to call
 concurrently from multiple threads/processes against the same module).
+The three Korak 10 templates need no such patching -- ``cross_sectional_engine``
+takes its parameterization directly via ``CrossSectionalConfig``.
 
 Every combination this module evaluates operates ONLY on data at or before
 ``end_timestamp_ms`` (passed through unchanged to the frozen backtest
 functions' own ``end_timestamp_ms`` argument, which already guarantees no
-look-ahead past that point) -- the same frozen train/validation boundary
-used by the three closed hypothesis families
-(``research_registry.json``'s ``shared_holdout.end_timestamp_ms``). The
-existing locked 6-week holdout AFTER that boundary is never read here.
+look-ahead past that point) -- the three CLOSED families use the frozen
+train/validation boundary (``research_registry.json``'s
+``shared_holdout.end_timestamp_ms``); the three Korak 10 OPEN templates use
+a rolling ``as_of_ts`` instead. The existing locked 6-week holdout after
+that original boundary was formally released into Layer 1 training data by
+Korak 10 (see ``PHASE8_PROFITABILITY_RESEARCH_TODO.md`` "Korak 10") and is
+never used as a Layer 2 confirmation window.
 """
 
 from __future__ import annotations
@@ -53,6 +69,7 @@ from pathlib import Path
 from typing import Any
 
 from scanner.backtesting import (
+    cross_sectional_engine as cse,
     cross_sectional_momentum_backtest as csm,
     funding_extreme_backtest as feb,
 )
@@ -168,8 +185,83 @@ TREND_ANOMALY_VARIANTS: tuple[TemplateVariant, ...] = tuple(
     for variant_id in STRATEGY_VARIANTS
 )
 
+
+# --- Korak 10 widening: three NEW open templates on the generalized ----
+# ``cross_sectional_engine``. Unlike the three families above, these are
+# NOT frozen to ``SHARED_HOLDOUT_END_MS`` -- they're mined against a
+# ROLLING ``as_of_ts`` that moves forward roughly weekly (see
+# ``strategy_lab_scheduler.compute_rolling_as_of_ts``), each fresh as_of_ts
+# producing a NEW ``dataset_hash`` and therefore a genuinely new
+# leaderboard row (dedup v2, keyed on dataset_hash, not as_of_ts) -- this
+# is what lets the leaderboard actually change over time for these
+# templates, instead of discovering the identical 24 combinations forever.
+# Each has exactly 2 pre-declared variants (bounded, explicit grid, same
+# discipline as the three closed families); weekly rebalance (168h) for
+# momentum_30d/low_vol, daily (24h) for funding_carry_xs, per Korak 10's
+# spec. ``ROLLING_AS_OF_TEMPLATES``/``CLOSED_PRIOR_TEMPLATES`` below are
+# the single source of truth for which family uses which as_of_ts regime.
+MOMENTUM_30D_VARIANTS: tuple[TemplateVariant, ...] = (
+    TemplateVariant(
+        "momentum_30d",
+        "14d lookback, N=5",
+        {"lookback_hours": 336, "rebalance_hours": 168, "basket_size": 5},
+    ),
+    TemplateVariant(
+        "momentum_30d",
+        "30d lookback, N=5",
+        {"lookback_hours": 720, "rebalance_hours": 168, "basket_size": 5},
+    ),
+)
+
+LOW_VOL_VARIANTS: tuple[TemplateVariant, ...] = (
+    TemplateVariant(
+        "low_vol",
+        "14d vol window, N=5",
+        {"lookback_hours": 336, "rebalance_hours": 168, "basket_size": 5},
+    ),
+    TemplateVariant(
+        "low_vol",
+        "30d vol window, N=5",
+        {"lookback_hours": 720, "rebalance_hours": 168, "basket_size": 5},
+    ),
+)
+
+FUNDING_CARRY_XS_VARIANTS: tuple[TemplateVariant, ...] = (
+    TemplateVariant(
+        "funding_carry_xs",
+        "3d funding avg, N=5",
+        {"lookback_hours": 72, "rebalance_hours": 24, "basket_size": 5},
+    ),
+    TemplateVariant(
+        "funding_carry_xs",
+        "7d funding avg, N=5",
+        {"lookback_hours": 168, "rebalance_hours": 24, "basket_size": 5},
+    ),
+)
+
+# Which templates use the permanently-frozen ``SHARED_HOLDOUT_END_MS``
+# (never re-opened, never given new variants, never Layer-2 eligible --
+# Korak 10's "closed_prior" tag) vs. the new rolling ``as_of_ts`` (opens
+# the door to Layer 2 once a config earns it via layer2_entry's checks).
+CLOSED_PRIOR_TEMPLATES: frozenset[str] = frozenset(
+    {"trend_anomaly", "funding_extreme_reversion", "cross_sectional_momentum"}
+)
+ROLLING_AS_OF_TEMPLATES: frozenset[str] = frozenset({"momentum_30d", "low_vol", "funding_carry_xs"})
+
+# Hard cap on DISTINCT (template, tercile, variant_label) configs Layer 1
+# will EVER evaluate for the first time (Korak 10 item 4) -- re-testing an
+# already-seen config on a new rolling as_of_ts never counts against this;
+# only a brand-new combination does. Once reached, the generator reports
+# it and stops proposing anything new; it does not widen itself.
+MAX_UNIQUE_CONFIGURATIONS = 300
+
 ALL_TEMPLATE_VARIANTS: tuple[TemplateVariant, ...] = (
-    TREND_ANOMALY_VARIANTS + FUNDING_EXTREME_VARIANTS + CROSS_SECTIONAL_MOMENTUM_VARIANTS
+    TREND_ANOMALY_VARIANTS
+    + FUNDING_EXTREME_VARIANTS
+    + CROSS_SECTIONAL_MOMENTUM_VARIANTS
+    + MOMENTUM_30D_VARIANTS
+    + LOW_VOL_VARIANTS
+    + FUNDING_CARRY_XS_VARIANTS
 )
 
 
@@ -259,6 +351,47 @@ def _run_cross_sectional_variant(
     return report, event_net_returns
 
 
+# Maps each Korak 10 rolling template to its ``cross_sectional_engine``
+# ranking function -- the ONE place that knows which factor each new
+# template's name corresponds to.
+_CSE_RANKING_FNS: dict[str, cse.RankingFn] = {
+    "momentum_30d": cse.momentum_ranking_fn,
+    "low_vol": cse.low_vol_ranking_fn,
+    "funding_carry_xs": cse.funding_carry_ranking_fn,
+}
+
+
+def _run_cross_sectional_engine_variant(
+    symbols: tuple[str, ...],
+    end_timestamp_ms: int,
+    point_in_time_universe_cache: str | None,
+    variant: TemplateVariant,
+    bootstrap_confidence_pct: float | None = None,
+) -> tuple[dict[str, Any], list[float]]:
+    """Runs one of the Korak 10 rolling templates (momentum_30d, low_vol,
+    funding_carry_xs) through the generalized ``cross_sectional_engine``.
+    Unlike ``_run_funding_extreme_variant``/``_run_cross_sectional_variant``,
+    this needs no ``_patched_module_constants`` -- the engine takes its
+    parameterization directly via ``CrossSectionalConfig``, not via
+    frozen-module globals."""
+    config = cse.CrossSectionalConfig(
+        hypothesis=variant.template,
+        ranking_fn=_CSE_RANKING_FNS[variant.template],
+        lookback_hours=variant.params["lookback_hours"],
+        rebalance_hours=variant.params["rebalance_hours"],
+        basket_size=variant.params["basket_size"],
+    )
+    kwargs: dict[str, Any] = {
+        "end_timestamp_ms": end_timestamp_ms,
+        "point_in_time_universe_cache": point_in_time_universe_cache,
+    }
+    if bootstrap_confidence_pct is not None:
+        kwargs["bootstrap_confidence_pct"] = bootstrap_confidence_pct
+    report = cse.run_backtest(config, symbols, **kwargs)
+    event_net_returns = [p["net_return_pct"] for p in report["rebalance_periods"]]
+    return report, event_net_returns
+
+
 def _run_trend_anomaly_variant(
     symbols: tuple[str, ...], end_timestamp_ms: int, variant: TemplateVariant
 ) -> tuple[dict[str, Any], list[float]]:
@@ -297,12 +430,24 @@ def evaluate_variant(
     symbols: tuple[str, ...],
     end_timestamp_ms: int,
     point_in_time_universe_cache: str | None,
+    bootstrap_confidence_pct: float | None = None,
 ) -> VariantEvaluation:
     """Runs ``variant`` against ``symbols``/``end_timestamp_ms`` through
     the correct frozen backtest module, normalizing the result into
     ``VariantEvaluation``. Shared by ``run_mining_cycle`` (Layer 1),
     ``run_weekly_snapshot``, and Layer 2's confirmation run -- the ONE
-    place that knows how to dispatch by ``variant.template``."""
+    place that knows how to dispatch by ``variant.template``.
+
+    ``bootstrap_confidence_pct`` is normally left ``None`` (each module's
+    own default, ``BLOCK_BOOTSTRAP_CONFIDENCE_PCT``) for every Layer 1
+    mining/weekly-snapshot call; Layer 2 confirmation is the only caller
+    that ever passes a Holm/Bonferroni-corrected value (see
+    ``layer2_entry.holm_corrected_confidence_pct``). Only the three
+    Korak 10 rolling templates (built on ``cross_sectional_engine``,
+    which threads this straight into ``run_backtest``) currently honor a
+    non-default value here; the three frozen modules keep their own
+    pre-registered defaults regardless, since they are never Layer 2
+    candidates (``CLOSED_PRIOR_TEMPLATES``)."""
     if variant.template == "funding_extreme_reversion":
         report, event_net_returns = _run_funding_extreme_variant(
             symbols, end_timestamp_ms, point_in_time_universe_cache, variant
@@ -315,6 +460,15 @@ def evaluate_variant(
     elif variant.template == "cross_sectional_momentum":
         report, event_net_returns = _run_cross_sectional_variant(
             symbols, end_timestamp_ms, point_in_time_universe_cache, variant
+        )
+        n_independent = report["n_independent"]
+        net_observed_pct = report["net_block_bootstrap"]["observed_pct"] if report["net_block_bootstrap"] else None
+        gross_observed_pct = (
+            report["gross_block_bootstrap"]["observed_pct"] if report["gross_block_bootstrap"] else None
+        )
+    elif variant.template in ROLLING_AS_OF_TEMPLATES:
+        report, event_net_returns = _run_cross_sectional_engine_variant(
+            symbols, end_timestamp_ms, point_in_time_universe_cache, variant, bootstrap_confidence_pct
         )
         n_independent = report["n_independent"]
         net_observed_pct = report["net_block_bootstrap"]["observed_pct"] if report["net_block_bootstrap"] else None
@@ -533,3 +687,56 @@ def run_mining_cycle(
 
     candidates.sort(key=lambda c: c.composite_score, reverse=True)
     return candidates
+
+
+def select_variants_within_unique_config_cap(
+    template_variants: tuple[TemplateVariant, ...],
+    tercile_names: tuple[str, ...],
+    ever_mined_keys: frozenset[tuple[str, str, str]],
+    max_unique_configurations: int = MAX_UNIQUE_CONFIGURATIONS,
+) -> tuple[TemplateVariant, ...]:
+    """Enforces Korak 10 item 4's hard cap of ``max_unique_configurations``
+    DISTINCT ``(template, tercile, variant_label)`` combinations Layer 1
+    will EVER mine for the first time.
+
+    ``ever_mined_keys`` is the set of combinations already seen at least
+    once (any ``as_of_ts``/``dataset_hash`` -- see
+    ``strategy_lab_storage.fetch_ever_mined_combo_keys``), NOT the
+    per-as_of_ts ``already_mined_keys`` that ``run_mining_cycle`` itself
+    uses to skip redundant re-runs. A variant already in that set is
+    ALWAYS allowed through (re-testing it on a new rolling as_of_ts never
+    counts against the budget); only combinations that would be BRAND NEW
+    are gated by remaining budget.
+
+    Returns ``template_variants`` filtered down to what's admissible this
+    cycle, in original order, WITHOUT mutating its input. If the budget is
+    already exhausted, only already-seen variants pass through (the
+    generator "stops and reports it", never widening itself further, per
+    spec)."""
+    remaining_budget = max(0, max_unique_configurations - len(ever_mined_keys))
+    admitted: list[TemplateVariant] = []
+    newly_admitted_keys: set[tuple[str, str, str]] = set()
+    for variant in template_variants:
+        candidate_keys = {(variant.template, tercile_name, variant.variant_label) for tercile_name in tercile_names}
+        brand_new_keys = candidate_keys - ever_mined_keys - newly_admitted_keys
+        if not brand_new_keys:
+            # Every tercile combination for this variant has already been
+            # seen at least once (or was already admitted earlier in this
+            # same call) -- always allow it through, free of charge.
+            admitted.append(variant)
+            continue
+        if len(brand_new_keys) <= remaining_budget:
+            admitted.append(variant)
+            newly_admitted_keys |= brand_new_keys
+            remaining_budget -= len(brand_new_keys)
+        else:
+            logger.info(
+                "Strategy Lab unique-config cap: skipping brand-new variant %s/%s this cycle "
+                "(would need %d new configuration slots, only %d remain of %d total)",
+                variant.template,
+                variant.variant_label,
+                len(brand_new_keys),
+                remaining_budget,
+                max_unique_configurations,
+            )
+    return tuple(admitted)

@@ -2328,12 +2328,14 @@ async function loadStrategyLabTab() {
     } else {
       document.getElementById("strategy-lab-unavailable").classList.add("hidden");
       document.getElementById("strategy-lab-content").classList.remove("hidden");
+      renderStrategyLabStatusBar(data);
       renderStrategyLabAtAGlance(data.total_candidates_tested, data.latest_candidate, data.best_candidate_all_time);
       renderStrategyLabCurrentBest(data.current_best);
+      renderStrategyLabConfirmationQueue(data.confirmation_queue || [], data.layer2_readiness);
       renderStrategyLabLeaderboard(data.leaderboard || []);
       renderStrategyLabSnapshots(data.weekly_snapshots || []);
       renderStrategyLabConfirmations(data.confirmations || []);
-      renderStrategyLabHoldoutStatus(data.rolling_holdout_state, data.confirmations || []);
+      renderStrategyLabHoldoutStatus(data.rolling_holdout_state, data.confirmations || [], data.unique_config_count, data.max_unique_configurations);
     }
     const lastUpdatedEl = document.getElementById("strategy-lab-last-updated");
     if (lastUpdatedEl) {
@@ -2364,6 +2366,63 @@ function strategyLabCiRangeHtml(low, high, survives) {
   if (low === null || low === undefined || high === null || high === undefined) return "";
   const badge = survives ? `<span class="research-badge research-badge-confirmed">CI &gt; 0</span>` : `<span class="research-badge research-badge-noedge">CI uključuje 0</span>`;
   return `[${fmt(low)}%, ${fmt(high)}%] ${badge}`;
+}
+
+function renderStrategyLabStatusBar(data) {
+  const el = document.getElementById("strategy-lab-status-bar");
+  const countStyle = data.unique_config_count >= data.max_unique_configurations ? "color:#d9534f; font-weight:bold;" : "font-weight:bold;";
+  const closedDate = data.as_of_ts_status?.closed_family_as_of_ts_ms
+    ? new Date(data.as_of_ts_status.closed_family_as_of_ts_ms).toLocaleDateString("bs-BA")
+    : "—";
+  const rollingDate = data.as_of_ts_status?.rolling_family_as_of_ts_ms
+    ? new Date(data.as_of_ts_status.rolling_family_as_of_ts_ms).toLocaleDateString("bs-BA")
+    : "—";
+  el.innerHTML = `
+    <div class="research-mt-row">Jedinstvenih konfiguracija: <span style="${countStyle}">${data.unique_config_count ?? "—"} / ${data.max_unique_configurations ?? "—"}</span></div>
+    <div class="research-mt-row">Layer 1 podaci do (zatvorene porodice, fiksno): <b>${closedDate}</b> &nbsp;·&nbsp; Layer 1 podaci do (rolling porodice, sedmično se pomjera): <b>${rollingDate}</b></div>
+    <div class="research-mt-note muted">${data.phase8_holdout_status || ""}</div>`;
+}
+
+function renderStrategyLabConfirmationQueue(queue, readiness) {
+  const el = document.getElementById("strategy-lab-confirmation-queue");
+  const unconsumed = queue.filter((q) => !q.consumed);
+  if (!unconsumed.length) {
+    el.innerHTML = `<p class="muted">Nijedan kandidat nije ispunio prag ulaska. Normalno stanje.</p>`;
+    return;
+  }
+  const rows = unconsumed
+    .map((q) => {
+      const frozenDate = q.frozen_at ? new Date(q.frozen_at).toLocaleDateString("bs-BA") : "—";
+      const isNext = readiness && readiness.candidate && readiness.candidate.id === q.id;
+      let progressLine = `<span class="muted">u redu, čeka na svoj red</span>`;
+      let triggerButton = "";
+      if (isNext) {
+        if (readiness.ready_for_manual_trigger) {
+          progressLine = `<b style="color:#2e8b57;">Power-gate zadovoljen — spreman za ručnu potvrdu.</b>`;
+          triggerButton = `<p class="muted-caption">Pokretanje potvrde je moguće samo ručno preko <code>--confirm-layer2</code> na serveru (vlasnička odobrenja), nikad iz dashboarda.</p>`;
+        } else {
+          const needed = readiness.n_required ?? "?";
+          const days = readiness.estimated_days_needed;
+          const daysText = days !== null && days !== undefined ? ` (~${fmt(days)} dana)` : "";
+          progressLine = `Čeka svježe podatke — potrebno ~${needed} nezavisnih perioda${daysText}.`;
+        }
+      }
+      return `
+      <tr>
+        <td>${q.template} / ${q.tercile} / ${q.variant_label}</td>
+        <td>${frozenDate}</td>
+        <td>${q.windows_positive ?? "—"} / ${q.windows_checked ?? "—"}</td>
+        <td>${q.n_independent ?? "—"}</td>
+        <td>${q.btc_beta === null || q.btc_beta === undefined ? "—" : fmt(q.btc_beta)}</td>
+        <td>${progressLine}${triggerButton}</td>
+      </tr>`;
+    })
+    .join("");
+  el.innerHTML = `
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Kandidat (zamrznuta konfiguracija)</th><th>Zamrznuto (T)</th><th>Prozora pozitivno</th><th>n</th><th>BTC beta</th><th>Napredak</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 function renderStrategyLabAtAGlance(totalTested, latest, bestAllTime) {
@@ -2435,10 +2494,15 @@ function renderStrategyLabLeaderboard(leaderboard) {
       // click a row to see exactly what this candidate's configuration was,
       // same spirit as the "Analyze with AI" raw-JSON detail view.
       const detailJson = escapeHtml(JSON.stringify(c, null, 2));
+      const rowClass = c.closed_prior ? "muted" : "";
+      const windowsCell =
+        c.windows_checked === null || c.windows_checked === undefined
+          ? "—"
+          : `${c.windows_positive} / ${c.windows_checked}`;
       return `
-      <tr onclick="toggleStrategyLabRow('${detailId}')" style="cursor:pointer;">
+      <tr class="${rowClass}" onclick="toggleStrategyLabRow('${detailId}')" style="cursor:pointer;">
         <td>#${i + 1}</td>
-        <td>${c.template}</td>
+        <td>${c.template}${c.closed_prior ? ' <span class="research-badge research-badge-noedge">zatvoreno</span>' : ""}</td>
         <td>${c.tercile}</td>
         <td>${c.variant_label}</td>
         <td>${c.net_observed_pct === null || c.net_observed_pct === undefined ? "—" : `${fmt(c.net_observed_pct)}%`}</td>
@@ -2446,14 +2510,16 @@ function renderStrategyLabLeaderboard(leaderboard) {
         <td>${c.n_independent ?? "—"}</td>
         <td>${c.stability_score === null || c.stability_score === undefined ? "—" : fmt(c.stability_score)}</td>
         <td>${fmt(c.composite_score)}</td>
+        <td>${windowsCell}</td>
       </tr>
-      <tr id="${detailId}" class="hidden"><td colspan="9"><pre style="white-space:pre-wrap; font-size:0.8em; max-height:300px; overflow-y:auto;">${detailJson}</pre></td></tr>`;
+      <tr id="${detailId}" class="hidden"><td colspan="10"><pre style="white-space:pre-wrap; font-size:0.8em; max-height:300px; overflow-y:auto;">${detailJson}</pre></td></tr>`;
     })
     .join("");
   el.innerHTML = `
-    <p class="muted-caption">Klikni na red da vidiš punu konfiguraciju (JSON) tog kandidata.</p>
+    <p class="muted-caption">Klikni na red da vidiš punu konfiguraciju (JSON) tog kandidata. Sivi redovi su zatvorene
+      porodice (closed_prior) — ne generišu se nove varijante i ne idu u Layer 2.</p>
     <table class="bucket-breakdown-table">
-      <thead><tr><th>Rang</th><th>Template</th><th>Tercil</th><th>Varijanta</th><th>Neto</th><th>Bruto</th><th>n</th><th>Stabilnost</th><th>Kompozitni skor</th></tr></thead>
+      <thead><tr><th>Rang</th><th>Template</th><th>Tercil</th><th>Varijanta</th><th>Neto</th><th>Bruto</th><th>n</th><th>Stabilnost</th><th>Kompozitni skor</th><th>Prozora pozitivno</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
@@ -2517,7 +2583,7 @@ function renderStrategyLabConfirmations(confirmations) {
     </table>`;
 }
 
-function renderStrategyLabHoldoutStatus(state, confirmations) {
+function renderStrategyLabHoldoutStatus(state, confirmations, uniqueConfigCount, maxUniqueConfigurations) {
   const el = document.getElementById("strategy-lab-holdout-status");
   if (!state) {
     el.innerHTML = `<p class="muted">Rolling holdout još nije inicijalizovan (Layer 2 provjera se još nije pokrenula).</p>`;
@@ -2525,9 +2591,12 @@ function renderStrategyLabHoldoutStatus(state, confirmations) {
   }
   const boundaryDate = new Date(state.boundary_timestamp_ms).toLocaleString("bs-BA");
   const confirmationCount = confirmations.length;
+  const m = Math.max(uniqueConfigCount ?? 1, 1);
+  const holmAlphaPct = (100 * (0.05 / m)).toFixed(4);
   el.innerHTML = `
     <div class="research-mt-row">Granica rolling holdout-a (svježe vrijeme počinje odavde): <b>${boundaryDate}</b></div>
     <div class="research-mt-row">Ukupno Layer 2 pokušaja potvrde do sada: <b>${confirmationCount}</b></div>
+    <div class="research-mt-row">Holm/Bonferroni korigovan alpha (na osnovu ${uniqueConfigCount ?? "—"} / ${maxUniqueConfigurations ?? "—"} jedinstvenih konfiguracija): <b>${holmAlphaPct}%</b> (bazni alpha 5%, pooštrava se kako broj konfiguracija raste)</div>
     <div class="research-mt-note muted">Svaki pokušaj potvrde pomjera ovu granicu unaprijed i troši tačno taj prozor — nikad se ne ponovo koristi isti svježi period.</div>`;
 }
 

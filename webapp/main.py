@@ -33,12 +33,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from scanner import strategy_lab_storage
+from scanner.backtesting import layer2_entry
+from scanner.backtesting import strategy_miner as miner
+from scanner.backtesting.strategy_lab_runner import run_layer2_check
 from scanner.backtesting.strategy_variants import (
     DEFAULT_VARIANT_ID,
     STRATEGY_VARIANTS,
     get_variant,
     report_path_for_variant,
 )
+from scanner.strategy_lab_scheduler import SHARED_HOLDOUT_END_MS, compute_rolling_as_of_ts
 from scanner.drift_detector import active_muted_bucket_set
 from scanner.storage import (
     connect_for_reads,
@@ -988,17 +992,53 @@ def _strategy_lab_db_path() -> str:
     return os.environ.get("STRATEGY_LAB_DB_PATH", strategy_lab_storage.DEFAULT_STRATEGY_LAB_DB_PATH)
 
 
+def _dedupe_weekly_snapshots_by_iso_week(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Korak 10 dashboard mockup: "Jedan red po sedmici (ne dupli)". A
+    process restart within the same calendar week can otherwise produce
+    more than one ``weekly_snapshots`` row for that week (each restart
+    resets the scheduler's own in-memory "last weekly run" timer) --
+    ``snapshots`` is already newest-first (``fetch_weekly_snapshots``'s own
+    ordering), so keeping only the FIRST row seen per ISO (year, week)
+    keeps the newest one for that week and drops any earlier duplicate."""
+    seen_weeks: set[tuple[int, int]] = set()
+    deduped: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        snapshot_at = snapshot.get("snapshot_at")
+        if not snapshot_at:
+            deduped.append(snapshot)
+            continue
+        iso_year, iso_week, _ = datetime.fromisoformat(snapshot_at).isocalendar()
+        week_key = (iso_year, iso_week)
+        if week_key in seen_weeks:
+            continue
+        seen_weeks.add(week_key)
+        deduped.append(snapshot)
+    return deduped
+
+
 @app.get("/api/strategy-lab/overview")
 def strategy_lab_overview() -> dict[str, Any]:
     """Read-only overview for the "⚒️ Strategy Lab" tab: current best
     confirmed strategy (if any), the Layer 1 leaderboard, weekly snapshot
-    history, Layer 2 confirmation history, the rolling-holdout status, plus
-    a compact "what's Layer 1 doing right now" summary (total candidates
-    ever tested, the single most-recently-tested one, and the single
-    best-ever-by-composite-score one — both of the latter all-time, not
-    just from the most recent mining cycle). Never triggers a
-    mining/snapshot/confirmation run itself — purely reads what
-    ``scanner.strategy_lab_scheduler`` has already produced.
+    history (deduped to one row per ISO week), Layer 2 confirmation
+    history, the Layer 2 confirmation queue (Korak 10 item 5/6 -- the
+    "Red za potvrdu" section) with live power-gate readiness, the rolling-
+    holdout status, the Korak 10 "x / 300" unique-configuration counter,
+    and the current Layer 1 ``as_of_ts`` status (closed-family fixed
+    boundary + rolling-family current window) -- plus a compact "what's
+    Layer 1 doing right now" summary (total candidates ever tested, the
+    single most-recently-tested one, and the single best-ever-by-
+    composite-score one -- both of the latter all-time, not just from the
+    most recent mining cycle).
+
+    Never triggers a mining/snapshot/confirmation run itself, and NEVER
+    spends the rolling holdout window, even when checking the
+    confirmation queue's power-gate readiness: ``run_layer2_check`` is
+    called with ``manual_trigger=False``, which only ever reports
+    readiness and never calls the backtest engine, advances the holdout
+    boundary, or marks a queued candidate consumed -- purely reads what
+    ``scanner.strategy_lab_scheduler`` has already produced, plus one
+    cheap, side-effect-free power calculation.
 
     Returns ``{"available": False}`` rather than a 404/500 if
     ``scanner_data/strategy_lab.db`` doesn't exist yet (e.g. the scheduler
@@ -1012,25 +1052,63 @@ def strategy_lab_overview() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Could not open Strategy Lab database: {exc}") from None
     try:
         leaderboard = strategy_lab_storage.fetch_leaderboard(conn, limit=10)
-        weekly_snapshots = strategy_lab_storage.fetch_weekly_snapshots(conn, limit=52)
+        for row in leaderboard:
+            row["closed_prior"] = row["template"] in miner.CLOSED_PRIOR_TEMPLATES
+            if row["template"] in miner.ROLLING_AS_OF_TEMPLATES:
+                recent = strategy_lab_storage.fetch_recent_results_for_config(
+                    conn, row["template"], row["tercile"], row["variant_label"], limit=layer2_entry.ENTRY_WINDOW
+                )
+                row["windows_checked"] = min(len(recent), layer2_entry.ENTRY_WINDOW)
+                row["windows_positive"] = sum(1 for r in recent if (r.get("net_observed_pct") or 0.0) > 0)
+            else:
+                row["windows_checked"] = None
+                row["windows_positive"] = None
+        weekly_snapshots = _dedupe_weekly_snapshots_by_iso_week(strategy_lab_storage.fetch_weekly_snapshots(conn, limit=52))
         confirmations = strategy_lab_storage.fetch_confirmations(conn, limit=100)
         current_best = strategy_lab_storage.fetch_current_best(conn)
         holdout_state = strategy_lab_storage.fetch_rolling_holdout_state(conn)
         total_candidates_tested = strategy_lab_storage.fetch_total_candidates_tested(conn)
         latest_candidate = strategy_lab_storage.fetch_latest_candidate(conn)
         best_candidate_all_time = strategy_lab_storage.fetch_best_candidate_all_time(conn)
+        unique_config_count = strategy_lab_storage.count_unique_configurations(conn)
+        confirmation_queue = strategy_lab_storage.fetch_layer2_candidate_queue(conn)
     finally:
         conn.close()
+
+    # Read-only power-gate readiness check -- see docstring above for why
+    # this is always safe to call unconditionally (manual_trigger=False).
+    layer2_readiness = run_layer2_check(db_path=db_path, shared_holdout_end_ms=SHARED_HOLDOUT_END_MS)
+
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
     return {
         "available": True,
         "current_best": current_best,
         "leaderboard": leaderboard,
         "weekly_snapshots": weekly_snapshots,
         "confirmations": confirmations,
+        "confirmation_queue": confirmation_queue,
+        "layer2_readiness": {
+            "ready_for_manual_trigger": layer2_readiness.ready_for_manual_trigger,
+            "candidate": layer2_readiness.candidate,
+            "n_required": layer2_readiness.n_required,
+            "estimated_days_needed": layer2_readiness.estimated_days_needed,
+            "fresh_days_available": layer2_readiness.fresh_days_available,
+        },
         "rolling_holdout_state": holdout_state,
         "total_candidates_tested": total_candidates_tested,
         "latest_candidate": latest_candidate,
         "best_candidate_all_time": best_candidate_all_time,
+        "unique_config_count": unique_config_count,
+        "max_unique_configurations": miner.MAX_UNIQUE_CONFIGURATIONS,
+        "as_of_ts_status": {
+            "closed_family_as_of_ts_ms": min(now_ms, SHARED_HOLDOUT_END_MS),
+            "rolling_family_as_of_ts_ms": compute_rolling_as_of_ts(now_ms),
+            "rolling_family_embargo_days": 14,
+        },
+        "phase8_holdout_status": (
+            "Phase 8 holdout (poslije 2026-09-24T12:43:40Z): potrošen, sada dio Layer 1 trening podataka "
+            "(Korak 10) -- nikad se ne koristi kao Layer 2 potvrda."
+        ),
     }
 
 

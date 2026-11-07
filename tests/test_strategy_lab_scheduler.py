@@ -51,13 +51,17 @@ class TestRunMiningOnceSkipsAlreadyMinedCombos:
         )
         conn.close()
 
-        captured: dict[str, object] = {}
+        captured: list[dict[str, object]] = []
 
         def fake_run_mining_cycle(as_of_ts_arg, *, symbols, ranked_universe_cache_path, template_variants, already_mined_keys):
-            captured["already_mined_keys"] = already_mined_keys
-            # Only the NEW combination should be produced -- the
-            # already-mined one must not be re-run.
-            return [_make_candidate("trend_anomaly", "unsliced", "Fade (invert) signal")]
+            captured.append({"as_of_ts": as_of_ts_arg, "already_mined_keys": already_mined_keys})
+            if as_of_ts_arg == as_of_ts:
+                # The closed-family call (fixed SHARED_HOLDOUT_END_MS):
+                # only the NEW combination should be produced -- the
+                # already-mined one must not be re-run.
+                return [_make_candidate("trend_anomaly", "unsliced", "Fade (invert) signal")]
+            # The rolling-family call: nothing to add for this test.
+            return []
 
         monkeypatch.setattr(scheduler_module, "run_mining_cycle", fake_run_mining_cycle)
         # Freeze "now" past the holdout boundary so as_of_ts clamps to the
@@ -71,7 +75,9 @@ class TestRunMiningOnceSkipsAlreadyMinedCombos:
         sched = scheduler_module.StrategyLabScheduler(db_path=db_path, symbols=("BTCUSDT",))
         stored_count = sched.run_mining_once()
 
-        assert ("trend_anomaly", "unsliced", "Original signal") in captured["already_mined_keys"]
+        closed_calls = [c for c in captured if c["as_of_ts"] == as_of_ts]
+        assert len(closed_calls) == 1
+        assert ("trend_anomaly", "unsliced", "Original signal") in closed_calls[0]["already_mined_keys"]
         assert stored_count == 1
 
         conn = storage.init_db(db_path)
