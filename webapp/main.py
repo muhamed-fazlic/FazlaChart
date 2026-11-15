@@ -44,6 +44,7 @@ from scanner.backtesting.strategy_variants import (
 )
 from scanner.strategy_lab_scheduler import SHARED_HOLDOUT_END_MS, compute_rolling_as_of_ts
 from scanner.drift_detector import active_muted_bucket_set
+from scanner import live_strategy
 from scanner.storage import (
     connect_for_reads,
     fetch_all_active_muted_buckets,
@@ -1271,6 +1272,70 @@ def system_jobs() -> dict[str, Any]:
         "recent_logs": _list_recent_logs(max_age_seconds=6 * 3600, tail_lines=12),
         "checked_at": datetime.now(UTC).isoformat(),
     }
+
+
+@app.get("/api/live-strategy/summary")
+def live_strategy_summary(
+    range: str | None = None, since: str | None = None, until: str | None = None
+) -> dict[str, Any]:
+    """Main strategy (Strategy Lab #1 candidate, run live by the scanner --
+    see ``scanner.live_strategy``): spec, current basket with unrealized
+    P&L, per-trade and per-period (rebalance) statistics, equity curve.
+    ``range``/``since``/``until`` filter on when a leg/period was opened."""
+    since_iso, until_iso = _resolve_time_range(range, since, until)
+    conn = _get_conn()
+    try:
+        if not live_strategy.tables_exist(conn):
+            return {
+                "available": False,
+                "strategy": live_strategy.MAIN_STRATEGY.as_dict(),
+                "note": "Scanner još nije pokrenuo glavnu strategiju (prvi rebalans se dešava pri prvom ciklusu).",
+            }
+        summary = live_strategy.build_summary(conn, since=since_iso, until=until_iso)
+    finally:
+        conn.close()
+    summary["available"] = True
+    return summary
+
+
+@app.get("/api/live-strategy/trades")
+def live_strategy_trades(
+    status: str | None = None,
+    limit: int = 2000,
+    range: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+) -> dict[str, Any]:
+    """Every main-strategy leg (one row per symbol held from entry to exit),
+    open legs with live unrealized P&L. ``status``: ``open`` | ``closed``."""
+    since_iso, until_iso = _resolve_time_range(range, since, until)
+    conn = _get_conn()
+    try:
+        if not live_strategy.tables_exist(conn):
+            return {"trades": [], "count": 0}
+        rows = live_strategy.fetch_positions(
+            conn, live_strategy.MAIN_STRATEGY.key, status=status, since=since_iso, until=until_iso, limit=limit
+        )
+    finally:
+        conn.close()
+    trades = [live_strategy.position_view(r) for r in rows]
+    return {"trades": trades, "count": len(trades)}
+
+
+@app.get("/api/live-strategy/rebalances")
+def live_strategy_rebalances(limit: int = 200) -> dict[str, Any]:
+    """Every holding period (weekly rebalance) with its basket and the
+    basket-level net return, comparable to the backtest's per-period numbers."""
+    conn = _get_conn()
+    try:
+        if not live_strategy.tables_exist(conn):
+            return {"rebalances": []}
+        rows = live_strategy.fetch_rebalances(conn, live_strategy.MAIN_STRATEGY.key, limit=limit)
+    finally:
+        conn.close()
+    for r in rows:
+        r["basket"] = json.loads(r.pop("basket_json")) if r.get("basket_json") else {}
+    return {"rebalances": rows}
 
 
 @app.get("/api/forward-tracking/summary")

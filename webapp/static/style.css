@@ -1170,3 +1170,56 @@ footer {
     font-size: 10px;
   }
 }
+
+/* --- Glavna strategija (scanner/live_strategy.py) --------------------- */
+
+.main-strategy-panel {
+  margin: 10px 20px;
+  padding: 12px 16px;
+  border: 1px solid var(--blue);
+  border-radius: 8px;
+  background: var(--panel);
+  flex: 0 0 auto;
+  font-size: 13px;
+}
+
+.main-strategy-title { font-weight: 600; margin-bottom: 6px; }
+.main-strategy-disclaimer { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+.main-strategy-legs {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.main-strategy-legs > div { flex: 1 1 260px; min-width: 0; }
+.main-strategy-leg { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+
+.trades-source-bar {
+  display: flex;
+  gap: 6px;
+  padding: 14px 20px 0;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.trades-source-btn, .strategy-filter-btn {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 6px 14px;
+  font-size: 13px;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
+.strategy-filter-btn { padding: 5px 12px; font-size: 12px; }
+.trades-source-btn:hover, .strategy-filter-btn:hover { color: var(--text); }
+
+.trades-source-btn.active, .strategy-filter-btn.active {
+  color: var(--bg);
+  background: var(--blue);
+  border-color: var(--blue);
+  font-weight: 600;
+}

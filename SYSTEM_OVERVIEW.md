@@ -22,6 +22,35 @@ dijele kod ali se koriste nezavisno:
 
 ---
 
+## 🎯 Glavna strategija (live)
+
+`scanner/live_strategy.py`: scanner uživo vodi #1 Layer 1 kandidata iz
+Strategy Lab-a, `momentum_30d` / "14d lookback, N=5", ali na univerzumu
+SVIH coina koje scanner skenira (odluka vlasnika 15.11.2026). Lab ga je
+izmjerio samo na tercilu `top`, a ta varijanta je i dalje dostupna kroz
+`build_spec("top")`.
+Parametri se čitaju iz `strategy_miner.MOMENTUM_30D_VARIANTS` i
+`DEFAULT_TERCILE_RANK_RANGES`.
+
+- Svakih 168h (prvi rebalans pri startu scannera): univerzum = svi simboli
+  uspješno skenirani u tom ciklusu, rang po 14d % promjeni na zatvorenim 1h
+  svijećama, LONG top 5 / SHORT bottom 5, fill = `lastPrice`.
+- Rangiranje, košara, težine nogu, turnover trošak, troškovi po simbolu i
+  funding su importovani iz backtest koda (`cross_sectional_engine` i
+  ostali), ne reimplementirani.
+- Svaki ciklus (5 min): mark-to-market otvorenih nogu (MFE/MAE), funding
+  osvježen najviše jednom na sat.
+- Tabele u `scanner.db`: `live_strategy_positions` (jedan red po nozi od
+  ulaza do izlaza; noga koja ostaje na istoj strani je JEDAN trejd) i
+  `live_strategy_rebalances` (neto povrat košare po periodu, uporediv s
+  backtestom).
+- Dashboard: panel na Scanner tabu i podrazumijevani prikaz u "📊 Analitika
+  trejdova". Stari Best-signal tracking i dalje radi paralelno, dostupan pod
+  "📜 Stari signali". Telegram poruka pri svakom rebalansu.
+- Isključivanje: `python -m scanner --no-live-strategy`.
+- ⚠️ Eksploratorni Layer 1 kandidat, bez CI i bez Layer 2 potvrde. Ovo je
+  forward test, ne dokazan edge.
+
 ## 📡 Scanner (live tab)
 
 `scanner/market_scanner.py` nad Binance Futures public REST API-jem (bez

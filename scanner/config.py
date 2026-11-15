@@ -76,3 +76,7 @@ class ScannerConfig:
     # future portfolio-level counterfactual backtest (Korak 2) replays
     # against, not disposable live-dashboard scratch state.
     candidate_archive_retention_days: int = 90
+
+    # Run the Strategy Lab's #1 candidate live as the main strategy, with
+    # its own trade tracking (see scanner.live_strategy).
+    live_strategy_enabled: bool = True

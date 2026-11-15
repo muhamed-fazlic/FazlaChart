@@ -16,6 +16,7 @@ from scanner.btc_context import build_btc_context
 from scanner.candidate_archive import record_candidates
 from scanner.config import ScannerConfig
 from scanner.drift_detector import active_muted_bucket_set, evaluate_and_apply_drift_mutes
+from scanner.live_strategy import LiveStrategyRunner, format_rebalance_message
 from scanner.signal_tracking import DEFAULT_TRACKING_LIMIT, log_new_signals, resolve_open_signals
 from scanner.storage import (
     fetch_known_symbols,
@@ -25,7 +26,12 @@ from scanner.storage import (
     prune_old_scans,
     save_scan_result,
 )
-from scanner.telegram_alerts import TelegramAlertConfig, maybe_send_alert, maybe_send_drift_alert
+from scanner.telegram_alerts import (
+    TelegramAlertConfig,
+    maybe_send_alert,
+    maybe_send_drift_alert,
+    send_telegram_message,
+)
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance import client
 from tradingagents.dataflows.vendors.binance.snapshot import build_symbol_snapshot
@@ -45,6 +51,20 @@ class MarketScanner:
             require_btc_alignment=self.config.telegram_require_btc_alignment,
         )
         self._last_prune_at: float = 0.0
+        # Main strategy (Strategy Lab #1 candidate run live) -- see
+        # scanner.live_strategy. The legacy Top Signal Now tracking below
+        # keeps running alongside it for comparison.
+        # Its universe is every symbol successfully scanned this cycle.
+        self._scanned_symbols: list[str] = []
+        self.live_strategy = (
+            LiveStrategyRunner(
+                self.conn,
+                on_rebalance=self._on_live_rebalance,
+                universe_provider=lambda: list(self._scanned_symbols),
+            )
+            if self.config.live_strategy_enabled
+            else None
+        )
 
     def resolve_universe(self) -> list[str]:
         """The symbols to scan this cycle: explicit list, else top-N by
@@ -95,9 +115,18 @@ class MarketScanner:
             if snapshot is not None:
                 results[symbol] = snapshot
 
+        if self.live_strategy is not None:
+            self._scanned_symbols = list(results)
+            self.live_strategy.step()
         self._track_signal_outcomes()
         self._maybe_prune_old_scans()
         return {"btc": btc_context, "symbols": results}
+
+    def _on_live_rebalance(self, summary: dict[str, Any]) -> None:
+        """Telegram notice for every main-strategy rebalance (no-op without
+        Telegram credentials)."""
+        if self._telegram.bot_token and self._telegram.chat_id:
+            send_telegram_message(self._telegram.bot_token, self._telegram.chat_id, format_rebalance_message(summary))
 
     def _track_signal_outcomes(self) -> None:
         """Resolve any open tracked signals against this cycle's fresh

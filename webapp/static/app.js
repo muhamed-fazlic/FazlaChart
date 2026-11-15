@@ -1341,7 +1341,224 @@ function tradesRangeQueryParams() {
 // stale, unfiltered result even though the filter button shows "active".
 let _tradesLoadToken = 0;
 
+// --- Glavna strategija (Strategy Lab #1 candidate run live) --------------
+// Source of truth: scanner/live_strategy.py. A basket strategy has no SL/TP,
+// so its trades live in their own tables and get their own view here; the
+// legacy Best-signal analytics stay one click away ("📜 Stari signali").
+
+let currentTradesSource = "strategy";
+let currentStrategyStatusFilter = "";
+
+function pctHtml(value, digits = 2) {
+  if (value === null || value === undefined) return "—";
+  return `<span class="${signClass(value)}">${value > 0 ? "+" : ""}${fmt(value, digits)}%</span>`;
+}
+
+function fmtHours(h) {
+  if (h === null || h === undefined) return "—";
+  return h < 48 ? `${fmt(h, 0)}h` : `${fmt(h / 24, 1)}d`;
+}
+
+function strategyTitle(spec) {
+  const universe = spec.tercile === "all" ? "svi praćeni coini" : `${spec.tercile} tercil`;
+  return `${spec.template} · ${universe} · ${spec.variant_label}`;
+}
+
+function strategyStatsCard(label, stats) {
+  if (!stats || !stats.n) {
+    return `<div class="trades-summary-card"><span class="label">${label}</span><span class="value">—</span></div>`;
+  }
+  return `<div class="trades-summary-card"><span class="label">${label} (n=${stats.n})</span>
+    <span class="value">${fmt(stats.win_rate_pct, 1)}% · ${pctHtml(stats.avg_pct)}</span></div>`;
+}
+
+function renderMainStrategyPanel(data) {
+  const el = document.getElementById("main-strategy-panel");
+  if (!data || !data.available) {
+    el.className = "main-strategy-panel muted";
+    el.textContent = `🎯 Glavna strategija: ${data && data.strategy ? strategyTitle(data.strategy) : "—"} — ${
+      (data && data.note) || "nema podataka još."
+    }`;
+    return;
+  }
+  const legs = (side) => {
+    const rows = data.open_positions
+      .filter((p) => p.direction === side)
+      .map(
+        (p) => `<div class="main-strategy-leg"><b>${p.symbol}</b>
+          <span class="muted">${p.entry_score !== null ? (p.entry_score > 0 ? "+" : "") + fmt(p.entry_score, 1) + "% 14d" : ""}</span>
+          ${pctHtml(p.unrealized_net_pct)}</div>`
+      )
+      .join("");
+    return rows || `<div class="muted">—</div>`;
+  };
+  const cur = data.current_period;
+  el.className = "main-strategy-panel";
+  el.innerHTML = `
+    <div class="main-strategy-title">🎯 Glavna strategija: ${strategyTitle(data.strategy)}</div>
+    <div class="forward-tracking-stats">
+      <span>Tekući period: <b>${cur ? pctHtml(cur.unrealized_net_pct) : "—"}</b> (od ${fmtDateTime(cur && cur.rebalanced_at)})</span>
+      <span>Sljedeći rebalans: <b>${fmtDateTime(data.next_rebalance_at)}</b></span>
+      <span>Zatvorenih perioda: <b>${data.periods.n}</b>${data.compounded_net_pct !== null ? ` · ukupno ${pctHtml(data.compounded_net_pct)}` : ""}</span>
+    </div>
+    <div class="main-strategy-legs">
+      <div><div class="trend-bullish"><b>LONG</b> (najjači momentum)</div>${legs("long")}</div>
+      <div><div class="trend-bearish"><b>SHORT</b> (najslabiji momentum)</div>${legs("short")}</div>
+    </div>
+    <div class="main-strategy-disclaimer">⚠️ ${data.disclaimer}</div>`;
+}
+
+async function loadMainStrategyPanel() {
+  try {
+    const res = await fetch("/api/live-strategy/summary");
+    renderMainStrategyPanel(await res.json());
+  } catch (err) {
+    console.error("Could not load main strategy:", err);
+  }
+}
+
+function renderStrategySummary(data) {
+  const el = document.getElementById("strategy-summary");
+  if (!data || !data.available) {
+    el.className = "trades-summary muted";
+    el.textContent = (data && data.note) || "Nema podataka o glavnoj strategiji još.";
+    return;
+  }
+  const cur = data.current_period;
+  el.className = "trades-summary";
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">🎯 ${strategyTitle(data.strategy)} — rebalans svakih ${data.strategy.rebalance_hours / 24} dana,
+      long top ${data.strategy.basket_size} / short bottom ${data.strategy.basket_size}</div>
+    <div class="trades-summary-cards">
+      <div class="trades-summary-card"><span class="label">Otvoreno nogu</span><span class="value">${data.open_count}</span></div>
+      <div class="trades-summary-card"><span class="label">Zatvoreno trejdova</span><span class="value">${data.closed_count}</span></div>
+      ${strategyStatsCard("Trejdovi: win rate · avg net", data.trades.all)}
+      ${strategyStatsCard("LONG", data.trades.long)}
+      ${strategyStatsCard("SHORT", data.trades.short)}
+      ${strategyStatsCard("Periodi (košara): win · avg", data.periods)}
+      <div class="trades-summary-card"><span class="label">Ukupno (složeno, neto)</span><span class="value">${pctHtml(data.compounded_net_pct)}</span></div>
+      <div class="trades-summary-card"><span class="label">Tekući period (neto, nerealizovano)</span><span class="value">${cur ? pctHtml(cur.unrealized_net_pct) : "—"}</span></div>
+      <div class="trades-summary-card"><span class="label">Sljedeći rebalans</span><span class="value">${fmtDateTime(data.next_rebalance_at)}</span></div>
+    </div>
+    <div class="main-strategy-disclaimer">⚠️ ${data.disclaimer} Lab (backtest) za ovu varijantu: neto 1.33% po periodu, n=45 — ali izmjereno samo na top tercilu likvidnosti, ne na svim coinima.</div>`;
+}
+
+function renderStrategyTrades(trades) {
+  const body = document.getElementById("strategy-trades-body");
+  if (!trades.length) {
+    body.innerHTML = `<tr><td colspan="14" class="muted">Nema trejdova za ovaj filter.</td></tr>`;
+    return;
+  }
+  body.innerHTML = trades
+    .map((t) => {
+      const isOpen = t.status === "open";
+      const dirClass = t.direction === "long" ? "trend-bullish" : "trend-bearish";
+      const gross = isOpen ? t.unrealized_gross_pct : t.gross_return_pct;
+      const net = isOpen ? t.unrealized_net_pct : t.net_return_pct;
+      return `
+    <tr>
+      <td data-label="Symbol"><b>${t.symbol}</b></td>
+      <td data-label="Smjer" class="${dirClass}">${t.direction === "long" ? "LONG" : "SHORT"}</td>
+      <td data-label="Momentum 14d">${pctHtml(t.entry_score, 1)} <span class="muted">#${t.entry_rank ?? "—"}</span></td>
+      <td data-label="Status"><span class="status-badge status-${isOpen ? "open" : "timeout"}">${isOpen ? "U toku" : "Zatvoren"}</span></td>
+      <td data-label="Entry">${fmtPrice(t.entry_price)}</td>
+      <td data-label="Trenutno / Exit">${fmtPrice(isOpen ? t.last_price : t.exit_price)}</td>
+      <td data-label="Bruto %">${pctHtml(gross)}</td>
+      <td data-label="Trošak %">${fmt(t.cost_pct, 3)}%</td>
+      <td data-label="Funding %">${fmt(t.funding_pct, 3)}%</td>
+      <td data-label="Net %"><b>${pctHtml(net)}</b>${isOpen ? ' <span class="muted">(nerealiz.)</span>' : ""}</td>
+      <td data-label="MFE / MAE">${pctHtml(t.mfe_pct, 1)} / ${pctHtml(t.mae_pct, 1)}</td>
+      <td data-label="Držano">${fmtHours(t.held_hours)}</td>
+      <td data-label="Otvoren">${fmtDateTime(t.opened_at)}</td>
+      <td data-label="Zatvoren">${fmtDateTime(t.closed_at)}</td>
+    </tr>`;
+    })
+    .join("");
+}
+
+function renderStrategyRebalances(rebalances) {
+  const el = document.getElementById("strategy-rebalances");
+  if (!rebalances.length) {
+    el.className = "bucket-breakdown muted";
+    el.textContent = "Još nema rebalansa.";
+    return;
+  }
+  const statusWord = { open: "u toku", closed: "zatvoren", skipped: "preskočen" };
+  const rows = rebalances
+    .map((r) => {
+      const legs = (side) =>
+        Object.entries(r.basket || {})
+          .filter(([, leg]) => leg.side === side)
+          .map(([s]) => s.replace(/USDT$/, ""))
+          .join(", ") || "—";
+      return `
+    <tr>
+      <td>${fmtDateTime(r.rebalanced_at)}</td>
+      <td>${statusWord[r.status] || r.status}${r.note ? ` <span class="muted">(${r.note})</span>` : ""}</td>
+      <td class="trend-bullish">${legs("long")}</td>
+      <td class="trend-bearish">${legs("short")}</td>
+      <td>${r.turnover !== null ? fmt(r.turnover * 100, 0) + "%" : "—"}</td>
+      <td>${r.cost_pct !== null ? fmt(r.cost_pct, 3) + "%" : "—"}</td>
+      <td>${r.funding_pct !== null ? fmt(r.funding_pct, 3) + "%" : "—"}</td>
+      <td><b>${pctHtml(r.net_return_pct)}</b></td>
+      <td>${pctHtml(r.btc_return_pct)}</td>
+    </tr>`;
+    })
+    .join("");
+  el.className = "bucket-breakdown";
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">Rebalansi (periodi držanja košare) — neto povrat košare, uporedivo s backtestom</div>
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Rebalans</th><th>Status</th><th>LONG</th><th>SHORT</th><th>Turnover</th><th>Trošak</th><th>Funding</th><th>Neto košara</th><th>BTC isti period</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function loadStrategyTradesView() {
+  const token = ++_tradesLoadToken;
+  try {
+    const rangeParams = tradesRangeQueryParams();
+    const tradesParams = new URLSearchParams(rangeParams);
+    if (currentStrategyStatusFilter) tradesParams.set("status", currentStrategyStatusFilter);
+    const [summaryRes, tradesRes, rebalRes] = await Promise.all([
+      fetch(`/api/live-strategy/summary?${rangeParams}`),
+      fetch(`/api/live-strategy/trades?${tradesParams}`),
+      fetch(`/api/live-strategy/rebalances`),
+    ]);
+    const summary = await summaryRes.json();
+    const tradesData = await tradesRes.json();
+    const rebalData = await rebalRes.json();
+    if (token !== _tradesLoadToken) return;
+    renderStrategySummary(summary);
+    renderStrategyTrades(tradesData.trades || []);
+    renderStrategyRebalances(rebalData.rebalances || []);
+  } catch (err) {
+    if (token !== _tradesLoadToken) return;
+    console.error("Could not load main strategy analytics:", err);
+    document.getElementById("strategy-trades-body").innerHTML = `<tr><td colspan="14" class="muted">Greška: ${err.message}</td></tr>`;
+  }
+}
+
+document.querySelectorAll(".trades-source-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    currentTradesSource = btn.dataset.source;
+    document.querySelectorAll(".trades-source-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    document.getElementById("strategy-trades-view").classList.toggle("hidden", currentTradesSource !== "strategy");
+    document.getElementById("legacy-trades-view").classList.toggle("hidden", currentTradesSource !== "legacy");
+    loadTradesTab();
+  });
+});
+
+document.querySelectorAll(".strategy-filter-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    currentStrategyStatusFilter = btn.dataset.status;
+    document.querySelectorAll(".strategy-filter-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    loadStrategyTradesView();
+  });
+});
+
 async function loadTradesTab(status) {
+  if (currentTradesSource === "strategy") return loadStrategyTradesView();
   if (status !== undefined) currentTradesStatusFilter = status;
   const token = ++_tradesLoadToken;
   try {
@@ -2094,6 +2311,8 @@ async function loadHealth() {
 
 populateSymbolSuggestions();
 setFullTableMode(document.getElementById("show-all-toggle").checked);
+loadMainStrategyPanel();
+setInterval(loadMainStrategyPanel, REFRESH_MS);
 loadBestSignal();
 setInterval(loadBestSignal, REFRESH_MS);
 loadForwardTracking();

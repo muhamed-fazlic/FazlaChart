@@ -36,6 +36,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--interval", type=int, default=300, help="Seconds between scan cycles")
     parser.add_argument("--storage", type=str, default="scanner_data/scanner.db", help="SQLite file path")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit (for testing)")
+    parser.add_argument(
+        "--no-live-strategy",
+        action="store_true",
+        help="Do not run the main live strategy (Strategy Lab #1 candidate, see scanner/live_strategy.py)",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args(argv)
 
@@ -52,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
         storage_path=args.storage,
         keep_known_symbols=not args.no_keep_known_symbols,
         max_universe_size=args.max_universe_size,
+        live_strategy_enabled=not args.no_live_strategy,
         # Telegram credentials come from the environment, never CLI flags
         # (which would otherwise leak a bot token into `ps`/process-list
         # output) -- see scanner/telegram_alerts.py.

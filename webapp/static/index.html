@@ -48,6 +48,8 @@
 
   <section id="btc-banner" class="btc-banner muted">Loading BTC reference…</section>
 
+  <section id="main-strategy-panel" class="main-strategy-panel muted">Učitavam glavnu strategiju…</section>
+
   <section id="best-signal-panel" class="best-signal-panel muted">Tražim statistički potvrđen signal…</section>
 
   <section id="forward-tracking-panel" class="forward-tracking-panel muted">Učitavam uživo rezultate…</section>
@@ -78,6 +80,11 @@
   </div>
 
   <div id="tab-trades" class="tab-panel">
+    <section class="trades-source-bar">
+      <button type="button" class="trades-source-btn active" data-source="strategy">🎯 Glavna strategija</button>
+      <button type="button" class="trades-source-btn" data-source="legacy">📜 Stari signali (Best signal)</button>
+    </section>
+
     <section class="trades-timerange-bar">
       <span class="muted">Period:</span>
       <button type="button" class="trades-range-btn" data-range="1h">1h</button>
@@ -96,6 +103,45 @@
       </span>
     </section>
 
+    <div id="strategy-trades-view">
+      <section id="strategy-summary" class="trades-summary muted">Učitavam glavnu strategiju…</section>
+
+      <section class="trades-filter-bar">
+        <button type="button" class="strategy-filter-btn active" data-status="">Svi</button>
+        <button type="button" class="strategy-filter-btn" data-status="open">U toku</button>
+        <button type="button" class="strategy-filter-btn" data-status="closed">Zatvoreni</button>
+      </section>
+
+      <main>
+        <table id="strategy-trades-table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Smjer</th>
+              <th>Momentum 14d</th>
+              <th>Status</th>
+              <th>Entry</th>
+              <th>Trenutno / Exit</th>
+              <th>Bruto %</th>
+              <th>Trošak %</th>
+              <th>Funding %</th>
+              <th>Net %</th>
+              <th>MFE / MAE</th>
+              <th>Držano</th>
+              <th>Otvoren</th>
+              <th>Zatvoren</th>
+            </tr>
+          </thead>
+          <tbody id="strategy-trades-body">
+            <tr><td colspan="14" class="muted">Učitavam trejdove…</td></tr>
+          </tbody>
+        </table>
+      </main>
+
+      <section id="strategy-rebalances" class="bucket-breakdown muted">Učitavam rebalanse…</section>
+    </div>
+
+    <div id="legacy-trades-view" class="hidden">
     <section id="trades-summary" class="trades-summary muted">Učitavam analitiku trejdova…</section>
 
     <section id="bucket-breakdown" class="bucket-breakdown muted">Učitavam raspodjelu po bucket-ima…</section>
@@ -143,6 +189,7 @@
         </tbody>
       </table>
     </main>
+    </div>
   </div>
 
   <div id="tab-backtest" class="tab-panel">

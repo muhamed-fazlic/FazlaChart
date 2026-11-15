@@ -1150,3 +1150,63 @@ class TestPidIsRunning:
         monkeypatch.setattr("os.kill", _raise_os_error)
         assert _pid_is_running(12345) is False
 
+
+
+# --- Main live strategy (scanner/live_strategy.py) ------------------------
+
+
+def test_live_strategy_summary_before_first_rebalance(client):
+    data = client.get("/api/live-strategy/summary").json()
+    assert data["available"] is False
+    assert data["strategy"]["template"] == "momentum_30d"
+    assert client.get("/api/live-strategy/trades").json() == {"trades": [], "count": 0}
+    assert client.get("/api/live-strategy/rebalances").json() == {"rebalances": []}
+
+
+def test_live_strategy_endpoints_with_data(tmp_path, monkeypatch):
+    import json
+    import sqlite3
+
+    from scanner import live_strategy as ls
+
+    db_path = tmp_path / "scanner_ls.db"
+    monkeypatch.setenv("SCANNER_STORAGE_PATH", str(db_path))
+    init_db(str(db_path)).close()
+    conn = sqlite3.connect(str(db_path))
+    ls.ensure_schema(conn)
+    key = ls.MAIN_STRATEGY.key
+    basket = {"AAAUSDT": {"side": "long", "price": 10.0, "score": 25.0, "rank": 1}}
+    conn.execute(
+        "INSERT INTO live_strategy_rebalances (strategy_key, rebalanced_at, status, basket_json, turnover, cost_pct)"
+        " VALUES (?, '2026-11-10T00:00:00+00:00', 'open', ?, 1.0, 0.05)",
+        (key, json.dumps(basket)),
+    )
+    conn.execute(
+        "INSERT INTO live_strategy_positions (strategy_key, symbol, direction, status, opened_at, opened_rebalance_id,"
+        " entry_price, entry_score, entry_rank, cost_pct, last_price, funding_pct)"
+        " VALUES (?, 'AAAUSDT', 'long', 'open', '2026-11-10T00:00:00+00:00', 1, 10.0, 25.0, 1, 0.15, 11.0, 0.02)",
+        (key,),
+    )
+    conn.execute(
+        "INSERT INTO live_strategy_positions (strategy_key, symbol, direction, status, opened_at, opened_rebalance_id,"
+        " entry_price, cost_pct, closed_at, exit_price, gross_return_pct, funding_pct, net_return_pct)"
+        " VALUES (?, 'BBBUSDT', 'short', 'closed', '2026-11-03T00:00:00+00:00', 1, 5.0, 0.15,"
+        " '2026-11-10T00:00:00+00:00', 4.5, 10.0, -0.01, 9.86)",
+        (key,),
+    )
+    conn.commit()
+    conn.close()
+
+    from webapp.main import app
+
+    c = TestClient(app)
+    summary = c.get("/api/live-strategy/summary").json()
+    assert summary["available"] is True
+    assert summary["open_count"] == 1 and summary["closed_count"] == 1
+    assert summary["trades"]["short"]["win_rate_pct"] == 100.0
+    assert summary["open_positions"][0]["unrealized_net_pct"] == pytest.approx(10.0 - 0.15 - 0.02)
+
+    open_only = c.get("/api/live-strategy/trades?status=open").json()
+    assert [t["symbol"] for t in open_only["trades"]] == ["AAAUSDT"]
+    rebalances = c.get("/api/live-strategy/rebalances").json()["rebalances"]
+    assert rebalances[0]["basket"]["AAAUSDT"]["side"] == "long"
