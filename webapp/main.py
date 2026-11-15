@@ -24,6 +24,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,11 @@ from scanner.backtesting.strategy_variants import (
 from scanner.strategy_lab_scheduler import SHARED_HOLDOUT_END_MS, compute_rolling_as_of_ts
 from scanner.drift_detector import active_muted_bucket_set
 from scanner import live_strategy
+from scanner.backtesting.live_strategy_backtest import (
+    BASKET_BACKTESTS,
+    MAIN_BASKET_VARIANT_ID,
+)
+from scanner.backtesting.live_strategy_backtest import report_path as basket_report_path
 from scanner.storage import (
     connect_for_reads,
     fetch_all_active_muted_buckets,
@@ -298,6 +304,35 @@ def _backtest_report_path() -> str:
     ``python -m scanner.backtesting.portfolio_backtest --report-json ...``;
     it is NOT regenerated automatically by this webapp process."""
     return os.environ.get("BACKTEST_REPORT_PATH", "scanner_data/portfolio_backtest_report.json")
+
+
+def _validate_backtest_variant(variant: str) -> None:
+    """400 for an id that is neither a portfolio (SL/TP) variant nor a
+    basket strategy (``scanner.backtesting.live_strategy_backtest``)."""
+    if variant in BASKET_BACKTESTS:
+        return
+    try:
+        get_variant(variant)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+def _backtest_report_file(variant: str) -> str:
+    if variant in BASKET_BACKTESTS:
+        return basket_report_path(str(Path(_backtest_report_path()).parent), variant)
+    return report_path_for_variant(_backtest_report_path(), variant)
+
+
+def _ranked_universe_cache_path() -> str | None:
+    """The point-in-time ranked universe cache the Strategy Lab uses:
+    RANKED_UNIVERSE_CACHE_PATH env var, else the first
+    ``scanner_data/*ranked*.json`` found. None -> the basket backtest falls
+    back to today's top coins (survivorship bias, flagged in the report)."""
+    explicit = os.environ.get("RANKED_UNIVERSE_CACHE_PATH")
+    if explicit:
+        return explicit if Path(explicit).exists() else None
+    matches = sorted(Path(_backtest_report_path()).parent.glob("*ranked*.json"))
+    return str(matches[0]) if matches else None
 
 
 def _experiment_registry_path() -> str:
@@ -903,13 +938,10 @@ def backtest_report(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
 
     Returns ``{"available": False}`` rather than a 404/500 if no report has
     been generated yet, so the frontend can render a friendly empty state."""
-    try:
-        get_variant(variant)
-    except KeyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
-    path = Path(report_path_for_variant(_backtest_report_path(), variant))
+    _validate_backtest_variant(variant)
+    path = Path(_backtest_report_file(variant))
     if not path.exists():
-        return {"available": False}
+        return {"available": False, "kind": "basket"} if variant in BASKET_BACKTESTS else {"available": False}
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -926,19 +958,27 @@ def backtest_variants() -> dict[str, Any]:
     file on disk -- lets the frontend grey out/flag variants nobody has
     ever run yet instead of silently showing an empty state after the user
     picks them."""
-    base_report_path = _backtest_report_path()
-    return {
-        "variants": [
-            {
-                "variant_id": variant.variant_id,
-                "label": variant.label,
-                "description": variant.description,
-                "has_report": Path(report_path_for_variant(base_report_path, variant.variant_id)).exists(),
-            }
-            for variant in STRATEGY_VARIANTS.values()
-        ],
-        "default_variant_id": DEFAULT_VARIANT_ID,
-    }
+    basket = [
+        {
+            "variant_id": b.variant_id,
+            "label": b.label,
+            "description": b.description,
+            "kind": "basket",
+            "has_report": Path(_backtest_report_file(b.variant_id)).exists(),
+        }
+        for b in BASKET_BACKTESTS.values()
+    ]
+    portfolio = [
+        {
+            "variant_id": variant.variant_id,
+            "label": variant.label,
+            "description": variant.description,
+            "kind": "portfolio",
+            "has_report": Path(_backtest_report_file(variant.variant_id)).exists(),
+        }
+        for variant in STRATEGY_VARIANTS.values()
+    ]
+    return {"variants": basket + portfolio, "default_variant_id": MAIN_BASKET_VARIANT_ID}
 
 
 @app.get("/api/backtest/experiments")
@@ -1163,10 +1203,7 @@ def backtest_refresh(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
     ``_backtest_refresh_status_path()``). The frontend polls
     ``GET /api/backtest/refresh/status`` for progress and reloads the
     report once the state flips to "done"."""
-    try:
-        get_variant(variant)
-    except KeyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+    _validate_backtest_variant(variant)
 
     status = _read_refresh_status(variant)
     if _refresh_in_progress(status):
@@ -1180,16 +1217,27 @@ def backtest_refresh(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(UTC).isoformat()
 
-    script_args = [str(script_path)]
-    if variant != DEFAULT_VARIANT_ID:
-        script_args += ["--strategy-variant", variant]
+    if variant in BASKET_BACKTESTS:
+        # Basket strategies run through scanner.backtesting.live_strategy_backtest,
+        # not the SL/TP portfolio script.
+        command = [
+            sys.executable, "-m", "scanner.backtesting.live_strategy_backtest",
+            "--variant", variant, "--report-json", _backtest_report_file(variant),
+        ]
+        ranked_cache = _ranked_universe_cache_path()
+        if ranked_cache:
+            command += ["--ranked-universe-cache", ranked_cache]
+    else:
+        command = ["bash", str(script_path)]
+        if variant != DEFAULT_VARIANT_ID:
+            command += ["--strategy-variant", variant]
 
     with open(log_path, "a", encoding="utf-8") as log_fh:
         log_fh.write(f"\n=== refresh triggered via dashboard button {started_at} (variant={variant}) ===\n")
         log_fh.flush()
         try:
             proc = subprocess.Popen(
-                ["nice", "-n", "19", "bash", *script_args],
+                ["nice", "-n", "19", *command],
                 cwd=str(script_path.parent.parent),
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
@@ -1234,14 +1282,11 @@ def backtest_refresh_status(variant: str = DEFAULT_VARIANT_ID) -> dict[str, Any]
     JSON's mtime moved forward after the run started (the script can exit 0
     having skipped writing the report on, e.g., every symbol failing to
     fetch)."""
-    try:
-        get_variant(variant)
-    except KeyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+    _validate_backtest_variant(variant)
 
     status = _read_refresh_status(variant)
     if status.get("state") == "running" and isinstance(status.get("pid"), int) and not _pid_is_running(status["pid"]):
-        report_path = Path(report_path_for_variant(_backtest_report_path(), variant))
+        report_path = Path(_backtest_report_file(variant))
         succeeded = False
         started_at = status.get("started_at")
         if report_path.exists() and started_at:

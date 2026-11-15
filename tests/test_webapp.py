@@ -1210,3 +1210,23 @@ def test_live_strategy_endpoints_with_data(tmp_path, monkeypatch):
     assert [t["symbol"] for t in open_only["trades"]] == ["AAAUSDT"]
     rebalances = c.get("/api/live-strategy/rebalances").json()["rebalances"]
     assert rebalances[0]["basket"]["AAAUSDT"]["side"] == "long"
+
+
+def test_backtest_variants_include_basket_strategies(client):
+    data = client.get("/api/backtest/variants").json()
+    ids = [v["variant_id"] for v in data["variants"]]
+    assert data["default_variant_id"] == "momentum_30d_all"
+    assert {"momentum_30d_all", "momentum_30d_top", "original", "inverted"} <= set(ids)
+
+
+def test_basket_backtest_report_roundtrip(tmp_path, monkeypatch, client):
+    import json
+
+    monkeypatch.setenv("BACKTEST_REPORT_PATH", str(tmp_path / "portfolio_backtest_report.json"))
+    assert client.get("/api/backtest/report?variant=momentum_30d_all").json() == {"available": False, "kind": "basket"}
+    (tmp_path / "basket_backtest_report__momentum_30d_all.json").write_text(
+        json.dumps({"kind": "basket", "metrics": {"n_periods": 3}}), encoding="utf-8"
+    )
+    report = client.get("/api/backtest/report?variant=momentum_30d_all").json()
+    assert report["available"] is True and report["metrics"]["n_periods"] == 3
+    assert client.get("/api/backtest/report?variant=nope").status_code == 400

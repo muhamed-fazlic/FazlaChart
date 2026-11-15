@@ -599,6 +599,187 @@ let backtestVariantsLoaded = false;
 // strategy_variants.py doesn't change without a code deploy). Re-running
 // this after the user has picked a variant would reset their selection, so
 // loadBacktestTab() only calls it the first time.
+// --- Basket strategies (momentum, scanner/backtesting/live_strategy_backtest.py)
+// Different report shape from the SL/TP portfolio backtest: periods of a
+// weekly long/short basket instead of individual trades, so the SL/TP-only
+// sections are hidden while one of these is selected.
+
+const PORTFOLIO_ONLY_SECTIONS = [
+  "backtest-full-config",
+  "backtest-breakdown-timeframe",
+  "backtest-breakdown-direction",
+  "backtest-breakdown-label",
+  "backtest-statistical-validation",
+  "backtest-oos-validation",
+  "backtest-independence-validation",
+  "backtest-walk-forward-validation",
+  "backtest-experiments",
+];
+const BASKET_ONLY_SECTIONS = ["backtest-basket-sl", "backtest-basket-picks", "backtest-basket-periods"];
+
+function setBacktestBasketMode(isBasket) {
+  PORTFOLIO_ONLY_SECTIONS.forEach((id) => document.getElementById(id).classList.toggle("hidden", isBasket));
+  BASKET_ONLY_SECTIONS.forEach((id) => document.getElementById(id).classList.toggle("hidden", !isBasket));
+}
+
+function renderBasketBacktestUnavailable() {
+  const meta = document.getElementById("backtest-meta");
+  meta.className = "backtest-meta muted";
+  meta.innerHTML = "Još nema izvještaja za ovu strategiju. Klikni <b>🔄 Osvježi cijeli test</b> (traje nekoliko minuta).";
+  ["backtest-summary", "backtest-equity-curve", ...BASKET_ONLY_SECTIONS].forEach((id) => {
+    document.getElementById(id).textContent = "";
+  });
+}
+
+function renderBasketBacktest(r) {
+  const m = r.metrics || {};
+  const u = r.universe || {};
+  const meta = document.getElementById("backtest-meta");
+  meta.className = "backtest-meta";
+  const universeText =
+    u.source === "point_in_time_ranked_cache"
+      ? `point-in-time univerzum (rang ${u.rank_range[0]}–${u.rank_range[1]}, ${u.n_symbols_used} coina), bez survivorship biasa`
+      : `današnji top ${u.top_n} coina po volumenu (${u.n_symbols_used} korišteno)`;
+  meta.innerHTML = `
+    <div><b>${r.label}</b> — ${r.description}</div>
+    <div class="muted">Period: ${fmtDateTime(r.period_start)} → ${fmtDateTime(r.period_end)} · rebalans svakih ${r.strategy.rebalance_hours / 24} dana ·
+      lookback ${r.strategy.lookback_hours / 24} dana · košara ${r.strategy.basket_size}+${r.strategy.basket_size} · generisano ${fmtDateTime(r.generated_at)}</div>
+    <div class="muted">Univerzum: ${universeText}</div>
+    ${u.survivorship_bias ? `<div class="forward-tracking-warning">⚠️ Survivorship bias: ${u.note}</div>` : ""}`;
+
+  const ci = m.net_ci || {};
+  const ciLow = ci.ci_low_pct ?? ci.lower_pct ?? ci.ci_lower ?? null;
+  const ciHigh = ci.ci_high_pct ?? ci.upper_pct ?? ci.ci_upper ?? null;
+  const card = (label, value) =>
+    `<div class="trades-summary-card"><span class="label">${label}</span><span class="value">${value}</span></div>`;
+  const summary = document.getElementById("backtest-summary");
+  summary.className = "trades-summary";
+  summary.innerHTML = `
+    <div class="trades-summary-cards">
+      ${card("Perioda (sedmica)", m.n_periods ?? "—")}
+      ${card("Win rate (po periodu)", m.win_rate_pct !== null && m.win_rate_pct !== undefined ? fmt(m.win_rate_pct, 1) + "%" : "—")}
+      ${card("Prosjek neto / period", pctHtml(m.avg_net_pct))}
+      ${card("Medijan neto / period", pctHtml(m.median_net_pct))}
+      ${card("Ukupno (složeno, neto)", pctHtml(m.compounded_net_pct))}
+      ${card("BTC isti period", pctHtml(m.btc_compounded_pct))}
+      ${card("Max drawdown", pctHtml(m.max_drawdown_pct))}
+      ${card("Najbolji / najgori period", `${pctHtml(m.best_period_pct)} / ${pctHtml(m.worst_period_pct)}`)}
+      ${card("Prosj. bruto · trošak · funding", `${pctHtml(m.avg_gross_pct)} · ${fmt(m.avg_cost_pct, 3)}% · ${fmt(m.avg_funding_pct, 3)}%`)}
+      ${card("Sharpe po periodu", fmt(m.sharpe_per_period, 2))}
+      ${card("Prosj. turnover", m.avg_turnover !== null && m.avg_turnover !== undefined ? fmt(m.avg_turnover * 100, 0) + "%" : "—")}
+      ${card("95% CI neto (bootstrap)", ciLow !== null ? `${pctHtml(ciLow)} … ${pctHtml(ciHigh)}` : "—")}
+    </div>
+    <div class="main-strategy-disclaimer">Retrospektivna simulacija, ne live rezultat. ${
+      m.beta_check && m.beta_check.market_neutral_violated
+        ? `⚠️ Korelacija s BTC-om ${fmt(m.beta_check.correlation_with_btc, 2)}: košara nije tržišno neutralna.`
+        : ""
+    }</div>`;
+
+  renderBacktestEquityCurve(r.equity_curve, r.initial_capital);
+
+  renderBasketStopLossSweep(r.stop_loss_sweep, r.account_simulation);
+
+  const picks = r.top_picks || { long: [], short: [] };
+  const pickList = (rows) =>
+    rows.map((p) => `<tr><td><b>${p.symbol}</b></td><td>${p.count}</td><td>${fmt(p.pct_of_periods, 0)}%</td></tr>`).join("") ||
+    `<tr><td colspan="3" class="muted">—</td></tr>`;
+  const picksEl = document.getElementById("backtest-basket-picks");
+  picksEl.className = "bucket-breakdown";
+  picksEl.innerHTML = `
+    <div class="bucket-breakdown-title">Najčešće birani coini</div>
+    <div class="main-strategy-legs">
+      <div><div class="trend-bullish"><b>LONG</b></div>
+        <table class="bucket-breakdown-table"><thead><tr><th>Coin</th><th>Puta</th><th>% perioda</th></tr></thead><tbody>${pickList(picks.long)}</tbody></table></div>
+      <div><div class="trend-bearish"><b>SHORT</b></div>
+        <table class="bucket-breakdown-table"><thead><tr><th>Coin</th><th>Puta</th><th>% perioda</th></tr></thead><tbody>${pickList(picks.short)}</tbody></table></div>
+    </div>`;
+
+  const short = (s) => s.replace(/USDT$/, "");
+  const periodsEl = document.getElementById("backtest-basket-periods");
+  periodsEl.className = "bucket-breakdown";
+  periodsEl.innerHTML = `
+    <div class="bucket-breakdown-title">Svi periodi (najnoviji prvi)</div>
+    <div style="overflow-x:auto">
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Od</th><th>Do</th><th>LONG</th><th>SHORT</th><th>Bruto</th><th>Trošak</th><th>Funding</th><th>Neto</th><th>BTC</th></tr></thead>
+      <tbody>${(r.periods || [])
+        .map(
+          (p) => `<tr>
+        <td>${fmtDateTime(p.rebalance_time)}</td><td>${fmtDateTime(p.exit_time)}</td>
+        <td class="trend-bullish">${p.longs.map(short).join(", ")}</td>
+        <td class="trend-bearish">${p.shorts.map(short).join(", ")}</td>
+        <td>${pctHtml(p.gross_return_pct)}</td><td>${fmt(p.cost_pct, 3)}%</td><td>${fmt(p.funding_cost_pct, 3)}%</td>
+        <td><b>${pctHtml(p.net_return_pct)}</b></td><td>${pctHtml(p.btc_return_pct)}</td></tr>`
+        )
+        .join("")}</tbody>
+    </table></div>`;
+}
+
+function accountSimulationHtml(sims) {
+  if (!sims || !sims.length) return "";
+  const s0 = sims[0];
+  const rows = sims
+    .map(
+      (a) => `<tr>
+        <td><b>${a.name}</b></td>
+        <td><b>$${fmt(a.end_usd, 0)}</b></td>
+        <td>${pctHtml(a.return_pct, 1)}</td>
+        <td>${a.weeks_positive}/${a.n_weeks}</td>
+        <td class="pos">+$${fmt(a.best_week_usd, 0)}</td>
+        <td class="neg">$${fmt(a.worst_week_usd, 0)}</td>
+        <td class="neg">$${fmt(a.max_drawdown_usd, 0)}</td>
+        <td>${a.take_profit_pct !== null ? fmt(a.tp_hit_pct, 0) + "%" : "—"}</td>
+        <td>${a.stop_loss_pct !== null ? fmt(a.sl_hit_pct, 0) + "%" : "—"}</td>
+        <td>${a.liquidated_legs}</td>
+      </tr>`
+    )
+    .join("");
+  return `
+    <div class="bucket-breakdown-title" style="margin-top:14px">💵 Simulacija računa: start $${fmt(s0.start_usd, 0)}, $${fmt(s0.leg_usd, 0)} po poziciji (izolirana marža 1x)</div>
+    <div style="overflow-x:auto">
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>Pravila</th><th>Kraj</th><th>Zarada</th><th>Sedmica u plusu</th><th>Najbolja sedm.</th><th>Najgora sedm.</th><th>Max pad</th><th>TP okinut</th><th>SL okinut</th><th>Likvidirano</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="main-strategy-disclaimer">Jedna pozicija ne može izgubiti više od svojih $${fmt(s0.leg_usd, 0)} (likvidacija; Binance stvarno likvidira malo ranije i naplaćuje taksu). Ako su TP i SL u istoj 1h svijeći, računa se SL. Uračunati troškovi i funding.</div>`;
+}
+
+function renderBasketStopLossSweep(rows, accountSims) {
+  const el = document.getElementById("backtest-basket-sl");
+  if (!rows || !rows.length) {
+    el.className = "bucket-breakdown muted";
+    el.textContent = "Nema stop-loss simulacije u ovom izvještaju (osvježi test).";
+    return;
+  }
+  const best = rows.reduce((a, b) => ((b.compounded_net_pct ?? -Infinity) > (a.compounded_net_pct ?? -Infinity) ? b : a));
+  const body = rows
+    .map((r) => {
+      const isBest = r === best;
+      const label = r.stop_loss_pct === null ? "bez SL-a" : `${fmt(r.stop_loss_pct, 0)}%`;
+      return `<tr${isBest ? ' style="font-weight:600"' : ""}>
+        <td>${label}${isBest ? " ★" : ""}</td>
+        <td>${fmt(r.period_win_rate_pct, 1)}%</td>
+        <td>${fmt(r.leg_win_rate_pct, 1)}%</td>
+        <td>${pctHtml(r.avg_period_net_pct)}</td>
+        <td>${pctHtml(r.compounded_net_pct)}</td>
+        <td>${pctHtml(r.max_drawdown_pct)}</td>
+        <td>${pctHtml(r.worst_period_pct)}</td>
+        <td>${fmt(r.legs_stopped_pct, 0)}%</td>
+      </tr>`;
+    })
+    .join("");
+  el.className = "bucket-breakdown";
+  el.innerHTML = `
+    <div class="bucket-breakdown-title">Stop loss po nozi: šta bi bilo sa različitim SL-om (iste košare, iste sedmice)</div>
+    <div style="overflow-x:auto">
+    <table class="bucket-breakdown-table">
+      <thead><tr><th>SL</th><th>Win rate (sedmica)</th><th>Win rate (noga)</th><th>Prosj. neto / sedm.</th><th>Ukupno (složeno)</th><th>Max DD</th><th>Najgora sedmica</th><th>Nogu izbačeno</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table></div>
+    <div class="main-strategy-disclaimer">Procenti bez ograničenja gubitka po nozi (bez likvidacije), za poređenje s Lab-om. Stop se provjerava na svakoj 1h svijeći (high/low); gap preko stopa = izlaz po open cijeni; izbačena noga stoji u kešu do sljedećeg rebalansa, a ako je nova košara opet drži, plaća ponovni ulaz. ★ = najveći ukupni rezultat. Biranje najboljeg SL-a gledanjem u ovu tabelu je samo po sebi prilagođavanje istoriji (overfitting): razlike od par procenata nisu dokaz.</div>
+    ${accountSimulationHtml(accountSims)}`;
+}
+
 async function loadBacktestVariantsDropdown() {
   const select = document.getElementById("backtest-variant-select");
   if (!select) return;
@@ -606,12 +787,16 @@ async function loadBacktestVariantsDropdown() {
     const res = await fetch("/api/backtest/variants");
     const data = await res.json();
     currentBacktestVariant = data.default_variant_id || "original";
-    select.innerHTML = (data.variants || [])
-      .map((v) => {
-        const reportFlag = v.has_report ? "" : " (nema izvještaja)";
-        return `<option value="${v.variant_id}">${v.label}${reportFlag}</option>`;
-      })
-      .join("");
+    const option = (v) => {
+      const reportFlag = v.has_report ? "" : " (nema izvještaja)";
+      return `<option value="${v.variant_id}">${v.label}${reportFlag}</option>`;
+    };
+    const variants = data.variants || [];
+    const basket = variants.filter((v) => v.kind === "basket");
+    const portfolio = variants.filter((v) => v.kind !== "basket");
+    select.innerHTML =
+      (basket.length ? `<optgroup label="Strategije sa košarom (momentum)">${basket.map(option).join("")}</optgroup>` : "") +
+      (portfolio.length ? `<optgroup label="Stari signali (SL/TP)">${portfolio.map(option).join("")}</optgroup>` : "");
     select.value = currentBacktestVariant;
     backtestVariantsLoaded = true;
   } catch (err) {
@@ -733,7 +918,11 @@ async function loadBacktestTab() {
   try {
     const res = await fetch(`/api/backtest/report?variant=${encodeURIComponent(currentBacktestVariant)}`);
     const report = await res.json();
-    if (!report.available) {
+    setBacktestBasketMode(report.kind === "basket");
+    if (report.kind === "basket") {
+      if (report.available) renderBasketBacktest(report);
+      else renderBasketBacktestUnavailable();
+    } else if (!report.available) {
       renderBacktestUnavailable();
     } else {
       renderBacktestMeta(report);
